@@ -16,6 +16,7 @@
 ## 功能特性
 
 - **移动端 Web 客户端** -- 实时聊天视图，采用 Cursor 暗色主题，批准/拒绝按钮，完整计划模态框，计划模型选择器，运行命令卡片，模式/模型切换
+- **上下文栏 + 抽屉导航** -- 顶部面包屑显示「窗口 › 会话」，点击弹出抽屉面板统一列出所有窗口及其会话，点按即可切换窗口/会话（0.1.54 新增）
 - **Telegram 集成** -- 自动同步对话到论坛主题，通过内联按钮批准，从任何设备发送提示
 - **多窗口监控** -- 主窗口保持持久 CDP 连接；其他窗口每 10 秒并行轮询一次（无需切换 Cursor UI）
 - **自动创建主题** -- 新的聊天标签页自动创建对应的 Telegram 主题
@@ -58,11 +59,11 @@
 
 ### 1. 安装扩展
 
-从 [releases](https://github.com/len5ky/CursorRemote/releases) 下载最新的 `.vsix` 文件，然后安装：
+从 [releases](https://github.com/yaogjim/CursorRemoteControl/releases) 下载最新的 `.vsix` 文件，然后安装：
 
 ```bash
 # 从命令行安装
-cursor --install-extension cursor-remote-0.1.52.vsix
+cursor --install-extension cursor-remote-0.1.54.vsix
 ```
 
 或在 Cursor 中：打开命令面板（`Ctrl+Shift+P`），运行 **Extensions: Install from VSIX...**，然后选择文件。
@@ -157,7 +158,7 @@ cursor --remote-debugging-port=9222
 ### 安装和运行
 
 ```bash
-git clone https://github.com/len5ky/CursorRemote.git cursor-ide-remote
+git clone https://github.com/yaogjim/CursorRemoteControl.git cursor-ide-remote
 cd cursor-ide-remote
 npm install
 cp .env.example .env
