@@ -1,0 +1,128 @@
+import * as vscode from 'vscode';
+import { randomBytes } from 'crypto';
+import { join } from 'path';
+import { createOutputChannel, type UnifiedOutputChannel } from './output-channel.js';
+import { createStatusBar } from './status-bar.js';
+import { ServerManager } from './server-manager.js';
+import { StatusTreeView } from './tree-view.js';
+import { SetupPanel } from './setup-panel.js';
+import { TELEGRAM_BOT_TOKEN_SECRET_KEY } from './secrets.js';
+
+let serverManager: ServerManager | undefined;
+
+async function ensurePassword(): Promise<void> {
+  const config = vscode.workspace.getConfiguration('cursorRemote');
+  const current = config.get<string>('webappPassword', '');
+  if (current) return;
+
+  const generated = randomBytes(16).toString('base64url');
+  await config.update('webappPassword', generated, vscode.ConfigurationTarget.Global);
+
+  // Fire-and-forget — don't block activate() waiting for user interaction
+  vscode.window.showInformationMessage(
+    `CursorRemote: A web client password has been generated: ${generated}`,
+    'Copy to Clipboard',
+    'Open Settings'
+  ).then(action => {
+    if (action === 'Copy to Clipboard') {
+      vscode.env.clipboard.writeText(generated);
+    } else if (action === 'Open Settings') {
+      vscode.commands.executeCommand('workbench.action.openSettings', 'cursorRemote.webappPassword');
+    }
+  });
+}
+
+async function migrateTelegramBotToken(
+  context: vscode.ExtensionContext,
+  outputChannel: UnifiedOutputChannel
+): Promise<void> {
+  const config = vscode.workspace.getConfiguration('cursorRemote');
+  const legacy = config.get<string>('telegram.botToken', '');
+  if (!legacy.trim()) return;
+
+  try {
+    await context.secrets.store(TELEGRAM_BOT_TOKEN_SECRET_KEY, legacy);
+    const stored = await context.secrets.get(TELEGRAM_BOT_TOKEN_SECRET_KEY);
+    if (stored === legacy) {
+      await config.update('telegram.botToken', undefined, vscode.ConfigurationTarget.Global);
+      vscode.window.showInformationMessage(
+        'CursorRemote: your Telegram bot token was moved to secure storage.'
+      );
+    }
+  } catch (err) {
+    outputChannel.warn(`Telegram bot token migration failed: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  const outputChannel = createOutputChannel();
+
+  const statusBarItem = createStatusBar(context);
+
+  await migrateTelegramBotToken(context, outputChannel);
+
+  serverManager = new ServerManager(
+    context,
+    outputChannel,
+    statusBarItem
+  );
+
+  serverManager.startDirWatcher();
+
+  const extensionVersion = context.extension.packageJSON?.version ?? 'unknown';
+  const treeView = new StatusTreeView(serverManager, extensionVersion);
+  const serverLogPath = join(context.extensionPath, 'temp', 'server.log');
+
+  context.subscriptions.push(
+    outputChannel,
+    vscode.window.registerTreeDataProvider('cursorRemote.status', treeView),
+    vscode.commands.registerCommand('cursorRemote.start', () => serverManager!.start()),
+    vscode.commands.registerCommand('cursorRemote.stop', () => serverManager!.stop(true)),
+    vscode.commands.registerCommand('cursorRemote.restart', () => serverManager!.restart()),
+    vscode.commands.registerCommand('cursorRemote.openWebClient', () => serverManager!.openWebClient()),
+    vscode.commands.registerCommand('cursorRemote.showLogs', async () => {
+      outputChannel.reveal([
+        'CursorRemote - no server output captured yet.',
+        `Extension version: ${extensionVersion}`,
+        `Server state: ${serverManager?.serverState ?? 'unknown'}`,
+        `Server log file: ${serverLogPath}`,
+        'Logs appear here once the server starts.',
+      ]);
+      // Cursor's output service silently ignores OutputChannel.show() — the
+      // panel never opens or switches channel (public#47). Open the channel's
+      // backing log file too; the editor works on every build.
+      try {
+        const logFile = vscode.Uri.joinPath(context.logUri, 'CursorRemote.log');
+        await vscode.workspace.fs.stat(logFile);
+        const doc = await vscode.workspace.openTextDocument(logFile);
+        const end = doc.lineCount > 0
+          ? doc.lineAt(doc.lineCount - 1).range.end
+          : new vscode.Position(0, 0);
+        await vscode.window.showTextDocument(doc, {
+          preview: true,
+          selection: new vscode.Range(end, end),
+        });
+      } catch {
+        // No backing file (plain, non-log output channel) — reveal() above
+        // already appended a diagnostic header in that case.
+      }
+    }),
+    vscode.commands.registerCommand('cursorRemote.openSetup', () => SetupPanel.createOrShow(context)),
+  );
+
+  ensurePassword().catch(err => {
+    outputChannel.warn(`Password auto-generation failed: ${err}`);
+  });
+
+  const config = vscode.workspace.getConfiguration('cursorRemote');
+  if (config.get<boolean>('autoStart', true)) {
+    serverManager!.start();
+  }
+}
+
+export async function deactivate(): Promise<void> {
+  if (serverManager) {
+    await serverManager.stop();
+    serverManager.dispose();
+  }
+}

@@ -1,0 +1,235 @@
+# Changelog
+
+All notable changes to CursorRemote are documented here.
+
+Format follows [Keep a Changelog](https://keepachangelog.com/).
+
+## [Unreleased]
+
+### Changed
+- **No license gate:** the extension and `npm run dev` start directly. License key prompts, purchase commands, and offline key validation were removed.
+- **Docs aligned with current code:** multi-window monitoring is a persistent **home** CDP connection plus parallel polling of other windows every 10s. Standalone `POLL_INTERVAL_MS` / `DEBOUNCE_MS` defaults are **300 / 150** (`src/server/config.ts`); extension setting defaults remain **500 / 300**. Web-client password is stored in VS Code Settings (`cursorRemote.webappPassword`), not SecretStorage. Only the Telegram bot token uses SecretStorage.
+- **Web health:** unauthenticated LAN clients get `{ ok, authRequired, sessionValid }` only. Loopback observers and logged-in sessions still receive the detailed payload the extension needs.
+- **Idle state patches:** extractor heartbeat (`lastExtractionAt`) no longer broadcasts `state:patch` by itself. Internal `_rawSignals` stay off the public socket payload.
+
+### Fixed
+- **Plan file path traversal:** `get_plan_full` labels are confined to `~/.cursor/plans`.
+- **LAN bind without a password:** the relay refuses non-loopback listen addresses unless `WEBAPP_PASSWORD` is set.
+- **Web window switch:** `command:switch_window` now updates WindowMonitor's home window so the active window is not re-polled as a guest.
+- **CDP handshake hang:** WebSocket connect has a timeout; switch-window reconnect keeps the preferred target instead of falling back to the first workbench.
+- **Concurrent commands:** CommandExecutor serializes actions against the same CDP client.
+- **Extension restart races:** owner lock + generation prevent two windows from spawning two servers during restart/takeover.
+- **Web client:** weak-network reconnects no longer clear a valid session token; New Chat stays visible with a single tab; notifications use page visibility and tag de-dupe; HTML sanitizer strips javascript/data URLs and dangerous svg/style/base.
+
+### Security
+- Socket.IO CORS no longer reflects arbitrary Origin. Web sessions have 30-day absolute and 7-day idle TTL.
+
+### Added
+- Atomic JSON writes (`tmp` + rename) for web sessions and Telegram persistence files.
+- Telegram routing-failure feedback when a questionnaire or command cannot be mapped to a topic.
+
+## [0.1.52] - 2026-07-12
+
+### Fixed
+- **Answering questionnaire options failed with "action target not found"**: since v0.1.49's label verification, tapping an option in the web client never worked on any Cursor version — the stored selector pointed at the letter button (whose text is just "A"), while the option row concatenates letter + label, so nothing ever matched the expected label exactly. Options now emit a stable anchored path to the option row (same convention Skip/Continue got in v0.1.50), and the executor matches labels against the dedicated `.composer-questionnaire-toolbar-option-label` span, accepting the freeform row for "Other". Click-verified against a live Cursor 3.8.23 questionnaire over CDP. Fixes [public#50](https://github.com/len5ky/CursorRemote/issues/50) (thanks @ChrisjanWust); completes [public#44](https://github.com/len5ky/CursorRemote/issues/44) (issue 2).
+- **"Show logs" still did nothing** (extension): Cursor's output service silently ignores `OutputChannel.show()` — the Output panel neither opens nor switches channel, even when the channel exists and has content — so the v0.1.50 reveal fix couldn't help. The command now also opens the channel's backing on-disk log file (`<exthost logs>/CursorRemote.log`) in an editor tab with the cursor at the end, which works on every build. Fixes [public#47](https://github.com/len5ky/CursorRemote/issues/47) (thanks @agsola).
+- **Server spawned twice on activation** (extension): `start()` clears the manual-stop flag, and the data-dir watcher reacted to that deletion by calling `start()` again while the first call was still probing for an existing server — two processes raced for the relay port and every log line was doubled. `start()` is now re-entrancy guarded.
+
+## [0.1.50] - 2026-07-08
+
+### Fixed
+- **Questionnaire Skip/Continue buttons stopped working on Cursor 3.8+**: Cursor dropped the `composer-skip-button` / `composer-run-button` classes, so the action buttons are now `div[data-click-ready]` children of the still-intact `.composer-questionnaire-toolbar-actions`, with the clean label in a `span.truncate` next to a keybinding-hint span. Extraction now falls back to those elements (legacy classes stay primary) and emits a stable anchored selector path, and the executor matches labels via `span.truncate` first so the keybinding hint no longer pollutes the match. Cursor 3.8+ tool rows (`data-find-row-key="tool-placeholder:…"` with an inner `data-react-transcript-row-kind="activity"`) are also now mapped to tool cards. Fixes [public#44](https://github.com/len5ky/CursorRemote/issues/44); driven by live-DOM probe data from @habruzzo.
+- **"Show logs" appeared to do nothing** (extension): the output channel could be empty when the server had never spawned, and a no-arg `show()` doesn't force the panel to reveal, so clicking the command looked like a no-op. It now forces reveal + focus and, when the channel is empty, prints a diagnostic header (extension version, server state, log path) so there's always something actionable to see. Fixes [public#47](https://github.com/len5ky/CursorRemote/issues/47).
+
+## [0.1.49] - 2026-07-07
+
+### Fixed
+- **Assistant messages dropped on Cursor 3.8+ mixed-transcript DOM**: on current Cursor builds human turns still carry `data-message-index`, but AI rows now expose only `data-message-role` + `data-message-id`, so the v0.1.47 fallback (gated on a zero-match count) never fired and assistant replies silently disappeared from the web client and Telegram. Extraction now uses a merged union selector with nested-ancestor de-dupe to pick up both row populations, and maps `data-react-transcript-row-kind="assistantMarkdown"` to the assistant classifier. Pre-3.8 extraction is provably unchanged (pinned by a unit-tested invariant). Fixes [public#44](https://github.com/len5ky/CursorRemote/issues/44) (issue 1); thanks @habruzzo for the field report and probe data that drove the fix.
+- **Questionnaire action buttons needed two or three taps on Cursor 3.8+**: Cursor replaced the `composer-questionnaire-*` classes with atomic CSS, so the stored positional selectors resolved to inert sibling elements and the first tap (or two) did nothing. The command executor now verifies the resolved element's text against the action label and prefers a scoped text-content match; when it can't find anything better it falls back to the legacy positional click, so working setups are unaffected. Fixes [public#44](https://github.com/len5ky/CursorRemote/issues/44) (issue 2); thanks @habruzzo.
+
+### Changed
+- VSIX packaging verification is now allowlist-based — the build fails on any file outside the expected runtime set, instead of only checking a denylist of known-bad paths.
+
+## [0.1.48] - 2026-07-07
+
+### Fixed
+- **Packaging**: internal development files under `tmp/` are no longer included in the extension package. They were accidentally packaged in 0.1.45–0.1.47; the published artifacts for those versions have been replaced with cleaned builds.
+
+## [0.1.47] - 2026-07-07
+
+### Fixed
+- **Message extraction broke on Cursor 3.8+ virtualized chat DOM**: newer Cursor builds virtualize the chat transcript and reshuffle the message wrapper markup, so the relay stopped finding `data-flat-index` / `data-message-role` nodes and the web client and Telegram showed an empty or frozen conversation. Extraction now falls back to the 3.8+ virtualized wrappers (with tightened guards so it never matches stray nodes), and the composer-targeting selectors in `command-executor` were refreshed to match. The new path is **fallback-only** — the legacy pre-3.8 extraction is tried first and its behavior is unchanged, so older Cursor builds are unaffected. Ports [public#39](https://github.com/len5ky/CursorRemote/pull/39) (thanks @gilzhaiek) with tightened fallbacks, and folds in the command-executor selector updates from [public#38](https://github.com/len5ky/CursorRemote/pull/38) (thanks @cachrisman). Closes [public#36](https://github.com/len5ky/CursorRemote/issues/36), [public#35](https://github.com/len5ky/CursorRemote/issues/35).
+- **Messages weren't sent for users with Cursor's "Submit with ⌘+Enter" setting**: the relay submits prompts by dispatching a plain Enter, which does nothing when Cursor is configured to require Cmd/Ctrl+Enter — the text just sat in the composer. The submit path now retries with Cmd/Ctrl+Enter as a fallback, firing only when the composer still contains the text 300ms after the plain Enter (so normal setups are unaffected). Closes [public#37](https://github.com/len5ky/CursorRemote/issues/37).
+- **Telegram questionnaire only rendered in one topic**: multiple-choice questionnaire cards were processed on the global state path, so with several Cursor windows/agents open the card surfaced in just one topic. Questionnaires are now routed per window through `doProcessWindow`, so each agent's questions render in its own topic, with the option labels folded into the change fingerprint to avoid missed updates. Ports [public#40](https://github.com/len5ky/CursorRemote/pull/40) (thanks @rodrigopavezi).
+- **Telegram bot token now stored in VS Code SecretStorage** instead of plaintext in `settings.json`. Existing tokens in `settings.json` are auto-migrated into SecretStorage on activation and cleared from settings. Closes [public#33](https://github.com/len5ky/CursorRemote/issues/33).
+
+### Changed
+- `/history` now documents its real default of 5 messages, and the setup docs no longer ask for the Telegram "Pin Messages" permission — the bot never pinned. The dead `can_pin_messages` check was also removed from `/sync`. Closes [public#29](https://github.com/len5ky/CursorRemote/issues/29), [public#30](https://github.com/len5ky/CursorRemote/issues/30).
+
+## [0.1.46] - 2026-05-27
+
+### Fixed
+- **Model picker broken on Cursor 3.5+** (web client and Telegram): the model dropdown was reskinned — trigger renamed (`.composer-unified-dropdown-model` → `.ui-model-picker__trigger`), `data-testid="model-picker-menu"` removed, each row now contains an inner Edit button with a React-generated `useId` (`_r_ld_`), and the row's `textContent` includes that button's "Edit" text. Combined, this showed "Loading models…" → "No models available" in the web client, made selection silently no-op, and (with the bonus Telegram bug below) sent `set_model "label"` instead of `set_model "label::GPT-5.5 High"`. Fixed by (a) cascading the trigger selector through new + legacy classes, (b) resolving the menu via `data-testid` → trigger's `aria-controls` → first open `[role="menu"]`, (c) filtering out nested Edit buttons when collecting rows, (d) stripping descendant `<button>` text from the label, (e) detecting React `useId` ids and round-tripping through synthesized `label::<text>` ids, (f) substring fallback (length-gated to avoid `GPT-5` matching `GPT-5.5`) when the live row has extra spans beyond the captured label. One shared `MODEL_ITEM_HELPERS_JS` (`collectModelItems` + `pickModelById`) is now the single source of truth for both `get_model_options` and `set_model`/`set_plan_model`, with a round-trip unit test that fails if the read and write sides ever drift. Closes [public#22](https://github.com/len5ky/CursorRemote/issues/22) and likely [public#9](https://github.com/len5ky/CursorRemote/issues/9); thanks @michaelandrewgamble for the CDP probe data.
+- **Telegram callback parsing mangled payloads containing colons**: the callback handler did `data.split(':')` which shredded model ids with the `label::` prefix, broke the View Plan button (`vpl:<short-id>:<hash>` → "Plan not found in current state"), and could misroute any future action with a multi-colon payload. Replaced with action-aware `parseCallbackData()` that takes the entire rest as the id for no-hash actions (`mode`, `model`), splits hashed actions (`apr`/`rej`/`all`/`run`/`skp`/`alw`/`bld`/`vpl`/`dif`) on the last colon, and routes questionnaire callbacks (`qan`/`qsk`/`qco`) as hash-only. Unit-pinned.
+- **Telegram Run/Skip/Allowlist buttons silently no-op'd or said "Action expired"** on recent Cursor builds: the stable-selector table (`ACTION_SELECTORS`) still pointed at pre-0.1.45 button classes (`.composer-tool-call-status-row .anysphere-button.composer-run-button` etc.) that don't match the current per-card UI — so tapping Run threw "Element not found" in a Telegram tooltip easy to miss on mobile, while the web client worked. Server restarts and two-bot-instance setups also evicted the per-card hash from the in-memory tracker and bailed as "Action expired" even while the approval was still pending. Stable selectors refreshed to current `button.ui-shell-tool-call__run-btn` / `__skip-btn` / `__allowlist-button` (legacy `.composer-*` kept as a second fallback). Callback resolution tries the per-card hash first (preserves multi-card targeting), falls through to the stable selector when the hash is missing. Error message replaced with "Action no longer pending (already actioned, cleared, or restart)". Closes [public#21](https://github.com/len5ky/CursorRemote/issues/21), [public#25](https://github.com/len5ky/CursorRemote/issues/25).
+
+### Added
+- `scripts/probe-model-picker.ts` — one-shot CDP probe that clicks the model trigger and dumps the resulting menu structure (trigger `aria-controls`, menu element, sample of menu items). Useful when Cursor reskins the picker again.
+
+## [0.1.45] - 2026-05-07
+
+### Fixed
+- **Approval banners broken for current Cursor UI**: recent Cursor builds render shell tool approvals with a per-card layout (`Run` / `Skip` / `Allowlist '<cmd>'` plus an `Auto-Run in Sandbox` mode-dropdown trigger). The relay was matching the dropdown trigger via a generic `Run` text-substring match, so clicking Approve in the web client or Telegram opened a settings menu in Cursor instead of approving — users couldn't get unstuck without going to the IDE. Approval extraction now identifies the real action buttons by class (`.ui-shell-tool-call__run-btn`, `.ui-shell-tool-call__skip-btn`, `.ui-shell-tool-call__allowlist-button`) and skips any element with `aria-haspopup` (always a menu, never an action). Closes [public#12](https://github.com/len5ky/CursorRemote/issues/12).
+- **Approval description shows the actual command** (e.g. `curl -sI --max-time 5 https://example.com | head -n 3`) instead of a generic button label like "Auto-Run in Sandbox". Useful in Telegram, where you previously had no way to see what you were approving without switching to Cursor.
+- **Stuck approval banner in multi-agent / multi-composer setups**: approve/reject button discovery used `document.querySelectorAll`, so the relay matched buttons from other composers and sticky workbench chrome. Once a composer's approval was clicked the state never cleared because stale buttons in *other* composers kept surfacing. Approval extraction is now scoped to the active chat container and de-duped, mirroring how the rest of the extractor already worked. Originally credited as a community fix; see [public#15](https://github.com/len5ky/CursorRemote/pull/15) (thanks @gavinc).
+- **Multi-window approvals now reach Telegram**: with multiple Cursor windows open, only the active CDP target's approvals were processed for Telegram — non-active windows were polled by `window-monitor` into per-window snapshots, but those approvals never reached the bot. Each window's approvals now route to its own Telegram thread via `doProcessWindow`. Per-id content-hash dedupe keeps the active window from being banner-spammed twice when both the global and per-window paths fire.
+- **Cross-window approval routing**: when the user switches to a Cursor window that doesn't own the currently-selected agent (Cursor's global agent rail surfaces the same selected tab in every workbench DOM), the strict `(windowId, tab)` topic lookup returned nothing and the banner was silently dropped. Now falls through to a tab-title-only mapping lookup so the banner still surfaces in the canonical topic.
+- **Two different agents with the same tab title in different projects no longer share one Telegram topic.** The cross-window routing fix above wrongly conflated them when they shared a name (e.g. "Shell command approval process" in two projects). Topics are now identified by `data-composer-id` (Cursor's stable per-agent ID) instead of just tab title, so the same agent shown via Cursor's global rail in another window still routes to one topic, while two genuinely different agents that coincidentally share a title get their own topics auto-created.
+- **Same agent seen via the new 'Cursor Agents' window no longer mints a duplicate topic.** When a user opens an agent in the global Cursor Agents window after already having a topic for it (created earlier from the project's own workbench window), the relay would create a fresh topic because the composite `<group>/<agent>` tab title doesn't match the original tab title key. `autoCreateTopic` now consults composerId across all existing mappings before minting, and reuses the existing topic if found. `/dedupe` also groups by composerId so any historical duplicates can be collapsed in one command.
+- **Telegram approval banner deletion no longer flickers**: previously each transient empty `pendingApprovals` poll deleted the banner, and the next poll re-sent it — visible re-creation every ~10s while an approval was outstanding. Now defers deletion by 30 seconds (3× window-monitor cycle) so DOM transients are absorbed.
+- **No more duplicate approval banners from concurrent paths**: the global state-patch path and the per-window `doProcessWindow` path could both call the approval send routine for the same approval id within milliseconds of each other; both saw an empty tracker (because neither had called `track()` yet), both called `sendMessage`, and the user got two banners (confirmed live as msgIds 10352 + 10353 for one approval). Guarded with an inflight Set keyed on `${threadId}:${trackId}`.
+- **Telegram approval tracking per-id** (was: single `approval` key per thread that edited the same message in place). New approvals now appear as fresh banners at the bottom of the topic instead of silently rewriting an old banner far up in the chat. Multiple concurrent approvals get separate banners.
+- **Duplicate Telegram topics on WSL/SSH reconnect**: Cursor adds connection-context suffixes to window titles when projects are opened over WSL/SSH/Codespaces (`myproj` vs `myproj [WSL: ubuntu-24.04]`). The relay treated those as different windows and created a parallel topic tree per (project × connection mode). Window titles are now normalized for matching, so reopening a project under a different connection mode reuses the existing topic.
+- **Cursor Agents window now lists all agents, not just the active one.** Recent Cursor builds host a dedicated 'Cursor Agents' workbench window with a glass-sidebar rail showing every agent across every project, grouped by project. The relay's legacy `.agent-sidebar-cell` selector only matched the visible active row in that window, so the web client showed exactly one switchable agent there. Now extracts every `.glass-sidebar-agent-list-container li.ui-sidebar-menu-item > div.glass-sidebar-agent-menu-btn` row and builds composite `<group> / <agent>` titles so two agents with the same name in different projects don't collide. `switchTab` understands both the composite and the agent-only forms. Legacy `.agent-sidebar-cell` extraction is preserved as a fallback for older Cursor builds. Closes [public#13](https://github.com/len5ky/CursorRemote/issues/13); see [public#14](https://github.com/len5ky/CursorRemote/pull/14) (thanks @gavinc).
+- **Web client mobile multi-line input**: on touch devices Enter now inserts a newline instead of sending the message — previously you couldn't compose multi-line prompts on a phone because mobile keyboards have no Shift+Enter. Tap the Send button to send. Cmd/Ctrl+Enter always sends regardless of platform (handy for hardware keyboards on tablets, familiar on desktop). Closes [public#5](https://github.com/len5ky/CursorRemote/issues/5).
+- **iOS questionnaire scrolling**: when the agent presents 3+ questions on iOS Safari, the questionnaire panel no longer overflows off-screen. Caps `.questionnaire-bar` at `max-height: 55vh` with `#questionnaire-questions` independently scrollable (with iOS momentum); header and Skip/Continue stay pinned. Closes [public#8](https://github.com/len5ky/CursorRemote/issues/8); see [public#7](https://github.com/len5ky/CursorRemote/pull/7) (thanks @hfutrell-gss).
+- Stopped log spam: the `Skipping ... already belongs to ...` warning fired every 10s for every (non-owning window, tab) pair when Cursor's global agent rail is in use. Now logged once per pair.
+- Persisted message tracker now self-heals legacy approval keys (`approval`, `approval-approval-<TS>`) from prior code revisions that accumulated thousands of stale entries on disk.
+
+### Added
+- **`/dedupe` Telegram command** — preview and merge duplicate topic mappings created across WSL/SSH variants of the same project. `/dedupe` shows a preview with `KEEP` / `DROP` markers; `/dedupe yes` deletes the orphan topics and removes their mappings. Companion to the title-normalization fix above for cleaning up topics from before this release.
+- **`/resync` Telegram command** — run inside a topic to rebind it to whatever Cursor has active right now. Useful when Cursor's global agent rail has surfaced an agent in a window other than the one that originally created the topic, and the topic's window prefix no longer matches where you actually work. Also renames the Telegram topic if the bot has Manage Topics permission. Refuses if the new target is already bound to a different topic (suggests `/dedupe` in that case).
+- **`/debug/state` HTTP endpoint** (auth-gated) returning current `activeWindowId`, `agentStatus`, `pendingApprovals`, `chatTabs` (with active flags), `windows`, and recent message types. Indispensable when debugging which window/tab a state field is coming from without parsing socket.io traffic.
+- `[telegram-api] send thread=N msgId=M text=...` log line on every outbound Telegram API call, for tracing duplicate-send issues across multiple bot instances or transports.
+- `scripts/probe-tabs.ts` — connects to a given Cursor window via CDP and dumps tab/composer markers (active flags, `data-composer-id`, `data-composer-status`, ARIA attributes) for debugging selector regressions.
+- `scripts/probe-tg-thread.ts` — sends a one-off probe message to a specific (chat, thread) to verify whether a Telegram topic exists outside of our tracker, used to discover orphan topics created by other bot instances.
+
+### Known issues
+- **Two bot instances writing to the same Telegram chat will both succeed** (extension-spawned server + dev server using the same token). Both will appear to work but messages get duplicated across each instance's mapping set. Stop one before running the other; see "Dev mode" below.
+
+## [0.1.44] - 2026-04-07
+
+### Fixed
+- **Telegram approval spam**: approval messages no longer flood the chat. Root cause was `Date.now()` in the approval ID causing every poll cycle to generate a "new" approval that bypassed message tracking. Now uses a deterministic ID based on button labels, and adds content-hash dedup so unchanged approvals are never re-sent.
+- Questionnaire options in the web app now display vertically with full text instead of being squeezed into small horizontal pills that cut off long answers.
+- Questionnaire options in Telegram now appear as individual full-width keyboard buttons (one per row) with option text also shown in the message body for readability.
+- Questionnaire now appears in Telegram immediately even when shown alongside a plan widget. Previously the first question was silently dropped because the questionnaire was only processed via `state:patch` (which depends on a thread mapping that may not exist yet), while plan messages were processed via `window:update` (which creates the thread). Now the questionnaire is also processed at the end of `doProcessWindow` using the guaranteed thread ID.
+- Telegram questionnaire now shows ALL questions (not just the active one), with `👉` marking the current question. This prevents questions from being lost if the active index advances between poll cycles.
+
+## [0.1.43] - 2026-04-06
+
+### Added
+- "Clear License Key" command (`CursorRemote: Clear License Key` in Command Palette) to delete the stored license from OS secret storage, useful for testing the activation flow.
+- Telegram command logging: incoming bot commands (e.g. `/status`, `/sync`) now appear in the server log with the sender's username.
+- **Raw Telegram transport** (`TELEGRAM_IMPL=raw`): an alternative Telegram bot implementation that talks directly to the Bot API via `fetch` with explicit 30s HTTP timeouts, bypassing Grammy entirely. Use this if Grammy hangs during startup (commonly on macOS with flaky Telegram connectivity). Grammy remains the default; set `TELEGRAM_IMPL=raw` in `.env` or the VS Code extension settings to switch. Both implementations share the same command handlers, formatter, topic manager, and message tracking logic.
+- `docs/telegram-troubleshooting.md` — guide for Telegram startup hangs, connectivity, 409 conflicts, and switching to the raw transport.
+
+### Changed
+- Model selector in the web client and Telegram `/model` command now reads available models directly from Cursor's model picker menu instead of using a hardcoded list. The sheet shows a loading state while fetching, caches results for instant re-opens, and gracefully handles fetch failures.
+- CDP target discovery log now shows only page targets with a compact summary for the rest (e.g. `Found 5 page(s) (+21 iframe, 4 webview, 9 worker)`) instead of dumping every iframe/webview/worker.
+- Telegram bot startup is more resilient and verbose: Grammy's fetch calls now have a 30s HTTP timeout (previously no timeout — could hang forever on stale TCP connections), `autoRetry` max delay reduced from 60s to 10s, `bot.init()` and long-poll startup phases are logged separately, and a 30s watchdog warns if the polling loop doesn't connect.
+- `deleteWebhook` now passes `drop_pending_updates=true` and `bot.start()` uses `drop_pending_updates` to avoid choking on stale updates from a previous session.
+- `setMyCommands` moved to after `bot.init()` to avoid burning Telegram rate-limit budget before the bot is initialized.
+
+## [0.1.42] - 2026-03-27
+
+### Added
+- Questionnaire widget: agent multiple-choice questions (`.composer-questionnaire-toolbar`) are now extracted from the DOM, rendered in the web app with clickable option buttons and skip/continue actions, and formatted with inline keyboard buttons in Telegram.
+- Regression test suite with 82 tests covering activity derivation, Telegram formatting (including questionnaire and assistant empty-html handling), and web client rendering (including questionnaire widget). Runs via `npm test` and is required before every publish.
+- Generic tool action extraction: all tool types (including Fetch, and any future Cursor tools) now surface Skip/Run/Allowlist buttons in both the web app and Telegram, without needing per-tool-type code.
+- Browser notifications now fire for all actionable events — run command prompts, tool-level approvals (Fetch, Edit, etc.), not just global approvals. Each notification is deduplicated by message ID.
+- Canonical fixture library (`fixtures/recordings/`) with scenarios for shimmer lifecycle, approvals, plans, code blocks, connection states, and fetch tool.
+- Manual smoke checklist (`docs/smoke-checklist.md`) for pre-release verification.
+
+### Changed
+- Web client is no longer fixed to a narrow 600px mobile layout. The app now fills the full viewport width, with message content centered and capped at ~800px on desktop for readability. Mobile layout is unchanged.
+- CDP recorder now stores both raw extractor output and post-derived relay state, with schema versioning and metadata header.
+- Publish script (`scripts/publish.ts`) now gates on regression tests before syncing to the public repo. Use `--skip-tests` only for emergencies.
+- Deduplicated button extraction logic in `dom-extractor.ts` into a single `extractToolActions()` helper used by all tool paths.
+
+### Fixed
+- Telegram assistant messages no longer flash unformatted text (missing spaces/formatting) before showing the properly formatted version. Messages now wait for HTML rendering before being sent.
+- Model and mode now sync correctly across windows. Per-window model/mode is captured in window snapshots and pushed to global state immediately on window switch, eliminating stale values from the previous window.
+- Model extraction no longer picks up the plan-scoped model dropdown (e.g. "Opus 4.6" from a plan widget) instead of the actual composer model. Windows with active plan widgets now correctly report the composer-level model.
+- Fetch tool (and other compact tool types) now show their content and approval buttons in both Telegram and the web app instead of appearing as plain text with no actions.
+- Compact tool header extraction no longer picks up button text ("Skip", "Allowlist ...") as the action/description.
+
+## [0.1.41] - 2026-03-24
+
+### Fixed
+- Extension packaging now ships a vendored Socket.IO browser client so the web app loads correctly from a clean VSIX install without `node_modules`. Previously the server relied on Socket.IO's internal `client-dist/` files which were not included in the bundled extension package, causing `io is not defined` and a blank page on first use.
+- Added favicon to the web client so browsers no longer 404 on `/favicon.ico`.
+
+### Changed
+- The publish script now always rebuilds the `.vsix` instead of reusing a potentially stale cached artifact, and runs a VSIX content verifier before publishing.
+- Added a VSIX verification step (`scripts/verify-vsix.ts`) that checks for required runtime files and forbidden secrets before every package and publish.
+
+## [0.1.40] - 2026-03-24
+
+### Added
+- Web plan modal now loads the full saved plan file so `View Plan` on the web matches Telegram's richer full-plan view.
+- Web plan model picker now shows the real plan-scoped model options fetched from Cursor before applying the selection.
+
+### Changed
+- Web connection status now distinguishes relay connectivity from Cursor/CDP extraction health, including clearer waiting states during background throttling.
+- DOM extraction polling now uses single-flight retries with timeout backoff so backgrounded Cursor windows degrade more gracefully instead of hammering failed evaluations.
+- Plan widget interactions are now handled directly in the web UI for modal viewing and model selection, while Build still triggers the underlying Cursor action.
+
+### Fixed
+- Older browsers that do not support `crypto.randomUUID()` no longer crash the web client during command creation.
+- Run/Skip/Allow approval widgets now render and update correctly in the web app, including command text for terminal approval cards.
+- Web live updates now reconcile message type changes correctly instead of leaving stale `Generating` placeholders until manual refresh.
+- Auto-scroll no longer snaps back to the latest message after the user intentionally scrolls up.
+- Plan modal content no longer stops at the compact widget summary when the underlying saved plan file is available.
+
+## [0.1.39] - 2026-03-24
+
+### Added
+- Native web code/diff renderer for assistant `codeBlocks` and tool `diffBlock`, with deterministic add/remove line styling.
+- Mobile-friendly code block UX: ~7-line inline viewport with scroll and a full-screen reader.
+- Telegram spoiler/shimmer mechanics for in-progress thought and activity presentation.
+
+### Changed
+- Assistant markdown HTML is now prose-only; code and diffs render from structured payloads instead of mirrored Cursor Monaco/Shiki HTML.
+- Telegram formatter now maps structured code/diff blocks directly from `codeBlocks`.
+- Activity state now uses a shared live-activity contract across relay, web, and Telegram.
+
+### Fixed
+- Removed brittle Monaco/Shiki mirror rendering and related duplicate, empty, or black code block failures in the web client.
+- Native raw code blocks now preserve real newlines instead of flattening multiline code into a single `<code>` blob.
+- Plain patch/unified-diff blocks are classified as diffs again, restoring red/green add/remove highlighting in the native renderer.
+- Web app session persistence now survives re-login correctly instead of dropping saved auth/session state.
+- Message sending reliability in the web app.
+- Plan widget rendering and behavior in the web app.
+- Explicit activity clearing now survives relay patch updates, so stale header shimmer/text does not persist in the web client.
+- Telegram typing and ephemeral activity rows now stop based on live activity instead of stale status labels.
+- Startup false positives like `Image generation stopped` no longer count as active work unless there is a real live signal.
+
+## [0.1.38] - 2026-03-22
+
+### Added
+- Published to Open VSX registry so extension is searchable in Cursor's Extensions panel
+- `--ovsx` flag in publish script to package and publish to Open VSX in one step
+
+### Fixed
+- Excluded `openvsx_token` from .vsix packaging and public repo sync
+
+## [0.1.37] - 2026-03-21
+
+### Added
+- VS Code extension with auto-start, setup walkthrough, and status bar
+- CDP bridge connecting to Cursor via Chrome DevTools Protocol
+- DOM extraction of agent chat state (messages, tool calls, plans, approvals)
+- Mobile web client with Cursor's dark theme
+- Telegram bot transport with forum topic auto-creation
+- Multi-window monitoring via parallel CDP connections
+- Plan widget and run command widget support
+- Mode and model switching from remote clients
+- Chat tab switching and new chat creation
+- License key validation
+- Token-based Telegram registration
+- Rate-limited message delivery with send queue
+- Password-protected web client option
+- Persistent Telegram state (topics, messages, sync, auth)
+- Timestamped server logs to temp/server.log
+- Extension icon and Marketplace listing

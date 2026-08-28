@@ -1,0 +1,17 @@
+node_modules
+node_modules/
+.claude/
+dist/
+*.js.map
+.env
+
+data/
+releases/
+temp/server.log
+tmp/
+scripts/generate-keys.ts
+azure_token
+openvsx_token
+# marketing/
+.specstory/
+.DS_Store

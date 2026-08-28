@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="system">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#f7f8fa">
+  <title>CursorRemote</title>
+  <script>
+    (function () {
+      var KEY = 'cursor-remote-theme';
+      var t = 'system';
+      try {
+        var s = localStorage.getItem(KEY);
+        if (s === 'light' || s === 'dark' || s === 'system') t = s;
+      } catch (e) {}
+      document.documentElement.dataset.theme = t;
+      function syncThemeColor() {
+        var pref = document.documentElement.dataset.theme;
+        var dark = pref === 'dark';
+        if (!dark && pref === 'system') {
+          try {
+            dark = !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          } catch (e2) {}
+        }
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute('content', dark ? '#141414' : '#f7f8fa');
+      }
+      syncThemeColor();
+    })();
+  </script>
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="apple-touch-icon" href="favicon.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <header id="header">
+      <div class="header-left">
+        <span id="connection-dot" class="dot reconnecting"></span>
+        <span id="connection-text">Connecting...</span>
+      </div>
+      <div class="header-end">
+        <div class="header-right">
+          <span id="agent-status-icon"></span>
+          <span id="agent-status-text">Idle</span>
+        </div>
+        <label class="theme-control">
+          <span class="visually-hidden">Color theme</span>
+          <select id="theme-select" aria-label="Color theme">
+            <option value="system">System</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </label>
+      </div>
+    </header>
+
+    <div id="composer-queue-bar" class="composer-queue-bar hidden" aria-live="polite">
+      <div class="composer-queue-header">
+        <span class="composer-queue-chevron" aria-hidden="true">&#9660;</span>
+        <span id="composer-queue-label" class="composer-queue-label"></span>
+      </div>
+      <div id="composer-queue-items" class="composer-queue-items"></div>
+    </div>
+
+    <nav id="context-bar" class="context-bar hidden">
+      <button id="context-main" class="context-main">
+        <span id="context-window" class="context-window"></span>
+        <span id="context-count" class="context-count"></span>
+        <span class="context-sep">›</span>
+        <span id="context-session" class="context-session"></span>
+        <span class="context-chevron">▾</span>
+      </button>
+      <button id="btn-new-chat" class="context-new-btn" aria-label="New Chat">+</button>
+    </nav>
+
+    <div id="drawer-overlay" class="drawer-overlay hidden"></div>
+    <div id="drawer" class="drawer hidden">
+      <div class="drawer-header">
+        <div>
+          <div class="drawer-title">Windows & Sessions</div>
+          <div id="drawer-hint" class="drawer-hint"></div>
+        </div>
+        <button id="drawer-close" class="drawer-close">×</button>
+      </div>
+      <div id="drawer-body" class="drawer-body"></div>
+    </div>
+
+    <main id="messages" role="log" aria-live="polite">
+      <div id="empty-state" class="empty-state">
+        <p id="empty-state-primary">Connecting to relay...</p>
+        <p id="empty-state-hint" class="hint">Checking the CursorRemote server and Cursor IDE state.</p>
+      </div>
+    </main>
+
+    <div id="approval-bar" class="approval-bar hidden">
+      <div id="approval-desc" class="approval-desc"></div>
+      <div class="approval-actions">
+        <button id="btn-approve" class="btn btn-approve">Accept</button>
+        <button id="btn-reject" class="btn btn-reject">Reject</button>
+      </div>
+    </div>
+
+    <div id="questionnaire-bar" class="questionnaire-bar hidden">
+      <div class="questionnaire-header">
+        <span class="questionnaire-icon">&#10067;</span>
+        <span class="questionnaire-title">Questions</span>
+        <span id="questionnaire-stepper" class="questionnaire-stepper"></span>
+      </div>
+      <div id="questionnaire-questions"></div>
+      <div class="questionnaire-actions">
+        <button id="btn-q-skip" class="btn btn-q-skip">Skip</button>
+        <button id="btn-q-continue" class="btn btn-q-continue">Continue</button>
+      </div>
+    </div>
+
+    <footer id="input-bar">
+      <div id="mode-model-bar" class="mode-model-bar">
+        <button id="pill-mode" class="pill" aria-label="Select mode">
+          <span id="pill-mode-icon" class="pill-icon"></span>
+          <span id="pill-mode-text">Agent</span>
+          <span class="pill-chevron">&#9662;</span>
+        </button>
+        <button id="pill-model" class="pill" aria-label="Select model">
+          <span id="pill-model-text">Auto</span>
+          <span class="pill-chevron">&#9662;</span>
+        </button>
+      </div>
+      <div class="input-wrapper">
+        <textarea
+          id="message-input"
+          placeholder="Send a message..."
+          rows="1"
+          disabled
+        ></textarea>
+        <button id="btn-send" class="btn btn-send" disabled aria-label="Send">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+          </svg>
+        </button>
+      </div>
+    </footer>
+
+    <div id="sheet-overlay" class="sheet-overlay hidden"></div>
+    <div id="sheet-mode" class="bottom-sheet hidden">
+      <div class="sheet-header">Mode</div>
+      <div id="sheet-mode-list" class="sheet-list"></div>
+    </div>
+    <div id="sheet-model" class="bottom-sheet hidden">
+      <div class="sheet-header">Model</div>
+      <div id="sheet-model-list" class="sheet-list"></div>
+    </div>
+    <div id="sheet-plan-model" class="bottom-sheet hidden">
+      <div id="sheet-plan-model-header" class="sheet-header">Plan Model</div>
+      <div id="sheet-plan-model-list" class="sheet-list"></div>
+    </div>
+  </div>
+
+  <div id="plan-modal-overlay" class="plan-modal-overlay hidden">
+    <div id="plan-modal" class="plan-modal" role="dialog" aria-modal="true" aria-labelledby="plan-modal-title">
+      <div class="plan-modal-header">
+        <div class="plan-modal-heading">
+          <div id="plan-modal-label" class="plan-modal-label"></div>
+          <div id="plan-modal-title" class="plan-modal-title"></div>
+        </div>
+        <button id="plan-modal-close" class="plan-modal-close" aria-label="Close plan">×</button>
+      </div>
+      <div id="plan-modal-body" class="plan-modal-body"></div>
+    </div>
+  </div>
+
+  <div id="toast-container"></div>
+
+  <script src="vendor-socket.io.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
