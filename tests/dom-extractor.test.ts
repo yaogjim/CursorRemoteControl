@@ -4,7 +4,18 @@ import { JSDOM } from 'jsdom';
 import { extractionFunction } from '../src/server/dom-extractor.js';
 import type { CursorState } from '../src/server/types.js';
 
-function withDom(html: string): CursorState {
+function withDom(
+  html: string,
+  options: {
+    approveSelectors?: string[];
+    approveTextMatch?: string[];
+    rejectSelectors?: string[];
+    rejectTextMatch?: string[];
+    chatTabSelectors?: string[];
+    openChatTabSelectors?: string[];
+    windowTitle?: string;
+  } = {},
+): CursorState {
   const dom = new JSDOM(html);
   const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document');
   const nodeDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'Node');
@@ -19,15 +30,17 @@ function withDom(html: string): CursorState {
   try {
     const state = extractionFunction(
       ['#root'],
+      options.approveSelectors ?? [],
+      options.approveTextMatch ?? [],
+      options.rejectSelectors ?? [],
+      options.rejectTextMatch ?? [],
       [],
       [],
+      options.chatTabSelectors ?? [],
       [],
       [],
-      [],
-      [],
-      [],
-      [],
-      []
+      options.windowTitle,
+      options.openChatTabSelectors ?? []
     );
     assert.ok(state, 'expected extractionFunction to return state');
     return state;
@@ -139,6 +152,40 @@ describe('extractionFunction', () => {
     );
   });
 
+  it('does not turn historical tool output containing action words into approvals', () => {
+    const state = withDom(`
+      <main id="root">
+        <button>npm run build\nfail 0\ncancelled 0</button>
+        <button>source line: approveTextMatch and rejectTextMatch</button>
+      </main>
+    `, {
+      approveTextMatch: ['Approve', 'Run', 'Allow'],
+      rejectTextMatch: ['Reject', 'Cancel', 'Skip'],
+    });
+
+    assert.deepEqual(state.pendingApprovals, []);
+    assert.notEqual(state.agentStatus, 'waiting_approval');
+  });
+
+  it('keeps exact text and aria approval labels available', () => {
+    const state = withDom(`
+      <main id="root">
+        <button aria-label="Approve"></button>
+        <button>Cancel</button>
+      </main>
+    `, {
+      approveSelectors: ['button[aria-label*="Approve"]'],
+      approveTextMatch: ['Approve'],
+      rejectTextMatch: ['Cancel'],
+    });
+
+    assert.equal(state.pendingApprovals.length, 1);
+    assert.deepEqual(state.pendingApprovals[0].actions.map(action => [action.label, action.type]), [
+      ['Approve', 'approve'],
+      ['Cancel', 'reject'],
+    ]);
+  });
+
   it('keeps buildSelectorPath selectors for legacy questionnaire actions', () => {
     const state = withDom(`
       <main id="root"></main>
@@ -162,5 +209,86 @@ describe('extractionFunction', () => {
       'div#composer-toolbar-section > div > section > div:nth-of-type(2)'
     );
     assert.equal(state.questionnaire.continueDisabled, false);
+  });
+
+  it('uses the local history sidebar when Cursor hides the unified cross-project sidebar', () => {
+    const state = withDom(`
+      <body class="sidebarvisible unifiedsidebarhidden">
+        <main id="root"></main>
+        <div class="auxiliary-bar-title--agent-mode">
+          <ul><li class="composite-bar-action-tab checked" role="tab" aria-selected="true">
+            <a aria-id="chat-horizontal-tab" aria-label="Only open">Only open</a>
+          </li></ul>
+        </div>
+        <div class="agent-sidebar">
+          <div class="agent-sidebar-cell" data-has-hover-actions="false"><span class="agent-sidebar-cell-text">New Agent</span></div>
+          <div class="agent-sidebar-cell" data-has-hover-actions="true" data-selected="true"><span class="agent-sidebar-cell-text">Only open</span></div>
+          <div class="agent-sidebar-cell" data-has-hover-actions="true"><span class="agent-sidebar-cell-text">Older history</span></div>
+        </div>
+      </body>
+    `, {
+      chatTabSelectors: ['.agent-sidebar-cell'],
+      openChatTabSelectors: [
+        ".auxiliary-bar-title--agent-mode li.composite-bar-action-tab[role='tab']",
+      ],
+      windowTitle: 'cursorremote',
+    });
+
+    assert.deepEqual(
+      state.chatTabs.map(tab => [tab.title, tab.isOpen]),
+      [['Only open', true], ['Older history', false]]
+    );
+  });
+
+  it('orders open sessions first, excludes utility rows, and keeps history scoped to the window', () => {
+    const state = withDom(`
+      <main id="root" data-composer-id="composer-current"></main>
+      <div class="auxiliary-bar-title--agent-mode">
+        <ul role="tablist" aria-label="Active View Switcher">
+          <li class="composite-bar-action-tab" role="tab" aria-selected="false">
+            <a aria-id="chat-horizontal-tab" aria-label="Open left">Open left</a>
+          </li>
+          <li class="composite-bar-action-tab checked" role="tab" aria-selected="true">
+            <a aria-id="chat-horizontal-tab" aria-label="Open right">Open right</a>
+          </li>
+        </ul>
+      </div>
+      <section class="agent-sidebar-project-cell">
+        <div class="agent-sidebar-workspace-name">cursorremote</div>
+        <div class="agent-sidebar-cell" data-has-hover-actions="false">
+          <span class="agent-sidebar-cell-text">New Agent</span>
+        </div>
+        <div class="agent-sidebar-cell" data-has-hover-actions="false">
+          <span class="agent-sidebar-cell-text">Customize</span>
+        </div>
+        <div class="agent-sidebar-cell" data-has-hover-actions="true" data-selected="true">
+          <span class="agent-sidebar-cell-text">Open right</span>
+        </div>
+        <div class="agent-sidebar-cell" data-has-hover-actions="true">
+          <span class="agent-sidebar-cell-text">History only</span>
+        </div>
+      </section>
+      <section class="agent-sidebar-project-cell">
+        <div class="agent-sidebar-workspace-name">other-project</div>
+        <div class="agent-sidebar-cell" data-has-hover-actions="true">
+          <span class="agent-sidebar-cell-text">Wrong project session</span>
+        </div>
+      </section>
+    `, {
+      chatTabSelectors: ['.agent-sidebar-cell'],
+      openChatTabSelectors: [
+        ".auxiliary-bar-title--agent-mode li.composite-bar-action-tab[role='tab']",
+      ],
+      windowTitle: 'cursorremote',
+    });
+
+    assert.deepEqual(
+      state.chatTabs.map(tab => ({ title: tab.title, isOpen: tab.isOpen, isActive: tab.isActive })),
+      [
+        { title: 'Open left', isOpen: true, isActive: false },
+        { title: 'Open right', isOpen: true, isActive: true },
+        { title: 'History only', isOpen: false, isActive: false },
+      ]
+    );
   });
 });

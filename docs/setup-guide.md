@@ -47,7 +47,7 @@ CursorRemote 扩展提供最简单的安装体验：内置状态 UI、自动启�
 从 [releases](https://github.com/len5ky/CursorRemote/releases) 下载最新 `.vsix` 并安装：
 
 ```bash
-cursor --install-extension cursor-remote-0.1.54.vsix
+cursor --install-extension cursor-remote-0.1.56.vsix
 ```
 
 或在 Cursor 中：命令面板（`Ctrl+Shift+P`）> **Extensions: Install from VSIX...** > 选择该文件。

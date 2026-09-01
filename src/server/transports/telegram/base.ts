@@ -799,7 +799,11 @@ export abstract class BaseTelegramTransport implements Transport {
       }
     }
 
-    const hashCallback = (sp: string) => this.messageTracker.hashSelector(sp);
+    const hashCallback = (sp: string, actionId?: string | null) => actionId === null
+      ? this.messageTracker.hashSelector(sp)
+      : actionId
+        ? this.messageTracker.hashAction(actionId)
+        : '';
     const tail = messages.slice(-Math.min(messages.length, MAX_INITIAL_MESSAGES + 10));
 
     for (const element of tail) {
@@ -1039,7 +1043,11 @@ export abstract class BaseTelegramTransport implements Transport {
     if (!this.chatId) return;
 
     const APPROVAL_PREFIX = 'approval:';
-    const hashCallback = (sp: string) => this.messageTracker.hashSelector(sp);
+    const hashCallback = (sp: string, actionId?: string | null) => actionId === null
+      ? this.messageTracker.hashSelector(sp)
+      : actionId
+        ? this.messageTracker.hashAction(actionId)
+        : '';
     const currentTrackIds = new Set(approvals.map((a) => `${APPROVAL_PREFIX}${a.id}`));
 
     // Sweep stale approval entries. Two flavors:
@@ -1198,7 +1206,11 @@ export abstract class BaseTelegramTransport implements Transport {
       return;
     }
 
-    const hashCallback = (sp: string) => this.messageTracker.hashSelector(sp);
+    const hashCallback = (sp: string, actionId?: string | null) => actionId === null
+      ? this.messageTracker.hashSelector(sp)
+      : actionId
+        ? this.messageTracker.hashAction(actionId)
+        : '';
     const formatted = formatQuestionnaire(questionnaire, hashCallback);
     if (!formatted.html) return;
 

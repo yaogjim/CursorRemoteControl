@@ -2,20 +2,42 @@ import { EventEmitter } from 'events';
 import type { CursorState, CursorWindow } from './types.js';
 import { AGENT_ACTIVITY_STALE_MS } from './activity-stale.js';
 
-/** Socket-facing snapshot: drop internal extractor diagnostics. */
-export function toPublicState(state: CursorState): CursorState {
-  if (!('_rawSignals' in state)) return state;
-  const rest = { ...state };
-  delete rest._rawSignals;
-  return rest;
+/** Socket-facing snapshot: drop internal extractor diagnostics and selector paths. */
+const AUTHORIZATION_SELECTOR_KEYS = new Set([
+  'selectorPath',
+  'skipSelectorPath',
+  'continueSelectorPath',
+  'modelDropdownSelectorPath',
+]);
+
+function stripAuthorizationSelectors<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripAuthorizationSelectors(item)) as T;
+  }
+  if (!value || typeof value !== 'object') return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (AUTHORIZATION_SELECTOR_KEYS.has(key)) continue;
+    out[key] = stripAuthorizationSelectors(child);
+  }
+  return out as T;
 }
 
-/** Socket-facing patch: drop internal extractor diagnostics. */
+export function toPublicState(state: CursorState): CursorState {
+  const rest = { ...state };
+  delete rest._rawSignals;
+  return stripAuthorizationSelectors(rest);
+}
+
+/** Socket-facing patch: drop internal extractor diagnostics and selector paths. */
 export function toPublicPatch(patch: Partial<CursorState>): Partial<CursorState> {
-  if (!('_rawSignals' in patch)) return patch;
   const rest = { ...patch };
   delete rest._rawSignals;
-  return rest;
+  return stripAuthorizationSelectors(rest);
+}
+
+function availableSignature(mode: CursorState['mode'] | undefined): string {
+  return JSON.stringify(mode?.available ?? []);
 }
 
 function emptyState(): CursorState {
@@ -34,8 +56,8 @@ function emptyState(): CursorState {
     inputAvailable: false,
     chatTabs: [],
     activeComposerId: '',
-    mode: { current: 'agent', available: [] },
-    model: { current: 'Auto', currentId: '' },
+    mode: { current: '', available: [] },
+    model: { current: '', currentId: '' },
     windows: [],
     activeWindowId: '',
     composerQueue: { items: [] },
@@ -227,7 +249,8 @@ export class StateManager extends EventEmitter {
 
   /** Push per-window mode/model into global state (e.g. from a cached snapshot on window switch). */
   updateModeModel(mode: CursorState['mode'], model: CursorState['model']): void {
-    const modeChanged = this.currentState.mode?.current !== mode?.current;
+    const modeChanged = this.currentState.mode?.current !== mode?.current
+      || availableSignature(this.currentState.mode) !== availableSignature(mode);
     const modelChanged = this.currentState.model?.current !== model?.current
       || this.currentState.model?.currentId !== model?.currentId;
     if (!modeChanged && !modelChanged) return;
@@ -308,7 +331,7 @@ export class StateManager extends EventEmitter {
       hasChange = true;
     }
 
-    if (prev.mode?.current !== next.mode?.current) {
+    if (prev.mode?.current !== next.mode?.current || availableSignature(prev.mode) !== availableSignature(next.mode)) {
       patch.mode = next.mode;
       hasChange = true;
     }

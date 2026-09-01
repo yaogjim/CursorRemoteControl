@@ -17,8 +17,10 @@ import type {
   Questionnaire,
   ServerConfig,
   SelectorConfig,
+  CompatibleModeModelProjection,
 } from './types.js';
 import { applyDerivedActivityToState } from './activity-derive.js';
+import { projectModeModel } from './capability-state-manager.js';
 
 export interface WindowSnapshot {
   windowId: string;
@@ -174,6 +176,8 @@ export class WindowMonitor extends EventEmitter {
   private _cycling = false;
   private _firstCycleLogged = false;
   private switchGeneration = -1;
+  private projectCapabilities: ((targetId: string) => CompatibleModeModelProjection) | null = null;
+  private resolveSelectors: ((client: CdpClient, targetId: string) => Promise<SelectorConfig>) | null = null;
 
   get isCycling(): boolean {
     return this._cycling;
@@ -224,6 +228,21 @@ export class WindowMonitor extends EventEmitter {
       this.homeWindowId = windowId;
       this.switchGeneration = this.stateManager.generation;
     }
+  }
+
+  setCapabilityProjector(project: ((targetId: string) => CompatibleModeModelProjection) | null): void {
+    this.projectCapabilities = project;
+  }
+
+  setSelectorResolver(resolver: ((client: CdpClient, targetId: string) => Promise<SelectorConfig>) | null): void {
+    this.resolveSelectors = resolver;
+  }
+
+  private resolveModeModel(targetId: string): { mode: ModeInfo; model: ModelInfo } {
+    const projected = this.projectCapabilities
+      ? this.projectCapabilities(targetId)
+      : projectModeModel(null);
+    return { mode: projected.mode, model: projected.model };
   }
 
   getHomeWindowId(): string {
@@ -291,8 +310,7 @@ export class WindowMonitor extends EventEmitter {
       agentActivityLive: state.agentActivityLive,
       agentActivitySource: state.agentActivitySource,
       composerQueue: state.composerQueue,
-      mode: state.mode,
-      model: state.model,
+      ...this.resolveModeModel(windowId),
       questionnaire: state.questionnaire,
       lastUpdated: Date.now(),
       activeComposerId: state.activeComposerId ?? '',
@@ -316,6 +334,7 @@ export class WindowMonitor extends EventEmitter {
       || questionnaireSig !== prevQuestionnaireSig
       || queueSig !== prevQueueSig
       || prev.mode?.current !== snapshot.mode?.current
+      || JSON.stringify(prev.mode?.available ?? []) !== JSON.stringify(snapshot.mode?.available ?? [])
       || prev.model?.current !== snapshot.model?.current
       || prev.model?.currentId !== snapshot.model?.currentId
       || messageFingerprint(prev.messages) !== messageFingerprint(snapshot.messages)
@@ -398,7 +417,10 @@ export class WindowMonitor extends EventEmitter {
         win.title = workspaceName;
       }
 
-      const state = await this.extractFromClient(client, windowTitle);
+      const selectors = this.resolveSelectors
+        ? await this.resolveSelectors(client, win.id)
+        : this.selectors;
+      const state = await this.extractFromClient(client, windowTitle, selectors);
       if (!state) {
         console.warn(`[window-monitor] Poll "${windowTitle}": extraction returned null`);
       }
@@ -414,8 +436,7 @@ export class WindowMonitor extends EventEmitter {
           agentActivityLive: state.agentActivityLive,
           agentActivitySource: state.agentActivitySource,
           composerQueue: state.composerQueue,
-          mode: state.mode,
-          model: state.model,
+          ...this.resolveModeModel(win.id),
           questionnaire: state.questionnaire,
           lastUpdated: Date.now(),
           activeComposerId: state.activeComposerId ?? '',
@@ -439,6 +460,7 @@ export class WindowMonitor extends EventEmitter {
           || qnSig !== pqnSig
           || qSig !== pqSig
           || prev.mode?.current !== snapshot.mode?.current
+          || JSON.stringify(prev.mode?.available ?? []) !== JSON.stringify(snapshot.mode?.available ?? [])
           || prev.model?.current !== snapshot.model?.current
           || prev.model?.currentId !== snapshot.model?.currentId
           || messageFingerprint(prev.messages) !== messageFingerprint(snapshot.messages)
@@ -460,24 +482,25 @@ export class WindowMonitor extends EventEmitter {
     }
   }
 
-  private async extractFromClient(client: CdpClient, windowTitle: string): Promise<CursorState | null> {
+  private async extractFromClient(client: CdpClient, windowTitle: string, selectors: SelectorConfig = this.selectors): Promise<CursorState | null> {
     try {
       const { extractionFunction } = await import('./dom-extractor.js');
 
       const result = await client.callFunctionWithTimeout(
         extractionFunction as (...args: never[]) => unknown,
         [
-          this.selectors.chatContainer?.strategies ?? [],
-          this.selectors.approveButton?.strategies ?? [],
-          this.selectors.approveButton?.textMatch ?? [],
-          this.selectors.rejectButton?.strategies ?? [],
-          this.selectors.rejectButton?.textMatch ?? [],
-          this.selectors.chatInput?.strategies ?? [],
-          this.selectors.agentStatus?.strategies ?? [],
-          this.selectors.chatTabList?.strategies ?? [],
-          this.selectors.modeDropdown?.strategies ?? [],
-          this.selectors.modelDropdown?.strategies ?? [],
+          selectors.chatContainer?.strategies ?? [],
+          selectors.approveButton?.strategies ?? [],
+          selectors.approveButton?.textMatch ?? [],
+          selectors.rejectButton?.strategies ?? [],
+          selectors.rejectButton?.textMatch ?? [],
+          selectors.chatInput?.strategies ?? [],
+          selectors.agentStatus?.strategies ?? [],
+          selectors.chatTabList?.strategies ?? [],
+          selectors.modeDropdown?.strategies ?? [],
+          selectors.modelDropdown?.strategies ?? [],
           windowTitle,
+          selectors.openChatTabList?.strategies ?? [],
         ],
         5000
       );

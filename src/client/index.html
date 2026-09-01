@@ -115,16 +115,28 @@
     </div>
 
     <footer id="input-bar">
+      <details id="capability-diagnostics" class="capability-diagnostics">
+        <summary id="capability-diagnostics-summary">Capabilities: waiting for discovery</summary>
+        <div id="capability-diagnostics-body" class="capability-diagnostics-body" aria-live="polite"></div>
+        <div class="capability-diagnostics-actions">
+          <button type="button" id="btn-capability-refresh" class="btn-capability-refresh">Refresh Cursor capabilities</button>
+          <p id="capability-refresh-status" class="capability-refresh-status" hidden></p>
+        </div>
+      </details>
       <div id="mode-model-bar" class="mode-model-bar">
-        <button id="pill-mode" class="pill" aria-label="Select mode">
+        <button id="pill-mode" class="pill" aria-label="Select mode" disabled>
           <span id="pill-mode-icon" class="pill-icon"></span>
-          <span id="pill-mode-text">Agent</span>
+          <span id="pill-mode-text">Mode unavailable</span>
           <span class="pill-chevron">&#9662;</span>
         </button>
-        <button id="pill-model" class="pill" aria-label="Select model">
-          <span id="pill-model-text">Auto</span>
+        <button id="pill-model" class="pill" aria-label="Select model" disabled>
+          <span id="pill-model-text">Model unavailable</span>
           <span class="pill-chevron">&#9662;</span>
         </button>
+      </div>
+      <div id="mode-model-status" class="mode-model-status" role="status" hidden>
+        <span id="mode-model-status-text"></span>
+        <button type="button" id="btn-mode-model-refresh" class="btn-mode-model-refresh">Refresh capabilities</button>
       </div>
       <div class="input-wrapper">
         <textarea

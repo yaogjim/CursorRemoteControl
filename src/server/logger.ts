@@ -150,7 +150,7 @@ class Logger {
       level,
       event,
       msg,
-      ...redactSensitive(meta ?? {}),
+      ...(redactSensitive(meta ?? {}) as Record<string, unknown>),
     };
 
     if (this.format === 'json') {

@@ -77,7 +77,8 @@ export function extractionFunction(
   chatTabSelectors: string[],
   modeSelectors: string[],
   modelSelectors: string[],
-  windowTitle?: string
+  windowTitle?: string,
+  openChatTabSelectors: string[] = []
 ): CursorState | null {
   function projectNameFromTitle(title: string): string {
     const idx = title.indexOf(' [');
@@ -1248,6 +1249,17 @@ export function extractionFunction(
     };
     const cleanBtnLabel = (raw: string): string =>
       raw.replace(/\s*(Shift\+)?⏎\s*/g, '').replace(/\s+/g, ' ').trim();
+    const matchingButtonLabel = (btn: Element, patterns: string[]): string => {
+      const candidates = [btn.textContent || '', btn.getAttribute('aria-label') || '']
+        .map(cleanBtnLabel)
+        .filter(Boolean);
+      for (const candidate of candidates) {
+        if (patterns.some(pattern => candidate.toLowerCase() === cleanBtnLabel(pattern).toLowerCase())) {
+          return candidate;
+        }
+      }
+      return '';
+    };
 
     const seenCards = new Set<Element>();
     const approvalRows = container.querySelectorAll('.ui-shell-tool-call__approval-row');
@@ -1318,7 +1330,7 @@ export function extractionFunction(
           const btns = container.querySelectorAll(sel);
           for (const btn of Array.from(btns)) {
             if (seenApproveBtns.has(btn) || isMenuTrigger(btn)) continue;
-            const label = btn.textContent?.trim() || btn.getAttribute('aria-label') || '';
+            const label = matchingButtonLabel(btn, approveTextMatch);
             if (label) {
               seenApproveBtns.add(btn);
               approveButtons.push({ label, selector: buildSelectorPath(btn) });
@@ -1329,13 +1341,10 @@ export function extractionFunction(
       if (approveButtons.length === 0 && approveTextMatch.length > 0) {
         for (const btn of Array.from(container.querySelectorAll('button'))) {
           if (seenApproveBtns.has(btn) || isMenuTrigger(btn)) continue;
-          const text = `${btn.textContent?.trim() || ''} ${btn.getAttribute('aria-label') || ''}`.toLowerCase();
-          for (const pat of approveTextMatch) {
-            if (text.includes(pat.toLowerCase())) {
-              seenApproveBtns.add(btn);
-              approveButtons.push({ label: btn.textContent?.trim() || pat, selector: buildSelectorPath(btn) });
-              break;
-            }
+          const label = matchingButtonLabel(btn, approveTextMatch);
+          if (label) {
+            seenApproveBtns.add(btn);
+            approveButtons.push({ label, selector: buildSelectorPath(btn) });
           }
         }
       }
@@ -1345,7 +1354,7 @@ export function extractionFunction(
           const btns = container.querySelectorAll(sel);
           for (const btn of Array.from(btns)) {
             if (seenRejectBtns.has(btn) || isMenuTrigger(btn)) continue;
-            const label = btn.textContent?.trim() || btn.getAttribute('aria-label') || '';
+            const label = matchingButtonLabel(btn, rejectTextMatch);
             if (label) {
               seenRejectBtns.add(btn);
               rejectButtons.push({ label, selector: buildSelectorPath(btn) });
@@ -1356,13 +1365,10 @@ export function extractionFunction(
       if (rejectButtons.length === 0 && rejectTextMatch.length > 0) {
         for (const btn of Array.from(container.querySelectorAll('button'))) {
           if (seenRejectBtns.has(btn) || isMenuTrigger(btn)) continue;
-          const text = `${btn.textContent?.trim() || ''} ${btn.getAttribute('aria-label') || ''}`.toLowerCase();
-          for (const pat of rejectTextMatch) {
-            if (text.includes(pat.toLowerCase())) {
-              seenRejectBtns.add(btn);
-              rejectButtons.push({ label: btn.textContent?.trim() || pat, selector: buildSelectorPath(btn) });
-              break;
-            }
+          const label = matchingButtonLabel(btn, rejectTextMatch);
+          if (label) {
+            seenRejectBtns.add(btn);
+            rejectButtons.push({ label, selector: buildSelectorPath(btn) });
           }
         }
       }
@@ -1418,74 +1424,125 @@ export function extractionFunction(
 
     try {
       const seenTitles = new Set<string>();
+      const titleKey = (title: string): string => cleanTabTitle(title).toLowerCase();
+
+      // The horizontal agent tab strip is the authoritative list of sessions
+      // that are currently open. Its DOM order matches Cursor left-to-right, so
+      // appending here first maps directly to top-to-bottom on mobile.
+      for (const sel of openChatTabSelectors) {
+        let openItems: NodeListOf<Element>;
+        try {
+          openItems = document.querySelectorAll(sel);
+        } catch {
+          continue;
+        }
+        if (openItems.length === 0) continue;
+        for (const tab of Array.from(openItems)) {
+          const labelEl = tab.querySelector('[aria-id="chat-horizontal-tab"]');
+          const title = cleanTabTitle(
+            labelEl?.getAttribute('aria-label')
+            || labelEl?.textContent
+            || tab.getAttribute('aria-label')
+            || tab.textContent
+            || ''
+          );
+          const key = titleKey(title);
+          if (!title || seenTitles.has(key)) continue;
+          seenTitles.add(key);
+          const isActive = tab.getAttribute('aria-selected') === 'true'
+            || tab.getAttribute('aria-expanded') === 'true'
+            || tab.classList.contains('checked');
+          chatTabs.push({
+            composerId: `open:${title}`,
+            title,
+            isActive,
+            isOpen: true,
+            status: isActive ? 'active' : 'idle',
+            selectorPath: buildSelectorPath(tab),
+          });
+        }
+        break;
+      }
+
+      const hasOpenTabs = chatTabs.some((tab) => tab.isOpen);
       let scopeRoot: Element | null = null;
+      let historyFound = false;
+      const projectName = projectNameFromTitle(windowTitle || '').replace(/\s+/g, ' ').trim().toLowerCase();
       if (containerComposerId) {
         const allCells = document.querySelectorAll('.agent-sidebar-cell');
         for (const cell of Array.from(allCells)) {
           const cid = cell.getAttribute('data-composer-id') || cell.closest('[data-composer-id]')?.getAttribute('data-composer-id');
           if (cid === containerComposerId) {
-            scopeRoot = cell.closest('.agent-sidebar-project-cell') || document.body;
+            scopeRoot = cell.closest('.agent-sidebar-project-cell');
             break;
           }
         }
       }
-      if (!scopeRoot && windowTitle) {
-        const projectName = projectNameFromTitle(windowTitle).toLowerCase();
-        if (projectName) {
-          const projectCells = document.querySelectorAll('.agent-sidebar-project-cell');
-          for (const cell of Array.from(projectCells)) {
-            const labelEl = cell.querySelector('.agent-sidebar-section-title-text') || cell.querySelector('.agent-sidebar-workspace-name') || cell;
-            const label = (labelEl.textContent || '').trim().toLowerCase();
-            const firstWord = (label.split(/[\s\[\]\-]/)[0] || '').toLowerCase();
-            if (label.includes(projectName) || projectName.includes(firstWord) || firstWord === projectName) {
-              scopeRoot = cell;
-              break;
-            }
+      if (!scopeRoot && projectName) {
+        const projectCells = document.querySelectorAll('.agent-sidebar-project-cell');
+        for (const cell of Array.from(projectCells)) {
+          const labelEl = cell.querySelector('.agent-sidebar-section-title-text') || cell.querySelector('.agent-sidebar-workspace-name');
+          const label = (labelEl?.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+          if (label === projectName || label.startsWith(`${projectName} `) || projectName.startsWith(`${label} `)) {
+            scopeRoot = cell;
+            break;
           }
         }
       }
-      // Cursor Agents unified window: glass sidebar rows (replaces .agent-sidebar-cell in newer builds)
+      // When Cursor explicitly hides the unified cross-project sidebar, the
+      // remaining .agent-sidebar is the current window's local history list.
+      if (!scopeRoot && document.body.classList.contains('unifiedsidebarhidden')) {
+        scopeRoot = document.querySelector('.agent-sidebar');
+      }
+      // Cursor Agents unified window: glass sidebar rows (replaces .agent-sidebar-cell in newer builds).
+      // This sidebar can contain sessions from every project. Filter by the
+      // project group before adding a row; an unscoped result is unsafe because
+      // it makes unrelated sessions look like sessions in this window.
       const glassTabRoots = document.querySelectorAll(
         '.glass-sidebar-agent-list-container li.ui-sidebar-menu-item > div.glass-sidebar-agent-menu-btn'
       );
       if (glassTabRoots.length > 0) {
         for (const tab of Array.from(glassTabRoots)) {
+          const group = tab.closest('.ui-sidebar-group');
+          const groupTitleEl = group?.querySelector('.ui-sidebar-group-label-title');
+          const rawGroupTitle = (groupTitleEl?.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+          const inWindowProject = Boolean(
+            (scopeRoot && scopeRoot.contains(tab))
+            || (projectName && rawGroupTitle && (
+              rawGroupTitle === projectName
+              || rawGroupTitle.startsWith(`${projectName} `)
+              || projectName.startsWith(`${rawGroupTitle} `)
+            ))
+          );
+          if (!inWindowProject) continue;
+
           const labelEl = tab.querySelector('.ui-sidebar-menu-button-label');
           const rawAgentTitle = (labelEl?.textContent || '').trim();
           if (!rawAgentTitle) continue;
 
-          const group = tab.closest('.ui-sidebar-group');
-          const groupTitleEl = group?.querySelector('.ui-sidebar-group-label-title');
-          const rawGroupTitle = (groupTitleEl?.textContent || '').trim();
-
-          let displayTitle = cleanTabTitle(rawAgentTitle);
-          if (rawGroupTitle) {
-            const g = cleanTabTitle(rawGroupTitle);
-            if (g) {
-              displayTitle = `${g} / ${cleanTabTitle(rawAgentTitle)}`.substring(0, 120);
-            }
-          }
-
-          if (seenTitles.has(displayTitle)) continue;
-          seenTitles.add(displayTitle);
+          const displayTitle = cleanTabTitle(rawAgentTitle);
+          const key = titleKey(displayTitle);
+          if (seenTitles.has(key)) continue;
+          seenTitles.add(key);
 
           const composerId =
             tab.getAttribute('data-composer-id')
             || tab.closest('[data-composer-id]')?.getAttribute('data-composer-id')
             || `glass:${displayTitle}`;
-
           const isActive = tab.getAttribute('data-active') === 'true';
 
           chatTabs.push({
             composerId,
             title: displayTitle,
             isActive,
+            isOpen: false,
             status: isActive ? 'active' : 'idle',
             selectorPath: buildSelectorPath(tab),
           });
+          historyFound = true;
         }
 
-        if (containerComposerId) {
+        if (containerComposerId && !hasOpenTabs) {
           let matched = false;
           for (const t of chatTabs) {
             if (t.composerId === containerComposerId) {
@@ -1506,24 +1563,32 @@ export function extractionFunction(
       }
 
       for (const sel of chatTabSelectors) {
-        if (chatTabs.length > 0) break;
+        if (historyFound) break;
         let tabItems: NodeListOf<Element>;
         try {
-          const root: Element | Document = scopeRoot || document;
+          // A legacy selector is only safe when a project scope was found.
+          // Never fall back to document-wide history in a unified sidebar.
+          if (!scopeRoot) continue;
+          const root: Element = scopeRoot;
           tabItems = root.querySelectorAll(sel);
         } catch {
           continue;
         }
         if (tabItems.length === 0) continue;
         for (const tab of Array.from(tabItems)) {
-          if (scopeRoot && !scopeRoot.contains(tab)) continue;
+          if (!scopeRoot.contains(tab)) continue;
+          // Cursor renders utility rows such as New Agent and Customize with
+          // no hover actions. They are controls, not switchable sessions.
+          if (tab.classList.contains('agent-sidebar-cell')
+              && tab.getAttribute('data-has-hover-actions') === 'false') continue;
           const titleEl = tab.querySelector('.agent-sidebar-cell-text');
           const rawTitle = titleEl
             ? (titleEl.textContent || '').trim()
             : (tab.getAttribute('aria-label') || tab.textContent || '').trim();
           const title = cleanTabTitle(rawTitle);
-          if (!title || seenTitles.has(title)) continue;
-          seenTitles.add(title);
+          const key = titleKey(title);
+          if (!title || seenTitles.has(key)) continue;
+          seenTitles.add(key);
 
           const composerId = tab.getAttribute('data-composer-id')
             || tab.closest('[data-composer-id]')?.getAttribute('data-composer-id')
@@ -1539,12 +1604,14 @@ export function extractionFunction(
             composerId,
             title,
             isActive,
+            isOpen: false,
             status: isActive ? 'active' : 'idle',
             selectorPath: buildSelectorPath(tab),
           });
+          historyFound = true;
         }
-        if (chatTabs.length > 0) {
-          if (containerComposerId) {
+        if (historyFound) {
+          if (containerComposerId && !hasOpenTabs) {
             let matched = false;
             for (const t of chatTabs) {
               const match = t.composerId === containerComposerId;
@@ -1915,6 +1982,7 @@ export class DOMExtractor {
           this.selectors.modeDropdown?.strategies ?? [],
           this.selectors.modelDropdown?.strategies ?? [],
           this.getWindowTitle(),
+          this.selectors.openChatTabList?.strategies ?? [],
         ],
         EVALUATE_TIMEOUT_MS
       ) as CursorState | null;

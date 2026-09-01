@@ -47,7 +47,9 @@ export interface QuestionnaireOption {
   letter: string;
   label: string;
   isFreeform: boolean;
+  /** Internal extractor path; stripped from public socket state. */
   selectorPath: string;
+  actionId?: string;
 }
 
 export interface QuestionnaireQuestion {
@@ -61,8 +63,12 @@ export interface Questionnaire {
   questions: QuestionnaireQuestion[];
   activeIndex: number;
   totalLabel: string;
+  /** Internal extractor path; stripped from public socket state. */
   skipSelectorPath: string;
+  skipActionId?: string;
+  /** Internal extractor path; stripped from public socket state. */
   continueSelectorPath: string;
+  continueActionId?: string;
   continueDisabled: boolean;
 }
 
@@ -110,7 +116,10 @@ export interface ChatTab {
   composerId: string;
   title: string;
   isActive: boolean;
+  /** True when the session is present in Cursor's horizontal open-tab strip. */
+  isOpen?: boolean;
   status: string;
+  /** Internal extractor path; stripped from public socket state. */
   selectorPath: string;
 }
 
@@ -220,7 +229,10 @@ export interface PlanTodo {
 export interface PlanAction {
   label: string;
   type: 'view_plan' | 'build';
+  /** Internal extractor path; stripped from public socket state. */
   selectorPath: string;
+  /** Present when the server has authorized the action for one target generation. */
+  actionId?: string;
 }
 
 export interface PlanBlock {
@@ -238,8 +250,10 @@ export interface PlanBlock {
   /** Hidden todo rows behind "N more" in Cursor (estimated). */
   todosMoreCount?: number;
   model?: string;
-  /** Click to open plan-scoped model dropdown in Cursor. */
+  /** Click to open plan-scoped model dropdown in Cursor. Internal; stripped from public state. */
   modelDropdownSelectorPath?: string;
+  /** Opaque authorization for the plan model trigger. */
+  modelActionId?: string;
   actions?: PlanAction[];
 }
 
@@ -268,7 +282,9 @@ export interface TodoListBlock {
 export interface RunAction {
   label: string;
   type: 'run' | 'skip' | 'allow';
+  /** Internal extractor path; stripped from public socket state. */
   selectorPath: string;
+  actionId?: string;
 }
 
 export interface RunCommand {
@@ -298,7 +314,10 @@ export interface Approval {
 export interface ApprovalAction {
   label: string;
   type: 'approve' | 'reject' | 'approve_all';
+  /** Internal extractor path; stripped from public socket state. */
   selectorPath: string;
+  /** Present when the action has been registered by the server. */
+  actionId?: string;
 }
 
 export interface SelectorStrategy {
@@ -321,6 +340,10 @@ export interface CommandPayload {
   text?: string;
   approvalId?: string;
   actionType?: string;
+  /** Opaque ActionRegistry id; selectorPath is retained only for legacy reads. */
+  actionId?: string;
+  operationId?: string;
+  targetGeneration?: number;
   selectorPath?: string;
   actionLabel?: string;
   composerId?: string;
@@ -350,6 +373,9 @@ export interface ServerConfig {
   webappPassword: string;
   windowTitleQualifier: boolean;
   dataDir: string;
+  adapterStorePath: string;
+  adapterBackupCount: number;
+  actionTtlMs: number;
   telegram: TelegramConfig;
 }
 
@@ -358,4 +384,247 @@ export interface TelegramConfig {
   botToken: string;
   preRegisteredUsers: number[];
   impl: 'grammy' | 'raw';
+}
+
+// --- Capability discovery (P0): independent of DOM CursorState ---
+
+export type BrowserFamily = 'cursor' | 'vscode' | 'chrome' | 'unknown';
+
+export type DiscoveryStatus =
+  | 'idle'
+  | 'running'
+  | 'ok'
+  | 'degraded'
+  | 'failed'
+  | 'stale'
+  | 'endpoint_unverified'
+  | 'target_unverified';
+
+export type CapabilityState =
+  | 'ok'
+  | 'changed'
+  | 'degraded'
+  | 'unknown'
+  | 'stale'
+  | 'unavailable';
+
+export type MenuCompleteness = 'complete' | 'partial' | 'unknown';
+
+export type CapabilityKind = 'mode' | 'model' | 'tool';
+
+export type CapabilityEvidenceSource =
+  | 'data_attribute'
+  | 'aria'
+  | 'menu'
+  | 'registered_adapter'
+  | 'inferred';
+
+export type DiscoveryDiagnosticCode =
+  | 'cdp_unreachable'
+  | 'endpoint_unverified'
+  | 'target_list_failed'
+  | 'target_unverified'
+  | 'preferred_target_ambiguous'
+  | 'webview_target'
+  | 'runtime_evaluate_failed'
+  | 'composer_not_found'
+  | 'mode_trigger_not_found'
+  | 'mode_menu_not_opened'
+  | 'model_trigger_not_found'
+  | 'model_menu_not_opened'
+  | 'model_menu_empty'
+  | 'model_menu_partial'
+  | 'tool_scope_ambiguous'
+  | 'action_expired'
+  | 'action_scope_changed'
+  | 'action_consumed'
+  | 'selector_invalid'
+  | 'selector_non_unique'
+  | 'adapter_validation_failed'
+  | 'capability_circuit_open'
+  | 'adapter_rollback'
+  | 'identity_ok';
+
+export type DiagnosticSeverity = 'info' | 'warning' | 'error';
+
+export interface CdpVersionInfo {
+  Browser?: string;
+  'User-Agent'?: string;
+  UserAgent?: string;
+  'Protocol-Version'?: string;
+  webSocketDebuggerUrl?: string;
+}
+
+export interface EndpointIdentity {
+  verified: boolean;
+  browserFamily: BrowserFamily;
+  protocolVersion: string;
+  product: string;
+  diagnosticCode: DiscoveryDiagnosticCode;
+  diagnosticMessage: string;
+}
+
+export interface DiscoveryDiagnostic {
+  id: string;
+  code: DiscoveryDiagnosticCode;
+  severity: DiagnosticSeverity;
+  windowId?: string;
+  targetId?: string;
+  adapterId?: string;
+  message: string;
+  evidence: Record<string, string | number | boolean | null>;
+  createdAt: number;
+}
+
+export interface DiscoverySummary {
+  status: DiscoveryStatus;
+  targetId: string;
+  targetGeneration: number;
+  fingerprint?: string;
+  lastRunAt: number | null;
+  diagnosticIds: string[];
+}
+
+/** Public, redacted discovery payload for GET /api/discovery/status. */
+export interface SanitizedDiscoveryStatus {
+  status: DiscoveryStatus;
+  endpoint: {
+    verified: boolean;
+    browserFamily: BrowserFamily;
+    protocolVersion: string;
+    product: string;
+  };
+  activeTargetId: string;
+  targetGeneration: number;
+  preferredTargetPresent: boolean | null;
+  windowCount: number;
+  lastRunAt: number | null;
+  lastError: { code: DiscoveryDiagnosticCode; message: string } | null;
+  diagnostics: Array<{
+    code: DiscoveryDiagnosticCode;
+    severity: DiagnosticSeverity;
+    message: string;
+    targetId?: string;
+  }>;
+  capabilities?: {
+    targetId: string;
+    targetGeneration: number;
+    revision: number;
+    state: CapabilityState;
+  } | null;
+}
+
+export interface CapabilityStatus {
+  state: CapabilityState;
+  confidence: number;
+  completeness: MenuCompleteness;
+  revision: number;
+  targetGeneration: number;
+  expectedCount?: number;
+  observedCount?: number;
+  missing?: string[];
+  added?: string[];
+  changed?: string[];
+  conflicts?: string[];
+  lastObservedAt?: number | null;
+  lastVerifiedAt?: number | null;
+  diagnosticIds?: string[];
+}
+
+export interface ModeCapability {
+  id: string;
+  label: string;
+  icon?: string;
+  current: boolean;
+  source: CapabilityEvidenceSource;
+  confidence: number;
+  scope: 'composer';
+  selectable: boolean;
+  observedAt: number;
+}
+
+export interface ModelCapability {
+  id: string;
+  label: string;
+  selected: boolean;
+  scope: 'composer' | 'plan';
+  idStability: 'stable' | 'label' | 'runtime_only';
+  source: CapabilityEvidenceSource;
+  confidence: number;
+  selectable: boolean;
+  observedAt: number;
+}
+
+export interface ModelCapabilitySnapshot {
+  items: ModelCapability[];
+  completeness: MenuCompleteness;
+  filterActive: boolean;
+  observedAt: number;
+}
+
+/** Opaque action id only — no selector paths. */
+export interface ToolActionCapability {
+  /** Opaque server-generated id; selector paths never cross the public boundary. */
+  actionId: string;
+  label: string;
+  kind: string;
+  executable: boolean;
+  requiresConfirmation: boolean;
+  expiresAt: number;
+}
+
+export interface RegisteredActionTarget {
+  actionId: string;
+  windowId: string;
+  targetId: string;
+  targetGeneration: number;
+  composerId: string;
+  toolCallId: string;
+  adapterId: string;
+  actionType: string;
+  expectedLabel: string;
+  selectorStrategyId: string;
+  selectorPath: string;
+  createdAt: number;
+  expiresAt: number;
+  consumed: boolean;
+}
+
+export interface ToolCapability {
+  id: string;
+  type: string;
+  source: CapabilityEvidenceSource;
+  executable: boolean;
+  actions: ToolActionCapability[];
+}
+
+export interface CapabilitySummary {
+  targetId: string;
+  targetGeneration: number;
+  revision: number;
+  modes: ModeCapability[];
+  models: ModelCapabilitySnapshot;
+  tools: ToolCapability[];
+  status: CapabilityStatus;
+  adapterBindings: Record<CapabilityKind, string>;
+  observedAt: number;
+}
+
+export interface CapabilityPatch {
+  targetId: string;
+  targetGeneration: number;
+  revision: number;
+  status?: CapabilityStatus;
+  modes?: ModeCapability[];
+  models?: ModelCapabilitySnapshot;
+  tools?: ToolCapability[];
+  adapterBindings?: Record<CapabilityKind, string>;
+  stale?: boolean;
+}
+
+/** Read-only projection of capability state onto the legacy ModeInfo/ModelInfo shape. */
+export interface CompatibleModeModelProjection {
+  mode: ModeInfo;
+  model: ModelInfo;
+  status: CapabilityState;
 }

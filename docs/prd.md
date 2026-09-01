@@ -321,7 +321,8 @@ WSL2 仍然是受支持的部署（中继在 WSL2，Cursor 在 Windows）；macO
 | -------------- | -------- | ----------------------------- |
 | `label` | `string` | 按钮文本（“View Plan”、“Build”） |
 | `type` | `string` | `'view_plan'` 或 `'build'` |
-| `selectorPath` | `string` | 通过 CDP 点击的 CSS 选择器路径 |
+| `selectorPath` | `string` | 内部提取路径；从公开 socket 状态剥离，**不是**授权 |
+| `actionId` | `string?` | 服务端 ActionRegistry 颁发的不透明 id；缺失则按钮不可执行 |
 
 #### TodoListBlock（`type: 'todo_list'`）
 
@@ -356,7 +357,8 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 | -------------- | -------- | ---------------------------------------------- |
 | `label` | `string` | 按钮文本（“Run”、“Skip”、“Allow”） |
 | `type` | `string` | `'run'`、`'skip'` 或 `'allow'` |
-| `selectorPath` | `string` | 通过 CDP 点击此按钮的 CSS 选择器路径 |
+| `selectorPath` | `string` | 内部提取路径；从公开状态剥离，**不是**授权 |
+| `actionId` | `string?` | 服务端颁发的不透明 id；客户端只提交这个 id |
 
 #### LoadingIndicator（`type: 'loading'`）
 
@@ -373,6 +375,7 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 | `composerId` | `string` | Cursor 内部 composer ID |
 | `title` | `string` | Tab 显示名 |
 | `isActive` | `boolean` | 是否为当前聚焦 tab |
+| `isOpen` | `boolean?` | 是否出现在 Cursor 顶部横向打开会话栏；手机端按该字段把打开会话排在历史会话之前 |
 | `status` | `string` | Tab 状态（completed、running 等） |
 | `selectorPath` | `string` | 点击以切换到该 tab 的 CSS 路径 |
 
@@ -413,7 +416,8 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 | -------------- | -------- | --------------------------------------------------- |
 | `label` | `string` | 按钮文本（“Accept”、“Reject” 等） |
 | `type` | `string` | `'approve'`、`'reject'` 或 `'approve_all'` |
-| `selectorPath` | `string` | 通过 CDP 点击此按钮使用的 CSS 选择器路径 |
+| `selectorPath` | `string` | 内部提取路径；从公开状态剥离，**不是**授权 |
+| `actionId` | `string?` | 服务端颁发的不透明 id |
 
 ### 4.10 Questionnaire
 
@@ -424,8 +428,10 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 | `questions` | `QuestionnaireQuestion[]` | 问卷中的全部问题 |
 | `activeIndex` | `number` | 活动问题的 0 基索引 |
 | `totalLabel` | `string` | 步进标签，例如 “1 of 3” |
-| `skipSelectorPath` | `string` | Skip 按钮的 CSS 选择器 |
-| `continueSelectorPath` | `string` | Continue 按钮的 CSS 选择器 |
+| `skipSelectorPath` | `string` | Skip 的内部路径；公开状态剥离，不是授权 |
+| `continueSelectorPath` | `string` | Continue 的内部路径；公开状态剥离，不是授权 |
+| `skipActionId` | `string?` | Skip 的 ActionRegistry id |
+| `continueActionId` | `string?` | Continue 的 ActionRegistry id |
 | `continueDisabled` | `boolean` | Continue 是否禁用 |
 
 ### 4.11 QuestionnaireQuestion
@@ -444,7 +450,8 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 | `letter` | `string` | 选项字母（“A”、“B”、“C”、“D”） |
 | `label` | `string` | 选项文本（“Spring”、“Summer” 等） |
 | `isFreeform` | `boolean` | 自由输入的 “Other...” 选项为 true |
-| `selectorPath` | `string` | 通过 CDP 点击此选项的 CSS 选择器路径 |
+| `selectorPath` | `string` | 内部提取路径；公开状态剥离，不是授权 |
+| `actionId` | `string?` | 服务端颁发的不透明 id |
 
 ### 4.13 ComposerQueueState
 
@@ -465,27 +472,32 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 | `state:patch` | `Partial<CursorState>` | 任何状态字段变化时 |
 | `connection:status` | `{ connected: boolean }` | CDP 连接或断开时（内部 EventEmitter 事件是 `connection:changed`） |
 | `command:result` | `{ commandId, ok, error?, data? }` | 命令执行或失败后 |
+| `capabilities:full` | 能力快照信封（`activeTargetId` + `snapshots[]`） | 连接初始化或显式刷新后；含 targetGeneration/revision/completeness |
+| `capabilities:patch` | 带 `targetId` / `targetGeneration` / `revision` 的增量 | 能力或 adapter 诊断变化；旧 revision 必须丢弃 |
+| `capabilities:stale` | `{ targetId }` | target 重建或能力过期；不表示 CDP socket 已断开 |
+
+公开 `CursorState` 会剥离 `selectorPath` 与 `_rawSignals`。可执行按钮的授权字段是服务端 `actionId`，不是 CSS 路径。
 
 ### 5.2 客户端 → 服务器
 
 | 事件 | 载荷 | 说明 |
 | ---------------------- | --------------------------------------------- | ---------------------------------- |
-| `command:send_message` | `{ commandId, text }` | 输入并提交新提示 |
-| `command:approve` | `{ commandId, approvalId, selectorPath }` | 点击审批按钮 |
-| `command:approve_all` | `{ commandId }` | 点击 “Accept All” |
-| `command:reject` | `{ commandId, approvalId, selectorPath }` | 点击 reject 按钮 |
+| `command:send_message` | `{ commandId, operationId, text }` | 输入并提交新提示；`operationId` 用于服务端幂等与限流 |
+| `command:approve` | `{ commandId, operationId, approvalId, actionId }` | 点击审批。授权依据是服务端 `actionId`；`selectorPath` 不是授权 |
+| `command:approve_all` | `{ commandId, operationId, actionId }` | 点击 “Accept All”；`actionType` 必须是 `approve_all`，不能用 `approve` 冒充 |
+| `command:reject` | `{ commandId, approvalId, actionId }` | 点击 reject；仍需合法、未消费的 `actionId` |
 | `command:switch_tab` | `{ commandId, tabTitle }` | 切换到不同聊天 tab |
-| `command:new_chat` | `{ commandId }` | 创建新聊天 tab |
-| `command:set_mode` | `{ commandId, modeId }` | 更改 agent mode |
-| `command:set_model` | `{ commandId, modelId }` | 更改模型 |
-| `command:get_model_options` | `{ commandId }` | 刮取 Cursor 现场模型菜单 |
+| `command:new_chat` | `{ commandId, operationId }` | 创建新聊天 tab |
+| `command:set_mode` | `{ commandId, operationId, modeId }` | 更改 agent mode；id 必须来自当前已验证能力目录 |
+| `command:set_model` | `{ commandId, operationId, modelId }` | 更改模型；同样受能力目录约束 |
+| `command:get_model_options` | `{ commandId }` | 刮取 Cursor 现场模型菜单（INTERACTIVE，不是 PASSIVE） |
 | `command:get_plan_full` | `{ commandId, label }` | 从磁盘加载完整计划正文/todos |
-| `command:get_plan_model_options` | `{ commandId, selectorPath }` | 刮取计划作用域模型菜单 |
-| `command:set_plan_model` | `{ commandId, modelId, selectorPath }` | 把所选计划模型应用回 Cursor |
+| `command:get_plan_model_options` | `{ commandId, actionId }` | 刮取计划作用域模型菜单；只接受已注册的 plan-model action |
+| `command:set_plan_model` | `{ commandId, operationId, planModelId, actionId }` | 把所选计划模型应用回 Cursor；属于危险写命令 |
 | `command:switch_window` | `{ commandId, windowId }` | 切换到不同 Cursor 窗口 |
-| `command:click_action` | `{ commandId, selectorPath }` | 按选择器点击任意操作按钮（Run、Skip、Allow、Build、View Plan、问卷选项） |
+| `command:click_action` | `{ commandId, actionId, actionType, operationId? }` | 点击已注册动作。缺少有效 `actionId`/`actionType` 时拒绝；`approve`、`approve_all`、`allow`、`run`、`build`、`continue` 要求 bounded `operationId`，`reject`、`skip`、问卷选项和只读动作不要求 |
 
-每个客户端命令包含一个 `commandId`（UUID），会在 `command:result` 中回显以便关联。问卷回答没有单独的 socket 事件；Web 客户端通过 `command:click_action` 发送选项/Skip/Continue 的 `selectorPath`。
+每个客户端命令包含一个 `commandId`（UUID），会在 `command:result` 中回显以便关联。问卷回答没有单独的 socket 事件；Web 客户端通过 `command:click_action` 发送选项/Skip/Continue 的 `actionId`。`SIDE_EFFECT` 按动作显式批准：点 Plan **Build** 只授权 `build`，不授予 Run/Approve/Allow/Mode/Model/adapter apply。授权级别与验收分层见 §15 和 `docs/cursor-capability-sync-plan.md` 第 21 节。
 
 ---
 
@@ -572,7 +584,7 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 
 **行为**：
 
-- “Build” 用 Build 按钮的 `selectorPath` 发出 `command:click_action`
+- “Build” 用 Build 按钮的 `actionId`（`actionType: 'build'`）发出 `command:click_action`。这只授权这一次 Build，不授予 Run/Approve/Allow/Mode/Model/adapter apply
 - “View Plan” 打开 Web 模态框；当有已保存的计划文件时，模态框从磁盘加载完整计划正文和 todo 列表，使手机视图与 Telegram 的完整计划视图一致
 - 点模型药丸打开 Web 侧选择器，选项来自 Cursor 当前计划模型菜单，再把所选选项应用回 Cursor
 - 计划执行期间 todo 状态变化时，卡片就地更新
@@ -589,9 +601,8 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 
 **行为**：
 
-- “Run” 用 Run 按钮的 `selectorPath` 发出 `command:click_action`
-- “Skip” 用 Skip 按钮的 `selectorPath` 发出 `command:click_action`
-- “Allow” 用 Allow 按钮的 `selectorPath` 发出 `command:click_action`
+- “Run” / “Skip” / “Allow” 各自用对应按钮的 `actionId` 发出 `command:click_action`，`actionType` 必须精确匹配。一般 Build 或其他动作的授权不能复用到这些按钮
+- 缺少 `actionId` 时按钮不可执行；不得回退到客户端 `selectorPath` 授权
 
 ### 6.11 原生代码块与 diff（`codeBlocks`、`diffBlock`、Web UX）
 
@@ -765,10 +776,10 @@ CLI 工具（`src/discovery/discover-dom.ts`，通过 `npm run discover` 运行�
 | DOM 提取（tab/mode） | 完成 | `.agent-sidebar-cell` / glass sidebar tab + 来自下拉的 mode/model |
 | 状态管理 + diff | 完成 | JSON diff、防抖广播、窗口与 DOM 分开跟踪 |
 | 消息发送 | 完成 | 通过 CDP 的 Input.insertText + Enter |
-| 审批按钮 | 完成 | 文本匹配 + 基于选择器的点击 |
+| 审批按钮 | 代码已落地 | 文本匹配用于展示；点击授权走 ActionRegistry `actionId`。真实 Tool/审批 SIDE_EFFECT live 本批次未宣称通过 |
 | 聊天 tab 切换 | 完成 | 通过 JS `.click()` 在 `.agent-sidebar-cell` 上基于标题匹配 |
-| Mode 切换 | 完成 | 对下拉触发器和项 JS `.click()` |
-| Model 切换 | 完成 | 对下拉触发器和项 JS `.click()`，验证菜单关闭 |
+| Mode 切换 | 代码已落地 / isolated tests | 受动态能力目录约束；Telegram Mode E2E deferred |
+| Model 切换 | 代码已落地 / isolated tests | 受 completeness 约束；Telegram Model E2E deferred |
 | 现场模型列表 | 完成 | `getModelOptions` 刮取 Cursor 的模型菜单（不再硬编码模型 ID） |
 | 移动端模型菜单 | 完成 | MAX 开关、分类、brain 徽章 |
 | 移动 Web 客户端 | 完成 | 按类型聊天渲染、匹配 Cursor 的主题 |
@@ -779,9 +790,11 @@ CLI 工具（`src/discovery/discover-dom.ts`，通过 `npm run discover` 运行�
 | Run command 提取 | 完成 | `.composer-terminal-tool-call-block-container` → 带命令文本、actions 的 RunCommand |
 | Run command Web 渲染 | 完成 | 带等宽文本、Run/Skip/Allow 按钮的命令卡片 |
 | 原生代码 / diff（Web） | 完成 | `codeBlocks` / `diffBlock` → `.native-code-block`；约 7 行视口 + 滚动 + 全屏模态；无 Monaco HTML 镜像 |
-| 问卷 | 完成 | Web 栏 + Telegram 内联键盘，经 `command:click_action` |
+| 问卷 | 代码已落地 | Web 栏 + Telegram 内联键盘走 `actionId`；Telegram Action E2E deferred |
 | 传输层抽象 | 完成 | Transport 接口、SendQueue、MessageTracker、WindowMonitor |
-| Telegram 传输层 | 完成 | grammy bot（raw 回退）、自动同步、/register 认证、并行 CDP、内联键盘 |
+| Telegram 传输层 | 完成（监视） / 控制 E2E deferred | grammy bot（raw 回退）、自动同步、/register 认证、并行 CDP、内联键盘。Mode/Model/Action/Tool live E2E 见 §15 |
+| ActionRegistry | 代码已落地 / isolated tests | 不透明 action id、TTL、一次性消费、跨 generation 拒绝。**不宣称**真实 Tool 副作用已通过 |
+| Adapter apply 激活 | **本批次禁用** | `POST /api/adapters/:id/apply` 稳定返回 `503 ADAPTER_ACTIVATION_UNAVAILABLE`。Mode 候选保持 pending，当前 selector 路径继续生效 |
 | 安装文档 | 完成 | `docs/setup-guide.md`、`docs/tailscale-setup.md`、`docs/telegram-troubleshooting.md` |
 | VS Code 扩展外壳 | 完成 | 见 `docs/extension_prd.md` |
 
@@ -816,25 +829,26 @@ CLI 工具（`src/discovery/discover-dom.ts`，通过 `npm run discover` 运行�
 - **自动审批规则**：可配置规则，例如 “自动批准 read 操作”
 - **PWA**：Service worker + manifest，支持 “添加到主屏幕”
 - **推送通知**：Web Push API，浏览器关闭时也能提醒
-- **动态 mode 列表**：从 Cursor 的 DOM 提取可用 mode，而不是硬编码 `available` 数组（模型选项已经通过 `getModelOptions` 现场刮取）
+- **动态 mode 列表**：从 Cursor 的 DOM 提取可用 mode（PassiveProbe 当前值已旁路；完整菜单属 INTERACTIVE）。Mode 候选保持 pending，本批次不激活 adapter apply
+- **ADAPTER_APPLY**：生产 `AdapterRegistry` 接入真实 Cursor build + DOM fingerprint 之后，才能解除 `503 ADAPTER_ACTIVATION_UNAVAILABLE`
 
 ---
 
 ## 14. 成功标准
 
-当满足以下条件时，认为系统成功：
+当满足以下条件时，认为**产品**成功。本批次是否已经验到对应层级，以 §15 为准：代码实现、isolated tests、PASSIVE live、SIDE_EFFECT live 必须分开记录。不得把 isolated tests 写成真实 Tool 副作用已通过。
 
-**Web 客户端**：
+**Web 客户端**（产品目标；标了 SIDE_EFFECT 的项本批次未宣称 live 通过）：
 
 1. 中继服务器通过 CDP 连接到正在运行的 Cursor IDE
 2. 手机上的 Web 客户端以正确格式显示 agent 对话
 3. 每种聊天元素类型渲染方式不同（human、assistant、tool、thought、plan widget、todo_list、run command）
-4. Plan widget 显示带状态指示器的完整 todo 列表，Build/View Plan 按钮可用
-5. Run command widget 显示完整命令文本，Run/Skip/Allow 按钮可用
-6. 在手机上点 Approve/Reject 会触发 Cursor 中的操作
+4. Plan widget 显示带状态指示器的完整 todo 列表，Build/View Plan 按钮在有 `actionId` 时可用
+5. Run command widget 显示完整命令文本，Run/Skip/Allow 按钮在有 `actionId` 时可用
+6. 在手机上点 Approve/Reject 会触发 Cursor 中的操作（`SIDE_EFFECT`，需按动作显式批准）
 7. 从手机输入并发送的消息出现在 Cursor 的 composer 中并提交
-8. 可以从手机切换聊天 tab、mode 和 model
-9. 系统从临时连接中断中自动恢复
+8. 可以从手机切换聊天 tab、mode 和 model（Mode/Model 属 `SIDE_EFFECT` / 菜单属 `INTERACTIVE`）
+9. 系统从临时连接中断中自动恢复；连接层与能力层状态可区分（见冒烟矩阵）
 10. 从操作到反映的延迟低于 2 秒
 
 **Telegram 传输层**：
@@ -844,11 +858,56 @@ CLI 工具（`src/discovery/discover-dom.ts`，通过 `npm run discover` 运行�
 13. 活动窗口+tab 的对话以正确格式流进其 Telegram 话题（初始同步最近 5 条消息）
 14. `/history [N]` 以限流节奏把最近 N 条消息（默认 5）发进话题
 15. 每种 ChatElement 类型以适当的 Telegram 格式渲染（HTML、代码块、内联键盘）
-16. 审批内联按钮（Accept/Reject/Accept All）触发 Cursor 中的正确操作
-17. Run command 卡片显示命令，并提供 Run/Skip/Allow 内联按钮
-18. Plan widget 显示 todo 列表，并提供 Build/View Plan 内联按钮
+16. 审批内联按钮（Accept/Reject/Accept All）触发 Cursor 中的正确操作 — **本批次 E2E deferred**
+17. Run command 卡片显示命令，并提供 Run/Skip/Allow 内联按钮 — **Tool E2E deferred**
+18. Plan widget 显示 todo 列表，并提供 Build/View Plan 内联按钮 — **Action E2E deferred**
 19. 在话题中输入会把文本作为消息发到映射的 Cursor 窗口+tab
-20. `/mode` 和 `/model` 命令显示当前状态，并允许通过内联键盘切换
+20. `/mode` 和 `/model` 命令显示当前状态，并允许通过内联键盘切换 — **Mode/Model E2E deferred**
 21. agent 活动时 bot 显示输入指示器
 22. 所有出站 API 调用通过 SendQueue 限流（Telegram 传输层约 300ms 发送、100ms 编辑）+ auto-retry 插件
 23. 基于 token 的认证（`/register`），可选 `TELEGRAM_ALLOWED_USERS` 覆盖。数据持久化在 `data/` 目录。
+
+**本批次明确非成功项**：
+
+- Adapter apply 激活**不可用**。`POST /api/adapters/:id/apply` 稳定 `503 ADAPTER_ACTIVATION_UNAVAILABLE` 才算符合本批次合同。
+- Mode 候选保持 pending；当前 selector 路径保持活动。
+- 不得宣称真实 Tool 副作用已验收通过。
+
+---
+
+## 15. 本批次验收：授权级别与证据分层
+
+完整字段、脱敏规则和 `caseId` 清单见 `docs/cursor-capability-sync-plan.md` 第 21 节。冒烟步骤见 `docs/smoke-checklist.md`。
+
+### 15.1 授权级别
+
+| 级别 | 允许 | 本批次 |
+| --- | --- | --- |
+| `PASSIVE` | 只读探测、GET、收 socket 状态 | 默认允许 |
+| `INTERACTIVE` | 显式刷新时开/关菜单，不选择 | 仅 “Refresh Cursor capabilities” |
+| `SIDE_EFFECT` | 单个 `actionId` + `actionType` 的状态变更 | **按动作显式批准**。一般 Build 不授予 Run/Approve/Allow/Mode/Model |
+| `ADAPTER_APPLY` | 激活 pending adapter、切换生产 selector | **禁用**；503 `ADAPTER_ACTIVATION_UNAVAILABLE` |
+
+### 15.2 证据层
+
+必须分开记录，禁止混报：
+
+1. `code_implemented` — 组合根已接线
+2. `isolated_test` — 无真实 Cursor 的测试
+3. `passive_live` — 真实 Cursor 只读（含双 workbench target 报告）
+4. `side_effect_live` — 真实点击副作用；本批次 **不** 把 Tool 标为 pass
+
+Telegram Mode / Model / Action / Tool E2E = `deferred`。
+
+### 15.3 机器可读证据与脱敏
+
+每条用例输出 `AcceptanceEvidenceRecord`（`schemaVersion: 1`）：`caseId`、`authorizationLevel`、`evidenceLayer`、`result`（`pass|fail|deferred|blocked`）、`observedAt`，以及可选的 `httpStatus` / `errorCode` / `capabilityState` / `adapterStatus` / `selectorPathActive`。禁止写入密码、token、cookie、WebSocket URL、完整聊天、完整 DOM、未截断路径、可执行 selector、未哈希 action id。路径与 URL 规则与 `redactDiscoveryText` 一致。
+
+### 15.4 本批次必须覆盖的冒烟面
+
+- Web 连接/能力状态矩阵（reconnect awaiting-full、CDP vs pills、extractor stale、caps stale、generation lock、unavailable vs degraded、ok+partial Model、恢复）
+- HTTP/Socket：session、外域 Origin、CSRF、Bearer CLI、`X-Operation-Id` 去重与冲突、速率限制、JSON 400/413
+- 双 target PASSIVE 报告：两个 workbench 隔离、排除 webview、preferred 保持、无 UI mutation、不把未开菜单写成 empty/removed
+- ActionRegistry 负向（缺 id、过期、已消费、scope/generation、selector 不授权）与正向（reserve/consume、类型隔离、Build ≠ Run）；正向不是 live Tool 通过
+- Adapter apply：确认后仍 503；pending 不变；当前 selector 路径仍活动
+- Telegram Mode/Model/Action/Tool E2E：标记 deferred，不勾 pass

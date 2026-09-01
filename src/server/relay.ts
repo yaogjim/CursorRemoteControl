@@ -3,12 +3,22 @@ import { createServer, type IncomingMessage } from 'http';
 import { Server as SocketServer, type Socket } from 'socket.io';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { randomBytes, timingSafeEqual } from 'crypto';
+import { randomBytes, timingSafeEqual, createHash } from 'crypto';
 import { readFileSync } from 'fs';
-import type { ServerConfig, CursorState, CommandPayload, CommandResult } from './types.js';
+import type { ServerConfig, CursorState, CommandPayload, CommandResult, SanitizedDiscoveryStatus } from './types.js';
+import { AdapterStore } from './adapter-store.js';
+import { ActionRegistry } from './action-registry.js';
+import { capabilityAllows } from './capability-guard.js';
+import { toPublicCapabilityFull } from './capability-state-manager.js';
+import { normalizeModel } from './capability-normalize.js';
+import { RuntimeValidator } from './runtime-validator.js';
+import type { RuntimeSelectorProvider, RuntimeAdapterContext } from './runtime-selector-provider.js';
 import { toPublicPatch, toPublicState, type StateManager } from './state-manager.js';
 import type { CommandExecutor } from './command-executor.js';
+import type { CdpClient } from './cdp-client.js';
 import type { CDPBridge } from './cdp-bridge.js';
+import type { CapabilityStateManager } from './capability-state-manager.js';
+import { TargetUiCoordinator } from './target-ui-coordinator.js';
 import { moveHomeWindow, type WindowMonitor } from './window-monitor.js';
 import { markdownToWebHtml, readPlanFile } from './plan-files.js';
 import {
@@ -21,10 +31,194 @@ import {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+export const CSRF_COOKIE = 'cursor_remote_csrf';
+const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+export const OPERATION_ID_RE = /^[A-Za-z0-9._:-]{8,128}$/;
+export const ACTION_TYPE_RE = /^[a-z][a-z0-9_:-]{0,63}$/;
+export const SENSITIVE_PROBE_RATE_MAX = 5;
+export const SENSITIVE_ADAPTER_RATE_MAX = 20;
+export const SENSITIVE_RATE_WINDOW_MS = 60_000;
+export const SOCKET_DANGEROUS_RATE_MAX = 20;
+export const SOCKET_DANGEROUS_RATE_WINDOW_MS = 60_000;
+export const API_JSON_LIMIT_BYTES = 64 * 1024;
+export const SOCKET_MAX_HTTP_BUFFER_SIZE = API_JSON_LIMIT_BYTES;
+const LOGIN_RATE_MAX = 10;
+const LOGIN_RATE_WINDOW_MS = 60_000;
+const MAX_RATE_LIMIT_KEYS = 2048;
+const MAX_OPERATION_CACHE = 1024;
+const OPERATION_CACHE_TTL_MS = 5 * 60_000;
+const API_JSON_LIMIT = '64kb';
+
+/** Dedicated socket events that mutate Cursor and require a bounded operationId. */
+export const DANGEROUS_SOCKET_COMMANDS = new Set([
+  'send_message',
+  'approve',
+  'approve_all',
+  'new_chat',
+  'set_mode',
+  'set_model',
+  'set_plan_model',
+]);
+
+/** click_action types that share the dangerous-command operation/rate contract. */
+export const DANGEROUS_ACTION_TYPES = new Set([
+  'approve',
+  'approve_all',
+  'allow',
+  'run',
+  'build',
+  'continue',
+]);
+
+export function isValidActionType(value: unknown): value is string {
+  return typeof value === 'string' && ACTION_TYPE_RE.test(value);
+}
+
+export function socketCommandRequiresOperationId(command: string, actionType?: string): boolean {
+  if (DANGEROUS_SOCKET_COMMANDS.has(command)) return true;
+  return command === 'click_action' && typeof actionType === 'string' && DANGEROUS_ACTION_TYPES.has(actionType);
+}
+
+function commandIdOf(payload: { commandId?: unknown } | undefined): string {
+  return typeof payload?.commandId === 'string' && payload.commandId.length > 0 ? payload.commandId : 'unknown';
+}
+
+function parseCookieMap(header: string | undefined): Record<string, string> {
+  return Object.fromEntries((header ?? '').split(';').map((part) => {
+    const index = part.indexOf('=');
+    return index >= 0 ? [part.slice(0, index).trim(), part.slice(index + 1).trim()] : ['', ''];
+  }).filter(([key]) => key));
+}
+
+function csrfSetCookie(token: string): string {
+  return `${CSRF_COOKIE}=${token}; Path=/; SameSite=Lax; Max-Age=${SESSION_COOKIE_MAX_AGE_SEC}`;
+}
+
+function sendApiError(req: express.Request, res: express.Response, status: number, error: string): void {
+  if (!req.readableEnded) req.resume();
+  res.status(status).json({ error });
+}
+
+function jsonBodyErrorHandler(
+  err: unknown,
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+): void {
+  const rec = err && typeof err === 'object'
+    ? err as { type?: string; status?: number; statusCode?: number }
+    : null;
+  const type = rec?.type;
+  const status = rec?.status ?? rec?.statusCode;
+  if (type === 'entity.too.large' || status === 413) {
+    sendApiError(req, res, 413, 'Payload too large');
+    return;
+  }
+  if (type === 'entity.parse.failed' || (err instanceof SyntaxError && status === 400)) {
+    sendApiError(req, res, 400, 'Invalid JSON');
+    return;
+  }
+  next(err);
+}
+
+function csrfTokensEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  if (left.length !== right.length || left.length === 0) return false;
+  return timingSafeEqual(left, right);
+}
+
+function requestPathname(req: express.Request): string {
+  const raw = req.originalUrl || req.url || req.path || '';
+  const q = raw.indexOf('?');
+  return q >= 0 ? raw.slice(0, q) : raw;
+}
+
+/** Discovery/validate are probes; apply/reject/rollback mutate adapter state. Login is excluded. */
+export function sensitiveWriteKind(method: string, pathname: string): 'probe' | 'adapter' | null {
+  if (method !== 'POST') return null;
+  const path = pathname.replace(/\/+$/, '') || '/';
+  const rel = path.startsWith('/api/') ? path.slice(4) : path;
+  if (rel === '/discovery/run') return 'probe';
+  if (/^\/adapters\/[^/]+\/validate$/.test(rel)) return 'probe';
+  if (rel === '/adapters/rollback') return 'adapter';
+  if (/^\/adapters\/[^/]+\/(?:apply|reject)$/.test(rel)) return 'adapter';
+  return null;
+}
+
+function sensitiveRouteKey(pathname: string): string {
+  const path = pathname.replace(/\/+$/, '') || '/';
+  const rel = path.startsWith('/api/') ? path.slice(4) : path;
+  if (rel === '/discovery/run') return 'POST /api/discovery/run';
+  if (rel === '/adapters/rollback') return 'POST /api/adapters/rollback';
+  if (/^\/adapters\/[^/]+\/validate$/.test(rel)) return 'POST /api/adapters/validate';
+  if (/^\/adapters\/[^/]+\/apply$/.test(rel)) return 'POST /api/adapters/apply';
+  if (/^\/adapters\/[^/]+\/reject$/.test(rel)) return 'POST /api/adapters/reject';
+  return `POST ${path}`;
+}
 
 interface RateLimitEntry {
   count: number;
   resetAt: number;
+}
+
+/** Fixed-size sliding-window limiter. Expired keys are pruned; overflow evicts the soonest reset. */
+class BoundedRateLimiter {
+  private readonly buckets = new Map<string, RateLimitEntry>();
+
+  constructor(private readonly maxKeys: number) {}
+
+  check(key: string, limit: number, windowMs: number, now = Date.now()): { allowed: boolean; retryAfter: number } {
+    this.prune(now);
+    const entry = this.buckets.get(key);
+    if (!entry || now >= entry.resetAt) {
+      this.evictIfNeeded(now);
+      this.buckets.set(key, { count: 1, resetAt: now + windowMs });
+      return { allowed: true, retryAfter: 0 };
+    }
+    if (entry.count >= limit) {
+      return { allowed: false, retryAfter: Math.max(1, Math.ceil((entry.resetAt - now) / 1000)) };
+    }
+    entry.count += 1;
+    return { allowed: true, retryAfter: 0 };
+  }
+
+  private prune(now: number): void {
+    for (const [key, entry] of this.buckets) {
+      if (entry.resetAt <= now) this.buckets.delete(key);
+    }
+  }
+
+  private evictIfNeeded(now: number): void {
+    if (this.buckets.size < this.maxKeys) return;
+    this.prune(now);
+    if (this.buckets.size < this.maxKeys) return;
+    let oldestKey: string | undefined;
+    let oldestReset = Infinity;
+    for (const [key, entry] of this.buckets) {
+      if (entry.resetAt < oldestReset) {
+        oldestReset = entry.resetAt;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey !== undefined) this.buckets.delete(oldestKey);
+  }
+}
+
+interface OperationCacheEntry {
+  fingerprint: string;
+  settled: boolean;
+  status: number;
+  body: unknown;
+  expiresAt: number;
+  done: Promise<{ status: number; body: unknown }>;
+}
+
+/** Replay protection for HTTP mutations. The operation id is client-generated,
+ * while the request fingerprint prevents reusing it for another operation. */
+export function operationFingerprint(method: string, path: string, body: unknown): string {
+  const normalized = body && typeof body === 'object' ? { ...(body as Record<string, unknown>), operationId: undefined } : body;
+  return createHash('sha256').update(`${method} ${path}\n${JSON.stringify(normalized)}`).digest('hex');
 }
 
 /** Bind hosts that only accept local connections — password-optional. */
@@ -55,6 +249,13 @@ export function isAllowedSocketOrigin(
   } catch {
     return false;
   }
+}
+
+export function isAllowedHttpOrigin(
+  originHeader: string | undefined,
+  hostHeader: string | undefined,
+): boolean {
+  return isAllowedSocketOrigin(originHeader, hostHeader);
 }
 
 const LOGIN_PAGE_HTML = `<!DOCTYPE html>
@@ -137,6 +338,16 @@ const LOGIN_PAGE_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+function adapterScopeSelector(scope: string | undefined): string | undefined {
+  switch (scope) {
+    case 'composer': return '.composer-bar, [data-composer-id]';
+    case 'plan': return '.composer-create-plan-container, .plan-execution-message-content';
+    case 'tool': return '[data-tool-call-id], .ui-tool-call-card';
+    case 'approval': return '.ui-shell-tool-call__approval-row, .ui-shell-tool-call';
+    default: return undefined;
+  }
+}
+
 export class Relay {
   private config: ServerConfig;
   private app: express.Application;
@@ -146,9 +357,18 @@ export class Relay {
   private commandExecutor: CommandExecutor;
   private cdpBridge: CDPBridge;
   private windowMonitor: WindowMonitor | undefined;
+  private capabilityStateManager: CapabilityStateManager | undefined;
+  private targetUiCoordinator: TargetUiCoordinator | undefined;
+  private adapterStore: AdapterStore;
+  private runtimeSelectors: RuntimeSelectorProvider | undefined;
+  private actionRegistry: ActionRegistry;
+  private discoveryRunner: (() => Promise<unknown>) | null = null;
+  private runtimeValidator = new RuntimeValidator();
 
   private sessionStore: WebappSessionStore;
-  private loginAttempts = new Map<string, RateLimitEntry>();
+  private rateLimiter = new BoundedRateLimiter(MAX_RATE_LIMIT_KEYS);
+  private operationCache = new Map<string, OperationCacheEntry>();
+  private socketOperationCache = new Map<string, OperationCacheEntry>();
 
   private get authEnabled(): boolean {
     return this.config.webappPassword.length > 0;
@@ -165,19 +385,30 @@ export class Relay {
     stateManager: StateManager,
     commandExecutor: CommandExecutor,
     cdpBridge: CDPBridge,
-    windowMonitor?: WindowMonitor
+    windowMonitor?: WindowMonitor,
+    capabilityStateManager?: CapabilityStateManager,
+    actionRegistry?: ActionRegistry,
+    adapterStore?: AdapterStore,
+    targetUiCoordinator?: TargetUiCoordinator,
+    runtimeSelectors?: RuntimeSelectorProvider
   ) {
     this.config = config;
     this.stateManager = stateManager;
     this.commandExecutor = commandExecutor;
     this.cdpBridge = cdpBridge;
     this.windowMonitor = windowMonitor;
+    this.capabilityStateManager = capabilityStateManager;
+    this.targetUiCoordinator = targetUiCoordinator;
+    this.adapterStore = adapterStore ?? new AdapterStore(config.adapterStorePath, { backupCount: config.adapterBackupCount });
+    this.runtimeSelectors = runtimeSelectors;
+    this.actionRegistry = actionRegistry ?? new ActionRegistry({ ttlMs: config.actionTtlMs });
     this.sessionStore = createWebappSessionStore(config.dataDir);
 
     this.app = express();
     this.httpServer = createServer(this.app);
     this.io = new SocketServer(this.httpServer, {
       serveClient: false,
+      maxHttpBufferSize: SOCKET_MAX_HTTP_BUFFER_SIZE,
       // Same-origin only: do not reflect arbitrary Origin (credentials + origin:true
       // would allow any site to read Socket.IO responses). Cross-origin WS is
       // rejected in allowRequest via Origin vs Host.
@@ -205,6 +436,68 @@ export class Relay {
     if (this.authEnabled) {
       console.log('[relay] Web app password protection enabled');
     }
+  }
+
+  setDiscoveryRunner(runner: (() => Promise<unknown>) | null): void {
+    this.discoveryRunner = runner;
+  }
+
+  getActionRegistry(): ActionRegistry { return this.actionRegistry; }
+
+  private requireAdapterContext(body: Record<string, unknown>): RuntimeAdapterContext {
+    const context = this.runtimeSelectors?.getContext();
+    const targetId = this.cdpBridge.activeTargetId;
+    const generation = targetId ? this.cdpBridge.getTargetGeneration(targetId) : 0;
+    if (!context || !targetId || !generation
+      || context.targetId !== targetId || context.targetGeneration !== generation) {
+      throw new Error('verified runtime adapter context required');
+    }
+    if (body.cursorVersionRange !== context.cursorBuild
+      || body.endpointFingerprint !== context.endpointFingerprint
+      || body.domSignature !== context.domSignature) {
+      throw new Error('adapter context does not match the active Cursor build and DOM fingerprint');
+    }
+    return context;
+  }
+
+  private async validateAdapterRuntime(adapter: Awaited<ReturnType<AdapterStore['get']>>): Promise<Array<{ key:string; ok:boolean; visibleCount:number; error?:string }>> {
+    if (!adapter) throw new Error('adapter not found');
+    const runtime: Array<{ key:string; ok:boolean; visibleCount:number; error?:string }> = [];
+    for (const [key, strategies] of Object.entries(adapter.strategies)) {
+      const scope = adapterScopeSelector(strategies[0]?.scope);
+      const checked = await this.withActiveTargetUi('adapter:validate', (client) =>
+        this.runtimeValidator.validateCandidate(client, strategies.map((strategy) => strategy.selector), scope));
+      runtime.push({ key, ok:checked.ok, visibleCount:checked.visibleCount, ...(checked.error ? {error:checked.error} : {}) });
+    }
+    return runtime;
+  }
+
+  private async withActiveTargetUi<T>(
+    label: string,
+    operation: (client: CdpClient) => Promise<T>,
+  ): Promise<T> {
+    const client = this.cdpBridge.getClient();
+    const targetId = this.cdpBridge.activeTargetId;
+    const generation = targetId ? this.cdpBridge.getTargetGeneration(targetId) : 0;
+    if (!client || !targetId || !generation || !client.isConnected()) {
+      throw new Error('verified Cursor target required');
+    }
+    if (!this.targetUiCoordinator) throw new Error('Target UI coordinator unavailable');
+    return this.targetUiCoordinator.enqueue(
+      targetId,
+      async () => {
+        const result = await operation(client);
+        if (targetId !== this.cdpBridge.activeTargetId || generation !== this.cdpBridge.getTargetGeneration(targetId)) {
+          throw new Error('Target generation changed');
+        }
+        return result;
+      },
+      { generation, timeoutMs: 10_000, label },
+    );
+  }
+
+  notifyAdapterPending(adapter: { id: string; status: string; capabilityKinds: string[]; createdAt: number }): void {
+    this.io.emit('adapter:pending', { id: adapter.id, status: adapter.status, capabilityKinds: adapter.capabilityKinds, createdAt: adapter.createdAt });
   }
 
   start(): Promise<void> {
@@ -241,22 +534,23 @@ export class Relay {
     return req.socket.remoteAddress ?? 'unknown';
   }
 
-  private checkRateLimit(ip: string): { allowed: boolean; retryAfter: number } {
-    const now = Date.now();
-    const entry = this.loginAttempts.get(ip);
-
-    if (!entry || now >= entry.resetAt) {
-      this.loginAttempts.set(ip, { count: 1, resetAt: now + 60_000 });
-      return { allowed: true, retryAfter: 0 };
+  private pruneOperationCache(now: number, cache: Map<string, OperationCacheEntry> = this.operationCache): void {
+    for (const [key, value] of cache) {
+      if (value.settled && value.expiresAt <= now) cache.delete(key);
     }
-
-    if (entry.count >= 10) {
-      const retryAfter = Math.ceil((entry.resetAt - now) / 1000);
-      return { allowed: false, retryAfter };
+    while (cache.size >= MAX_OPERATION_CACHE) {
+      let oldestKey: string | undefined;
+      let oldestExp = Infinity;
+      for (const [key, value] of cache) {
+        if (!value.settled) continue;
+        if (value.expiresAt < oldestExp) {
+          oldestExp = value.expiresAt;
+          oldestKey = key;
+        }
+      }
+      if (oldestKey === undefined) break;
+      cache.delete(oldestKey);
     }
-
-    entry.count++;
-    return { allowed: true, retryAfter: 0 };
   }
 
   /** First matching credential that exists in the persisted session store. */
@@ -288,19 +582,30 @@ export class Relay {
 
   private setupRoutes(): void {
     const clientDir = join(__dirname, '..', 'client');
-
-    this.app.use(express.json());
+    const apiJson = express.json({ limit: API_JSON_LIMIT });
 
     this.app.get('/login', (_req, res) => {
       if (!this.authEnabled) return res.redirect('/');
       res.type('html').send(LOGIN_PAGE_HTML);
     });
 
-    this.app.post('/api/login', (req, res) => {
+    this.app.post('/api/login', (req, res, next) => {
+      const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+      const host = typeof req.headers.host === 'string' ? req.headers.host : undefined;
+      if (!isAllowedHttpOrigin(origin, host)) {
+        sendApiError(req, res, 403, 'Forbidden origin');
+        return;
+      }
+      next();
+    }, apiJson, (req, res) => {
       if (!this.authEnabled) return res.json({ token: 'no-auth' });
 
       const ip = this.getClientIp(req);
-      const { allowed, retryAfter } = this.checkRateLimit(ip);
+      const { allowed, retryAfter } = this.rateLimiter.check(
+        `login:${ip}`,
+        LOGIN_RATE_MAX,
+        LOGIN_RATE_WINDOW_MS,
+      );
       if (!allowed) {
         console.warn(`[relay] Rate limited login from ${ip}`);
         res.set('Retry-After', String(retryAfter));
@@ -320,6 +625,7 @@ export class Relay {
       }
 
       const token = randomBytes(32).toString('hex');
+      const csrf = randomBytes(24).toString('hex');
       this.sessionStore.add(token);
       console.log(`[relay] Successful login from ${ip}`);
       res.setHeader(
@@ -332,6 +638,7 @@ export class Relay {
           `Max-Age=${SESSION_COOKIE_MAX_AGE_SEC}`,
         ].join('; ')
       );
+      res.append('Set-Cookie', csrfSetCookie(csrf));
       return res.json({ token });
     });
 
@@ -432,12 +739,503 @@ export class Relay {
       if (this.resolveHttpSession(req)) return next();
 
       if (req.path.startsWith('/api/')) {
+        if (!req.readableEnded) req.resume();
         return res.status(401).json({ error: 'Unauthorized' });
       }
       return res.redirect('/login');
     };
 
     this.app.use(authMiddleware);
+
+    // Protected writes: auth (above) → Host/Origin/CSRF/Bearer → body/size →
+    // rate limit → operation reservation → handler. Cookie sessions must be
+    // same-origin and send CSRF; Bearer CLI clients may omit Origin and CSRF.
+    this.app.use('/api', (req, res, next) => {
+      if (!WRITE_METHODS.has(req.method)) return next();
+      const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+      const host = typeof req.headers.host === 'string' ? req.headers.host : undefined;
+      const authHeader = typeof req.headers.authorization === 'string' && req.headers.authorization.startsWith('Bearer ')
+        ? req.headers.authorization.slice(7).trim() : '';
+      const bearer = authHeader.length > 0 && this.sessionStore.touch(authHeader) ? authHeader : '';
+
+      if (this.authEnabled && !bearer) {
+        if (!origin || !isAllowedHttpOrigin(origin, host)) {
+          sendApiError(req, res, 403, 'Forbidden origin');
+          return;
+        }
+      } else if (!isAllowedHttpOrigin(origin, host)) {
+        sendApiError(req, res, 403, 'Forbidden origin');
+        return;
+      }
+
+      if (!this.authEnabled || bearer) return next();
+      const cookies = parseCookieMap(req.headers.cookie);
+      const csrfHeader = typeof req.headers['x-csrf-token'] === 'string' ? req.headers['x-csrf-token'] : '';
+      const csrfCookie = cookies[CSRF_COOKIE] ?? '';
+      if (!csrfHeader || !csrfCookie || !csrfTokensEqual(csrfHeader, csrfCookie)) {
+        sendApiError(req, res, 403, 'CSRF token required');
+        return;
+      }
+      next();
+    });
+
+    this.app.use('/api', (req, res, next) => {
+      if (!WRITE_METHODS.has(req.method)) return next();
+      apiJson(req, res, next);
+    });
+
+    this.app.use('/api', (req, res, next) => {
+      const kind = sensitiveWriteKind(req.method, requestPathname(req));
+      if (!kind) return next();
+      const clientId = this.resolveHttpSession(req) ?? this.getClientIp(req);
+      const limit = kind === 'probe' ? SENSITIVE_PROBE_RATE_MAX : SENSITIVE_ADAPTER_RATE_MAX;
+      const { allowed, retryAfter } = this.rateLimiter.check(
+        `api:${clientId}:${sensitiveRouteKey(requestPathname(req))}`,
+        limit,
+        SENSITIVE_RATE_WINDOW_MS,
+      );
+      if (!allowed) {
+        console.warn(`[relay] Rate limited ${req.method} ${requestPathname(req)} from ${this.getClientIp(req)}`);
+        res.set('Retry-After', String(retryAfter));
+        sendApiError(req, res, 429, `Too many requests. Retry in ${retryAfter}s.`);
+        return;
+      }
+      next();
+    });
+
+    // Sensitive POSTs require a bounded operation id. Same id + fingerprint
+    // replays the first result; a different fingerprint is a conflict.
+    this.app.use('/api', (req, res, next) => {
+      if (!sensitiveWriteKind(req.method, requestPathname(req))) return next();
+      const headerId = req.headers['x-operation-id'];
+      if (typeof headerId !== 'string' || headerId.length === 0) {
+        sendApiError(req, res, 400, 'X-Operation-Id header required');
+        return;
+      }
+      if (!OPERATION_ID_RE.test(headerId)) {
+        sendApiError(req, res, 400, 'Invalid operation id');
+        return;
+      }
+      const operationId = headerId;
+      const now = Date.now();
+      this.pruneOperationCache(now);
+      const fingerprint = operationFingerprint(req.method, req.path, req.body);
+      const existing = this.operationCache.get(operationId);
+      if (existing) {
+        if (existing.fingerprint !== fingerprint) {
+          sendApiError(req, res, 409, 'Operation id was already used for different input');
+          return;
+        }
+        void existing.done.then((result) => {
+          res.status(result.status).json(result.body);
+        });
+        return;
+      }
+      if (this.operationCache.size >= MAX_OPERATION_CACHE) {
+        this.pruneOperationCache(now);
+        if (this.operationCache.size >= MAX_OPERATION_CACHE) {
+          res.set('Retry-After', '1');
+          sendApiError(req, res, 429, 'Too many in-flight operations. Retry in 1s.');
+          return;
+        }
+      }
+      let settle!: (result: { status: number; body: unknown }) => void;
+      const done = new Promise<{ status: number; body: unknown }>((resolve) => { settle = resolve; });
+      const entry: OperationCacheEntry = {
+        fingerprint,
+        settled: false,
+        status: 0,
+        body: undefined,
+        expiresAt: now + OPERATION_CACHE_TTL_MS,
+        done,
+      };
+      this.operationCache.set(operationId, entry);
+      const finish = (status: number, body: unknown) => {
+        if (entry.settled) return;
+        entry.settled = true;
+        entry.status = status;
+        entry.body = body;
+        entry.expiresAt = Date.now() + OPERATION_CACHE_TTL_MS;
+        settle({ status, body });
+      };
+      const originalJson = res.json.bind(res);
+      res.json = ((body: unknown) => {
+        finish(res.statusCode, body);
+        return originalJson(body);
+      }) as typeof res.json;
+      res.once('finish', () => finish(res.statusCode, undefined));
+      next();
+    });
+
+    this.app.get('/api/discovery/status', (_req, res) => {
+      res.json(this.buildDiscoveryStatus());
+    });
+
+    this.app.get('/api/csrf', (req, res) => {
+      const cookies = parseCookieMap(req.headers.cookie);
+      let token = cookies[CSRF_COOKIE];
+      if (typeof token !== 'string' || !/^[A-Za-z0-9]+$/.test(token) || token.length < 24) {
+        token = randomBytes(24).toString('hex');
+        res.append('Set-Cookie', csrfSetCookie(token));
+      }
+      res.json({ csrfToken: token });
+    });
+
+    this.app.get('/api/capabilities', (_req, res) => {
+      res.json(this.capabilityStateManager?.getPublicState() ?? {
+        activeTargetId: '',
+        snapshots: [],
+      });
+    });
+
+    this.app.get('/api/capabilities/diff', (_req, res) => {
+      res.json(this.buildCapabilityDiff());
+    });
+
+    this.app.post('/api/discovery/run', async (_req, res) => {
+      if (!this.discoveryRunner) { res.status(503).json({ error: 'discovery runner unavailable' }); return; }
+      try { res.json({ ok: true, data: await this.discoveryRunner() }); }
+      catch (err) { res.status(409).json({ ok: false, error: err instanceof Error ? err.message : String(err) }); }
+    });
+
+    this.app.get('/api/adapters/history', async (_req, res) => {
+      const data = await this.adapterStore.load();
+      res.json({ revision: data.revision, activeBindings: data.activeBindings, runtime: this.runtimeSelectors?.status() ?? null, adapters: data.adapters.map((a) => ({ id:a.id, status:a.status, cursorVersionRange:a.cursorVersionRange, endpointFingerprint:a.endpointFingerprint ?? '', domSignature:a.domSignature, capabilityKinds:a.capabilityKinds, createdAt:a.createdAt, verifiedAt:a.verifiedAt, contentHash:a.contentHash })), history: data.history });
+    });
+
+    this.app.post('/api/adapters/:id/validate', async (req, res) => {
+      try {
+        this.requireAdapterContext(req.body ?? {});
+        const adapter = await this.adapterStore.get(req.params.id);
+        if (!adapter) { res.status(404).json({ error: 'adapter not found' }); return; }
+        if (adapter.cursorVersionRange !== req.body.cursorVersionRange
+          || adapter.endpointFingerprint !== req.body.endpointFingerprint
+          || adapter.domSignature !== req.body.domSignature) {
+          res.status(409).json({ ok:false, error:'candidate was discovered for a different runtime context' });
+          return;
+        }
+        const { validateAdapter } = await import('./adapter-store.js');
+        const result = validateAdapter(adapter);
+        const runtime = result.ok ? await this.validateAdapterRuntime(adapter) : [];
+        const ok = result.ok && runtime.length > 0 && runtime.every((item) => item.ok);
+        res.status(ok ? 200 : 422).json({ ok, errors: result.errors, runtime, adapter: { id: adapter.id, status: adapter.status, capabilityKinds: adapter.capabilityKinds } });
+      } catch (err) {
+        res.status(409).json({ ok:false, error:err instanceof Error ? err.message : String(err) });
+      }
+    });
+
+    this.app.post('/api/adapters/:id/apply', async (req, res) => {
+      const body = req.body ?? {};
+      if (body.confirmed !== true) { res.status(400).json({ ok:false, error:'explicit adapter confirmation required' }); return; }
+      if (typeof body.capabilityKind !== 'string' || !['mode','model','tool'].includes(body.capabilityKind)
+        || typeof body.cursorVersionRange !== 'string' || typeof body.endpointFingerprint !== 'string'
+        || typeof body.domSignature !== 'string') {
+        res.status(400).json({ error:'binding fields required' });
+        return;
+      }
+      const candidate = await this.adapterStore.get(req.params.id);
+      if (!candidate) { res.status(404).json({ error:'adapter not found' }); return; }
+      // Fail-closed until production AdapterRegistry is wired to real Cursor
+      // build + DOM fingerprint selection. Never activate a pending candidate.
+      res.status(503).json({ ok: false, error: 'ADAPTER_ACTIVATION_UNAVAILABLE' });
+    });
+
+    this.app.post('/api/adapters/:id/reject', async (req, res) => {
+      try {
+        const adapter = await this.adapterStore.get(req.params.id);
+        if (!adapter) { res.status(404).json({ ok:false, error:'adapter not found' }); return; }
+        if (adapter.status !== 'pending_confirmation') { res.status(409).json({ ok:false, error:`adapter is ${adapter.status}` }); return; }
+        const changed = await this.adapterStore.reject(req.params.id);
+        if (!changed) { res.status(404).json({ ok:false, error:'adapter not found' }); return; }
+        res.json({ ok:true, adapter:{ id:adapter.id, status:'rejected' } });
+        this.io.emit('adapter:changed', { adapterId: adapter.id, action:'reject' });
+      } catch (err) { res.status(422).json({ ok:false, error:err instanceof Error ? err.message : String(err) }); }
+    });
+
+    this.app.post('/api/adapters/rollback', async (req, res) => {
+      const body=req.body ?? {};
+      if (!['mode','model','tool'].includes(body.capabilityKind) || typeof body.cursorVersionRange !== 'string'
+        || typeof body.endpointFingerprint !== 'string' || typeof body.domSignature !== 'string') {
+        res.status(400).json({ error:'binding fields required' });
+        return;
+      }
+      try {
+        this.requireAdapterContext(body);
+        const binding = {
+          capabilityKind:body.capabilityKind as 'mode'|'model'|'tool',
+          cursorVersionRange:body.cursorVersionRange,
+          endpointFingerprint:body.endpointFingerprint,
+          domSignature:body.domSignature,
+        };
+        await this.adapterStore.rollback(binding, typeof body.adapterId === 'string' ? body.adapterId : undefined);
+        this.runtimeSelectors!.updateStore(this.adapterStore.getState());
+        const snapshot = this.capabilityStateManager?.getSnapshot();
+        if (snapshot) this.capabilityStateManager?.applyObserved({
+          targetId:snapshot.targetId,
+          targetGeneration:snapshot.targetGeneration,
+          state:snapshot.status.state,
+          confidence:snapshot.status.confidence,
+          adapterBindings:this.runtimeSelectors!.getAdapterBindings(),
+        });
+        res.json({ok:true, runtime:this.runtimeSelectors!.status()});
+        this.io.emit('adapter:changed',{action:'rollback',capabilityKind:body.capabilityKind});
+      }
+      catch (err) { res.status(422).json({ok:false,error:err instanceof Error?err.message:String(err)}); }
+    });
+
+    this.app.use(jsonBodyErrorHandler);
+  }
+
+  private buildCapabilityDiff(): {
+    targetId: string;
+    targetGeneration: number;
+    revision: number;
+    state: string;
+    completeness: string;
+    added: string[];
+    removed: string[];
+    changed: string[];
+    conflicts: string[];
+    canReportRemoval: boolean;
+  } {
+    const snapshot = this.capabilityStateManager?.getSnapshot() ?? null;
+    const completeness = snapshot?.status.completeness ?? snapshot?.models.completeness ?? 'unknown';
+    return {
+      targetId: snapshot?.targetId ?? '',
+      targetGeneration: snapshot?.targetGeneration ?? 0,
+      revision: snapshot?.revision ?? 0,
+      state: snapshot?.status.state ?? 'unknown',
+      completeness,
+      added: snapshot?.status.added ?? [],
+      removed: snapshot?.status.missing ?? [],
+      changed: snapshot?.status.changed ?? [],
+      conflicts: snapshot?.status.conflicts ?? [],
+      canReportRemoval: completeness === 'complete',
+    };
+  }
+
+  private buildDiscoveryStatus(): SanitizedDiscoveryStatus {
+    const status = this.cdpBridge.getDiscoveryStatus();
+    const cap = this.capabilityStateManager;
+    if (!cap) return status;
+    const snapshot = cap.getSnapshot();
+    status.capabilities = snapshot
+      ? {
+          targetId: snapshot.targetId,
+          targetGeneration: snapshot.targetGeneration,
+          revision: snapshot.revision,
+          state: snapshot.status.state,
+        }
+      : null;
+    return status;
+  }
+
+  private updateModelCapabilities(result: CommandResult): void {
+    const data = result.data as {
+      options?: Array<{ id?: string; label?: string; selected?: boolean }>;
+      completeness?: 'complete' | 'partial' | 'unknown';
+      filterActive?: boolean;
+    } | undefined;
+    const target = this.capabilityStateManager?.getSnapshot();
+    if (!target || !data || !Array.isArray(data.options)) return;
+    const items = data.options.map((item) => normalizeModel({ id:item.id, label:item.label, selected:item.selected, scope:'composer', source:'menu', confidence:1, selectable:true, observedAt:Date.now() })).filter((item): item is NonNullable<ReturnType<typeof normalizeModel>> => !!item);
+    const completeness = data.completeness === 'complete'
+      ? 'complete'
+      : data.completeness === 'unknown' ? 'unknown' : 'partial';
+    this.capabilityStateManager!.applyObserved({
+      targetId:target.targetId,
+      targetGeneration:target.targetGeneration,
+      models:{ items, completeness, filterActive:data.filterActive === true, observedAt:Date.now() },
+      state:completeness === 'complete' ? 'ok' : 'degraded',
+      completeness,
+      confidence:1,
+    });
+  }
+
+  private capabilityAllows(kind: 'mode' | 'model', id: string): string | null {
+    return capabilityAllows(kind, id, {
+      snapshot: this.capabilityStateManager?.getSnapshot(),
+      activeTargetId: this.cdpBridge.activeTargetId,
+      getTargetGeneration: (targetId) => this.cdpBridge.getTargetGeneration(targetId),
+    });
+  }
+
+  private asCommandPayload(raw: unknown): CommandPayload | undefined {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    return raw as CommandPayload;
+  }
+
+  private socketSessionKey(socket: Socket): string {
+    return this.resolveSocketSession(socket) ?? `anon:${socket.id}`;
+  }
+
+  private emitCommandResult(
+    socket: Socket,
+    commandId: string,
+    result: { ok: boolean; error?: string; data?: unknown },
+  ): void {
+    const body: CommandResult = { commandId, ok: result.ok };
+    if (result.error !== undefined) body.error = result.error;
+    if (result.data !== undefined) body.data = result.data;
+    socket.emit('command:result', body);
+  }
+
+  private socketOperationFingerprint(route: string, payload: CommandPayload): string {
+    const { commandId: _commandId, operationId: _operationId, ...rest } = payload;
+    return operationFingerprint('SOCKET', route, rest);
+  }
+
+  private lookupSocketOperation(key: string, fingerprint: string):
+    | { type: 'conflict' }
+    | { type: 'replay'; done: Promise<{ status: number; body: unknown }> }
+    | { type: 'miss' } {
+    this.pruneOperationCache(Date.now(), this.socketOperationCache);
+    const existing = this.socketOperationCache.get(key);
+    if (!existing) return { type: 'miss' };
+    if (existing.fingerprint !== fingerprint) return { type: 'conflict' };
+    return { type: 'replay', done: existing.done };
+  }
+
+  private beginSocketOperation(key: string, fingerprint: string):
+    | { type: 'overflow' }
+    | { type: 'run'; finish: (result: { ok: boolean; error?: string; data?: unknown }) => void } {
+    const now = Date.now();
+    this.pruneOperationCache(now, this.socketOperationCache);
+    if (this.socketOperationCache.size >= MAX_OPERATION_CACHE) {
+      this.pruneOperationCache(now, this.socketOperationCache);
+      if (this.socketOperationCache.size >= MAX_OPERATION_CACHE) return { type: 'overflow' };
+    }
+    let settle!: (result: { status: number; body: unknown }) => void;
+    const done = new Promise<{ status: number; body: unknown }>((resolve) => { settle = resolve; });
+    const entry: OperationCacheEntry = {
+      fingerprint,
+      settled: false,
+      status: 0,
+      body: undefined,
+      expiresAt: now + OPERATION_CACHE_TTL_MS,
+      done,
+    };
+    this.socketOperationCache.set(key, entry);
+    const finish = (result: { ok: boolean; error?: string; data?: unknown }) => {
+      if (entry.settled) return;
+      entry.settled = true;
+      entry.body = result;
+      entry.expiresAt = Date.now() + OPERATION_CACHE_TTL_MS;
+      settle({ status: 0, body: result });
+    };
+    return { type: 'run', finish };
+  }
+
+  private cachedCommandResult(result: CommandResult): { ok: boolean; error?: string; data?: unknown } {
+    return {
+      ok: result.ok,
+      ...(result.error !== undefined ? { error: result.error } : {}),
+      ...(result.data !== undefined ? { data: result.data } : {}),
+    };
+  }
+
+  private async runSocketCommand(
+    socket: Socket,
+    route: string,
+    raw: unknown,
+    execute: (payload: CommandPayload, commandId: string) => Promise<CommandResult>,
+    validate?: (payload: CommandPayload, commandId: string) => string | null,
+  ): Promise<void> {
+    const payload = this.asCommandPayload(raw);
+    const commandId = commandIdOf(payload);
+    if (!payload || commandId === 'unknown') {
+      this.emitCommandResult(socket, commandId, { ok: false, error: 'Missing commandId' });
+      return;
+    }
+    const validationError = validate?.(payload, commandId);
+    if (validationError) {
+      this.emitCommandResult(socket, commandId, { ok: false, error: validationError });
+      return;
+    }
+
+    if (!socketCommandRequiresOperationId(route, payload.actionType)) {
+      try {
+        const result = await execute(payload, commandId);
+        this.emitCommandResult(socket, commandId, this.cachedCommandResult(result));
+      } catch (err) {
+        this.emitCommandResult(socket, commandId, {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return;
+    }
+
+    const operationId = payload.operationId;
+    if (typeof operationId !== 'string' || operationId.length === 0) {
+      this.emitCommandResult(socket, commandId, { ok: false, error: 'operationId required' });
+      return;
+    }
+    if (!OPERATION_ID_RE.test(operationId)) {
+      this.emitCommandResult(socket, commandId, { ok: false, error: 'Invalid operation id' });
+      return;
+    }
+
+    const sessionKey = this.socketSessionKey(socket);
+    const cacheKey = `${sessionKey}:${route}:${operationId}`;
+    const fingerprint = this.socketOperationFingerprint(route, payload);
+    const existing = this.lookupSocketOperation(cacheKey, fingerprint);
+    if (existing.type === 'conflict') {
+      this.emitCommandResult(socket, commandId, {
+        ok: false,
+        error: 'Operation id was already used for different input',
+      });
+      return;
+    }
+    if (existing.type === 'replay') {
+      const replayed = await existing.done;
+      const body = replayed.body && typeof replayed.body === 'object'
+        ? replayed.body as { ok: boolean; error?: string; data?: unknown }
+        : { ok: false, error: 'Operation replay failed' };
+      this.emitCommandResult(socket, commandId, body);
+      return;
+    }
+
+    const { allowed, retryAfter } = this.rateLimiter.check(
+      `socket:${sessionKey}:${route}`,
+      SOCKET_DANGEROUS_RATE_MAX,
+      SOCKET_DANGEROUS_RATE_WINDOW_MS,
+    );
+    if (!allowed) {
+      this.emitCommandResult(socket, commandId, {
+        ok: false,
+        error: `Too many requests. Retry in ${retryAfter}s.`,
+      });
+      return;
+    }
+
+    const started = this.beginSocketOperation(cacheKey, fingerprint);
+    if (started.type === 'overflow') {
+      this.emitCommandResult(socket, commandId, {
+        ok: false,
+        error: 'Too many in-flight operations. Retry in 1s.',
+      });
+      return;
+    }
+
+    try {
+      const result = await execute(payload, commandId);
+      const cached = this.cachedCommandResult(result);
+      started.finish(cached);
+      this.emitCommandResult(socket, commandId, cached);
+    } catch (err) {
+      const cached = { ok: false, error: err instanceof Error ? err.message : String(err) };
+      started.finish(cached);
+      this.emitCommandResult(socket, commandId, cached);
+    }
+  }
+
+  private actionTarget(actionType: string): { targetId?: string; targetGeneration: number; actionType: string } {
+    return {
+      targetId: this.cdpBridge.activeTargetId,
+      targetGeneration: this.cdpBridge.getTargetGeneration(),
+      actionType,
+    };
   }
 
   private setupSocketHandlers(): void {
@@ -466,258 +1264,121 @@ export class Relay {
       console.log(`[relay] Client connected: ${socket.id}`);
 
       socket.emit('state:full', toPublicState(this.stateManager.getCurrentState()));
+      if (this.capabilityStateManager) {
+        socket.emit('capabilities:full', this.capabilityStateManager.getPublicState());
+      }
 
-      socket.on('command:send_message', async (payload: CommandPayload) => {
-        if (!payload.commandId || !payload.text) {
-          socket.emit('command:result', {
-            commandId: payload.commandId ?? 'unknown',
-            ok: false,
-            error: 'Missing commandId or text',
-          } satisfies CommandResult);
-          return;
-        }
+      const onCommand = (
+        route: string,
+        execute: (payload: CommandPayload, commandId: string) => Promise<CommandResult>,
+        validate?: (payload: CommandPayload, commandId: string) => string | null,
+      ) => {
+        socket.on(`command:${route}`, (raw: unknown) => {
+          void this.runSocketCommand(socket, route, raw, execute, validate);
+        });
+      };
+
+      onCommand('send_message', (payload, commandId) => {
         console.log(`[relay] Command: send_message from ${socket.id}`);
-        const result = await this.commandExecutor.sendMessage(
-          payload.commandId,
-          payload.text
-        );
-        socket.emit('command:result', result);
-      });
+        return this.commandExecutor.sendMessage(commandId, payload.text!);
+      }, (payload) => (!payload.text ? 'Missing commandId or text' : null));
 
-      socket.on('command:approve', async (payload: CommandPayload) => {
-        if (!payload.commandId || !payload.selectorPath) {
-          socket.emit('command:result', {
-            commandId: payload.commandId ?? 'unknown',
-            ok: false,
-            error: 'Missing commandId or selectorPath',
-          } satisfies CommandResult);
-          return;
-        }
+      onCommand('approve', (payload, commandId) => {
         console.log(`[relay] Command: approve from ${socket.id}`);
-        const result = await this.commandExecutor.clickApproval(
-          payload.commandId,
-          payload.selectorPath
-        );
-        socket.emit('command:result', result);
-      });
+        return this.commandExecutor.clickRegisteredAction(commandId, payload.actionId!, this.actionTarget('approve'));
+      }, (payload) => (!payload.actionId ? 'Missing commandId or authorized actionId' : null));
 
-      socket.on('command:approve_all', async (payload: CommandPayload) => {
-        if (!payload.commandId) {
-          socket.emit('command:result', {
-            commandId: 'unknown',
-            ok: false,
-            error: 'Missing commandId',
-          } satisfies CommandResult);
-          return;
-        }
+      onCommand('approve_all', (payload, commandId) => {
         console.log(`[relay] Command: approve_all from ${socket.id}`);
-        const result = await this.commandExecutor.approveAll(payload.commandId);
-        socket.emit('command:result', result);
-      });
+        return this.commandExecutor.clickRegisteredAction(commandId, payload.actionId!, this.actionTarget('approve_all'));
+      }, (payload) => (!payload.actionId ? 'Missing commandId or authorized actionId' : null));
 
-      socket.on('command:reject', async (payload: CommandPayload) => {
-        if (!payload.commandId || !payload.selectorPath) {
-          socket.emit('command:result', {
-            commandId: payload.commandId ?? 'unknown',
-            ok: false,
-            error: 'Missing commandId or selectorPath',
-          } satisfies CommandResult);
-          return;
-        }
+      onCommand('reject', (payload, commandId) => {
         console.log(`[relay] Command: reject from ${socket.id}`);
-        const result = await this.commandExecutor.reject(
-          payload.commandId,
-          payload.selectorPath
-        );
-        socket.emit('command:result', result);
-      });
+        return this.commandExecutor.clickRegisteredAction(commandId, payload.actionId!, this.actionTarget('reject'));
+      }, (payload) => (!payload.actionId ? 'Missing commandId or authorized actionId' : null));
 
-      socket.on('command:switch_tab', async (payload: CommandPayload) => {
-        if (!payload.commandId || (!payload.tabTitle && !payload.selectorPath)) {
-          socket.emit('command:result', {
-            commandId: payload.commandId ?? 'unknown',
-            ok: false,
-            error: 'Missing commandId and tab target',
-          } satisfies CommandResult);
-          return;
-        }
-        console.log(`[relay] Command: switch_tab to "${payload.tabTitle ?? payload.selectorPath}" from ${socket.id}`);
-        const result = await this.commandExecutor.switchTab(
-          payload.commandId,
-          payload.tabTitle ?? '',
-          payload.selectorPath
-        );
-        socket.emit('command:result', result);
-      });
+      onCommand('switch_tab', (payload, commandId) => {
+        console.log(`[relay] Command: switch_tab to "${payload.tabTitle}" from ${socket.id}`);
+        return this.commandExecutor.switchTab(commandId, payload.tabTitle!);
+      }, (payload) => (!payload.tabTitle ? 'Missing commandId or tab title' : null));
 
-      socket.on('command:new_chat', async (payload: CommandPayload) => {
-        if (!payload.commandId) {
-          socket.emit('command:result', {
-            commandId: 'unknown',
-            ok: false,
-            error: 'Missing commandId',
-          } satisfies CommandResult);
-          return;
-        }
+      onCommand('new_chat', (_payload, commandId) => {
         console.log(`[relay] Command: new_chat from ${socket.id}`);
-        const result = await this.commandExecutor.newChat(payload.commandId);
-        socket.emit('command:result', result);
+        return this.commandExecutor.newChat(commandId);
       });
 
-      socket.on('command:set_mode', async (payload: CommandPayload) => {
-        if (!payload.commandId || !payload.modeId) {
-          socket.emit('command:result', {
-            commandId: payload.commandId ?? 'unknown',
-            ok: false,
-            error: 'Missing commandId or modeId',
-          } satisfies CommandResult);
-          return;
-        }
+      onCommand('set_mode', (payload, commandId) => {
         console.log(`[relay] Command: set_mode to ${payload.modeId} from ${socket.id}`);
-        const result = await this.commandExecutor.setMode(
-          payload.commandId,
-          payload.modeId
-        );
-        socket.emit('command:result', result);
+        return this.commandExecutor.setMode(commandId, payload.modeId!);
+      }, (payload) => {
+        if (!payload.modeId) return 'Missing commandId or modeId';
+        return this.capabilityAllows('mode', payload.modeId);
       });
 
-      socket.on('command:set_model', async (payload: CommandPayload) => {
-        if (!payload.commandId || !payload.modelId) {
-          socket.emit('command:result', {
-            commandId: payload.commandId ?? 'unknown',
-            ok: false,
-            error: 'Missing commandId or modelId',
-          } satisfies CommandResult);
-          return;
-        }
+      onCommand('set_model', (payload, commandId) => {
         console.log(`[relay] Command: set_model to ${payload.modelId} from ${socket.id}`);
-        const result = await this.commandExecutor.setModel(
-          payload.commandId,
-          payload.modelId
-        );
-        socket.emit('command:result', result);
+        return this.commandExecutor.setModel(commandId, payload.modelId!);
+      }, (payload) => {
+        if (!payload.modelId) return 'Missing commandId or modelId';
+        return this.capabilityAllows('model', payload.modelId);
       });
 
-      socket.on('command:get_model_options', async (payload: CommandPayload) => {
-        if (!payload.commandId) {
-          socket.emit('command:result', {
-            commandId: payload.commandId ?? 'unknown',
-            ok: false,
-            error: 'Missing commandId',
-          } satisfies CommandResult);
-          return;
-        }
+      onCommand('get_model_options', async (_payload, commandId) => {
         console.log(`[relay] Command: get_model_options from ${socket.id}`);
-        const result = await this.commandExecutor.getModelOptions(
-          payload.commandId
-        );
-        socket.emit('command:result', result);
+        const result = await this.commandExecutor.getModelOptions(commandId);
+        this.updateModelCapabilities(result);
+        return result;
       });
 
-      socket.on('command:get_plan_full', async (payload: CommandPayload) => {
-        if (!payload.commandId || !payload.planLabel) {
-          socket.emit('command:result', {
-            commandId: payload.commandId ?? 'unknown',
-            ok: false,
-            error: 'Missing commandId or planLabel',
-          } satisfies CommandResult);
-          return;
-        }
+      onCommand('get_plan_full', async (payload, commandId) => {
         console.log(`[relay] Command: get_plan_full for ${payload.planLabel} from ${socket.id}`);
-        const planFile = readPlanFile(payload.planLabel);
-        if (!planFile) {
-          socket.emit('command:result', {
-            commandId: payload.commandId,
-            ok: false,
-            error: 'Plan file not found',
-          } satisfies CommandResult);
-          return;
-        }
-        socket.emit('command:result', {
-          commandId: payload.commandId,
+        const planFile = readPlanFile(payload.planLabel!);
+        if (!planFile) return { commandId, ok: false, error: 'Plan file not found' };
+        return {
+          commandId,
           ok: true,
           data: {
             todos: planFile.todos,
             body: planFile.body,
             bodyHtml: markdownToWebHtml(planFile.body),
           },
-        } satisfies CommandResult);
-      });
+        };
+      }, (payload) => (!payload.planLabel ? 'Missing commandId or planLabel' : null));
 
-      socket.on('command:get_plan_model_options', async (payload: CommandPayload) => {
-        if (!payload.commandId || !payload.selectorPath) {
-          socket.emit('command:result', {
-            commandId: payload.commandId ?? 'unknown',
-            ok: false,
-            error: 'Missing commandId or selectorPath',
-          } satisfies CommandResult);
-          return;
-        }
+      onCommand('get_plan_model_options', (payload, commandId) => {
         console.log(`[relay] Command: get_plan_model_options from ${socket.id}`);
-        const result = await this.commandExecutor.getPlanModelOptions(
-          payload.commandId,
-          payload.selectorPath
-        );
-        socket.emit('command:result', result);
-      });
+        return this.commandExecutor.getRegisteredPlanModelOptions(commandId, payload.actionId!);
+      }, (payload) => (!payload.actionId ? 'Missing commandId or authorized plan model actionId' : null));
 
-      socket.on('command:set_plan_model', async (payload: CommandPayload) => {
-        if (!payload.commandId || !payload.selectorPath || !payload.planModelId) {
-          socket.emit('command:result', {
-            commandId: payload.commandId ?? 'unknown',
-            ok: false,
-            error: 'Missing commandId, selectorPath, or planModelId',
-          } satisfies CommandResult);
-          return;
-        }
+      onCommand('set_plan_model', (payload, commandId) => {
         console.log(`[relay] Command: set_plan_model to ${payload.planModelId} from ${socket.id}`);
-        const result = await this.commandExecutor.setPlanModel(
-          payload.commandId,
-          payload.selectorPath,
-          payload.planModelId
-        );
-        socket.emit('command:result', result);
-      });
+        return this.commandExecutor.setRegisteredPlanModel(commandId, payload.actionId!, payload.planModelId!);
+      }, (payload) => (
+        !payload.actionId || !payload.planModelId
+          ? 'Missing commandId, authorized plan model actionId, or planModelId'
+          : null
+      ));
 
-      socket.on('command:click_action', async (payload: CommandPayload) => {
-        if (!payload.commandId || !payload.selectorPath) {
-          socket.emit('command:result', {
-            commandId: payload.commandId ?? 'unknown',
-            ok: false,
-            error: 'Missing commandId or selectorPath',
-          } satisfies CommandResult);
-          return;
-        }
+      onCommand('click_action', (payload, commandId) => {
         console.log(`[relay] Command: click_action from ${socket.id}`);
-        const result = await this.commandExecutor.clickAction(
-          payload.commandId,
-          payload.selectorPath,
-          payload.actionLabel
+        return this.commandExecutor.clickRegisteredAction(
+          commandId,
+          payload.actionId!,
+          this.actionTarget(payload.actionType!),
         );
-        socket.emit('command:result', result);
+      }, (payload) => {
+        if (typeof payload.actionId !== 'string' || payload.actionId.length === 0 || !isValidActionType(payload.actionType)) {
+          return 'Missing authorized actionId or valid actionType';
+        }
+        return null;
       });
 
-      socket.on('command:switch_window', async (payload: CommandPayload) => {
-        if (!payload.commandId || !payload.windowId) {
-          socket.emit('command:result', {
-            commandId: payload.commandId ?? 'unknown',
-            ok: false,
-            error: 'Missing commandId or windowId',
-          } satisfies CommandResult);
-          return;
-        }
+      onCommand('switch_window', async (payload, commandId) => {
         console.log(`[relay] Command: switch_window to ${payload.windowId} from ${socket.id}`);
-        try {
-          // Same sequence as Telegram inbound: switch CDP home, then sync
-          // WindowMonitor home/generation so the new active window is not
-          // treated as a non-home parallel poll target.
-          await moveHomeWindow(this.cdpBridge, this.windowMonitor, payload.windowId);
-          socket.emit('command:result', { commandId: payload.commandId, ok: true });
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          socket.emit('command:result', { commandId: payload.commandId, ok: false, error: msg });
-        }
-      });
+        await moveHomeWindow(this.cdpBridge, this.windowMonitor, payload.windowId!);
+        return { commandId, ok: true };
+      }, (payload) => (!payload.windowId ? 'Missing commandId or windowId' : null));
 
       socket.on('disconnect', (reason) => {
         console.log(`[relay] Client disconnected: ${socket.id} (${reason})`);
@@ -735,5 +1396,20 @@ export class Relay {
     this.stateManager.on('connection:changed', (connected: boolean) => {
       this.io.emit('connection:status', { connected });
     });
+
+    if (this.capabilityStateManager) {
+      this.capabilityStateManager.on('capabilities:full', (snapshot: unknown) => {
+        this.io.emit(
+          'capabilities:full',
+          toPublicCapabilityFull(snapshot, this.capabilityStateManager?.activeTargetId ?? ''),
+        );
+      });
+      this.capabilityStateManager.on('capabilities:patch', (patch: unknown) => {
+        this.io.emit('capabilities:patch', patch);
+      });
+      this.capabilityStateManager.on('capabilities:stale', (patch: unknown) => {
+        this.io.emit('capabilities:stale', patch);
+      });
+    }
   }
 }

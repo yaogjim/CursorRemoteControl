@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 import {
+  ACTION_CLICK_RESOLVER_JS,
   CommandExecutor,
   resolveActionClickTarget,
   type ActionClickTargetResult,
@@ -131,7 +132,7 @@ describe('action click target resolution', () => {
     `);
     const multiple = resolveActionClickTarget(multipleDocument, '#toolbar > button#stale', 'Continue');
 
-    assert.match(assertError(multiple), /action target not found \(label: Continue\)/);
+    assert.match(assertError(multiple), /action target is ambiguous \(label: Continue\)/);
   });
 
   it('returns a closest button ancestor or descendant button when that label matches', () => {
@@ -215,6 +216,50 @@ describe('action click target resolution', () => {
     assert.equal(assertElement(result).id, 'row-a');
   });
 
+  it('rejects an ambiguous direct selector instead of choosing its first match', () => {
+    const document = documentFor(`
+      <main id="toolbar">
+        <button class="approve">Approve</button>
+        <button class="approve">Approve</button>
+      </main>
+    `);
+
+    const result = resolveActionClickTarget(document, '#toolbar > button.approve', 'Approve');
+
+    assert.match(assertError(result), /action target is ambiguous/);
+  });
+
+  it('matches aria-label when an icon-only action has no text', () => {
+    const document = documentFor('<button id="approve" aria-label="Approve"></button>');
+
+    const result = resolveActionClickTarget(document, '#approve', 'Approve');
+
+    assert.equal(assertElement(result).id, 'approve');
+  });
+
+  it('requires the resolved action to remain inside its registered capability scope', () => {
+    const document = documentFor(`
+      <section id="composer-a"><button id="outside">Approve</button></section>
+      <section id="composer-b"><button id="inside">Approve</button></section>
+    `);
+    const capabilityScope = document.querySelector('#composer-b');
+
+    const result = resolveActionClickTarget(document, '#outside', 'Approve', capabilityScope);
+
+    assert.equal(assertElement(result).id, 'inside');
+  });
+
+  it('keeps the serialized browser resolver aligned with whitespace and aria-label matching', () => {
+    const dom = new JSDOM('<button id="approve" aria-label="Approve   All"></button>', { runScripts: 'outside-only' });
+    const result = dom.window.eval(`(() => {
+      ${ACTION_CLICK_RESOLVER_JS}
+      const resolved = resolveActionClickTarget(document, '#approve', 'Approve All');
+      return resolved.element ? resolved.element.id : resolved.error;
+    })()`);
+
+    assert.equal(result, 'approve');
+  });
+
   it('keeps clickAction legacy behavior when no expected label is provided', async () => {
     const clickedSelectors: string[] = [];
     let evaluateCalled = false;
@@ -236,5 +281,43 @@ describe('action click target resolution', () => {
     assert.equal(result.ok, true);
     assert.deepEqual(clickedSelectors, ['#legacy-button']);
     assert.equal(evaluateCalled, false);
+  });
+
+  it('rejects hidden, disabled, and aria-disabled targets before they can be chosen', () => {
+    const hidden = resolveActionClickTarget(
+      documentFor('<button id="approve" hidden>Approve</button>'),
+      '#approve',
+      'Approve',
+    );
+    assert.match(assertError(hidden), /action target is hidden/);
+
+    const disabled = resolveActionClickTarget(
+      documentFor('<button id="approve" disabled>Approve</button>'),
+      '#approve',
+      'Approve',
+    );
+    assert.match(assertError(disabled), /action target is disabled/);
+
+    const ariaDisabled = resolveActionClickTarget(
+      documentFor('<button id="approve" aria-disabled="true">Approve</button>'),
+      '#approve',
+      'Approve',
+    );
+    assert.match(assertError(ariaDisabled), /action target is disabled/);
+  });
+
+  it('keeps the serialized resolver from returning a disabled or hidden element', () => {
+    const run = (html: string) => {
+      const dom = new JSDOM(html, { runScripts: 'outside-only' });
+      return dom.window.eval(`(() => {
+        ${ACTION_CLICK_RESOLVER_JS}
+        const resolved = resolveActionClickTarget(document, '#approve', 'Approve');
+        return resolved.element ? 'clicked' : resolved.error;
+      })()`);
+    };
+
+    assert.match(String(run('<button id="approve" hidden>Approve</button>')), /action target is hidden/);
+    assert.match(String(run('<button id="approve" disabled>Approve</button>')), /action target is disabled/);
+    assert.match(String(run('<button id="approve" aria-disabled="true">Approve</button>')), /action target is disabled/);
   });
 });

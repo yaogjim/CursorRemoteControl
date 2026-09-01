@@ -1224,17 +1224,13 @@ export async function handleCallbackQuery(ctx: BotContext, deps: CommandDeps): P
       }
       // Questionnaire callback format is `qan:<hash>` — parseCallbackData
       // routes the hash into the `hash` field for these actions.
-      const qSelector = deps.messageTracker.resolveHash(hash);
-      if (!qSelector) {
+      const actionId = deps.messageTracker.resolveActionHash(hash);
+      if (!actionId) {
         await ctx.answerCallbackQuery({ text: 'Action expired.' });
         return;
       }
-      const qActionLabel: Record<string, string | undefined> = {
-        qan: undefined,
-        qsk: 'Skip',
-        qco: 'Continue',
-      };
-      const result = await deps.commandExecutor.clickAction(commandId, qSelector, qActionLabel[action]);
+      const actionType = action === 'qan' ? 'questionnaire_option' : action === 'qsk' ? 'skip' : 'continue';
+      const result = await deps.commandExecutor.clickRegisteredAction(commandId, actionId, { actionType });
       const qNames: Record<string, string> = { qan: 'Answered', qsk: 'Skipped', qco: 'Continued' };
       await ctx.answerCallbackQuery({ text: result.ok ? qNames[action] ?? action : `Error: ${result.error}` });
       return;
@@ -1245,15 +1241,9 @@ export async function handleCallbackQuery(ctx: BotContext, deps: CommandDeps): P
       return;
     }
 
-    // Prefer the per-card hash from callback_data — it targets the exact card
-    // the user tapped in Telegram. Fall back to a stable CSS-class selector if
-    // the hash has been evicted (server restart, two-bot scenarios), which
-    // still works when only one approval card is currently visible.
-    const fromHash = deps.messageTracker.resolveHash(hash);
-    const stableFallback = resolveStableActionSelector(action);
-    const selectorPath = fromHash ?? stableFallback;
+    const actionId = deps.messageTracker.resolveActionHash(hash);
 
-    if (!selectorPath) {
+    if (!actionId) {
       await ctx.answerCallbackQuery({
         text: 'Action no longer pending (already actioned, cleared, or restart).',
       });
@@ -1262,11 +1252,26 @@ export async function handleCallbackQuery(ctx: BotContext, deps: CommandDeps): P
 
     let result;
     switch (action) {
-      case 'apr': case 'rej': case 'all':
-        result = await deps.commandExecutor.clickApproval(commandId, selectorPath);
+      case 'apr':
+        result = await deps.commandExecutor.clickRegisteredAction(commandId, actionId, { actionType: 'approve' });
         break;
-      case 'run': case 'skp': case 'alw': case 'bld':
-        result = await deps.commandExecutor.clickAction(commandId, selectorPath);
+      case 'rej':
+        result = await deps.commandExecutor.clickRegisteredAction(commandId, actionId, { actionType: 'reject' });
+        break;
+      case 'all':
+        result = await deps.commandExecutor.clickRegisteredAction(commandId, actionId, { actionType: 'approve_all' });
+        break;
+      case 'run':
+        result = await deps.commandExecutor.clickRegisteredAction(commandId, actionId, { actionType: 'run' });
+        break;
+      case 'skp':
+        result = await deps.commandExecutor.clickRegisteredAction(commandId, actionId, { actionType: 'skip' });
+        break;
+      case 'alw':
+        result = await deps.commandExecutor.clickRegisteredAction(commandId, actionId, { actionType: 'allow' });
+        break;
+      case 'bld':
+        result = await deps.commandExecutor.clickRegisteredAction(commandId, actionId, { actionType: 'build' });
         break;
       default:
         await ctx.answerCallbackQuery({ text: `Unknown: ${action}` });

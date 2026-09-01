@@ -2,7 +2,12 @@ import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server as HttpServer, type AddressInfo } from 'node:http';
 import { WebSocketServer, type WebSocket as WsSocket } from 'ws';
-import { CDPBridge } from '../src/server/cdp-bridge.js';
+import {
+  CDPBridge,
+  isUsableWorkspaceIdentity,
+  matchEligibleTargetsByWorkspace,
+  parseCdpTitle,
+} from '../src/server/cdp-bridge.js';
 import type { ServerConfig } from '../src/server/types.js';
 
 interface MockTarget {
@@ -41,13 +46,26 @@ function onceEvent(ee: NodeJS.EventEmitter, event: string, timeoutMs = 3000): Pr
 
 class MockCdpEndpoint {
   targets: MockTarget[] = [];
+  userAgent =
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) ' +
+    'Cursor/3.17.21 Chrome/144.0.7559.59 Electron/40.10.3 Safari/537.36';
   private http: HttpServer;
   private sockets = new Set<WsSocket>();
   private wssById = new Map<string, WebSocketServer>();
+  private workspaceByTargetId = new Map<string, { path: string; authority: string }>();
   port = 0;
 
   constructor() {
     this.http = createServer((req, res) => {
+      if (req.url === '/json/version') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          Browser: 'Chrome/144.0.7559.59',
+          'Protocol-Version': '1.3',
+          'User-Agent': this.userAgent,
+        }));
+        return;
+      }
       if (req.url === '/json') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(this.targets));
@@ -68,20 +86,32 @@ class MockCdpEndpoint {
     });
   }
 
-  async addWorkbench(id: string, title: string): Promise<string> {
+  async addWorkbench(
+    id: string,
+    title: string,
+    workspace?: { path: string; authority?: string },
+  ): Promise<string> {
     const wss = new WebSocketServer({ host: '127.0.0.1', port: 0 });
     await new Promise<void>((resolve, reject) => {
       wss.once('error', reject);
       wss.once('listening', () => resolve());
     });
     const wsPort = (wss.address() as AddressInfo).port;
+    if (workspace) {
+      this.workspaceByTargetId.set(id, { path: workspace.path, authority: workspace.authority ?? '' });
+    }
     wss.on('connection', (socket) => {
       this.sockets.add(socket);
       socket.on('close', () => this.sockets.delete(socket));
       socket.on('message', (data) => {
-        const msg = JSON.parse(data.toString()) as { id?: number };
+        const msg = JSON.parse(data.toString()) as { id?: number; method?: string };
         if (msg.id !== undefined) {
-          socket.send(JSON.stringify({ id: msg.id, result: { result: { value: null } } }));
+          let value: unknown = null;
+          if (msg.method === 'Runtime.evaluate') {
+            const ws = this.workspaceByTargetId.get(id);
+            if (ws) value = JSON.stringify({ path: ws.path, authority: ws.authority });
+          }
+          socket.send(JSON.stringify({ id: msg.id, result: { result: { value } } }));
         }
       });
     });
@@ -95,6 +125,13 @@ class MockCdpEndpoint {
       webSocketDebuggerUrl: wsUrl,
     });
     return wsUrl;
+  }
+
+  removeTarget(id: string): MockTarget | undefined {
+    const index = this.targets.findIndex((target) => target.id === id);
+    if (index < 0) return undefined;
+    const [removed] = this.targets.splice(index, 1);
+    return removed;
   }
 
   closeTargetSockets(id: string): void {
@@ -114,6 +151,30 @@ class MockCdpEndpoint {
     await new Promise<void>((resolve) => this.http.close(() => resolve()));
   }
 }
+
+describe('workspace identity matching', () => {
+  it('parses Cursor titles conservatively and rejects unusable identities', () => {
+    assert.equal(parseCdpTitle('Alpha - Cursor'), 'Alpha');
+    assert.equal(parseCdpTitle('file.ts - Alpha - Cursor'), 'Alpha');
+    assert.equal(parseCdpTitle('Alpha [WSL: Ubuntu] - Cursor'), 'Alpha [WSL: Ubuntu]');
+    assert.equal(isUsableWorkspaceIdentity('Alpha'), true);
+    assert.equal(isUsableWorkspaceIdentity('Cursor'), false);
+    assert.equal(isUsableWorkspaceIdentity(''), false);
+  });
+
+  it('returns only eligible workbench targets with an exact parsed-title match', () => {
+    const targets = [
+      { id: 'a', type: 'page', title: 'file.ts - Alpha - Cursor', url: 'vscode-file://app/workbench.html', webSocketDebuggerUrl: 'ws://a' },
+      { id: 'b', type: 'page', title: 'Beta - Cursor', url: 'vscode-file://app/workbench.html', webSocketDebuggerUrl: 'ws://b' },
+      { id: 'c', type: 'page', title: 'Alpha - Cursor', url: 'vscode-file://app/workbench.html', webSocketDebuggerUrl: 'ws://c' },
+      { id: 'd', type: 'iframe', title: 'Alpha - Cursor', url: 'vscode-file://app/workbench.html', webSocketDebuggerUrl: 'ws://d' },
+    ];
+    assert.deepEqual(matchEligibleTargetsByWorkspace(targets, 'Alpha').map((t) => t.id), ['a', 'c']);
+    assert.deepEqual(matchEligibleTargetsByWorkspace(targets, 'Beta').map((t) => t.id), ['b']);
+    assert.deepEqual(matchEligibleTargetsByWorkspace(targets, 'Missing').map((t) => t.id), []);
+    assert.deepEqual(matchEligibleTargetsByWorkspace(targets, 'Cursor').map((t) => t.id), []);
+  });
+});
 
 describe('CDPBridge reconnect target', () => {
   const bridges: CDPBridge[] = [];
@@ -287,5 +348,172 @@ describe('CDPBridge reconnect target', () => {
     await onceEvent(bridge, 'connected', 3500);
     assert.equal(bridge.activeTargetId, 'win-b');
     assert.equal(bridge.isConnected(), true);
+  });
+
+  it('keeps the exact preferred target when it still exists even if another window shares the workspace', async () => {
+    const endpoint = new MockCdpEndpoint();
+    endpoints.push(endpoint);
+    await endpoint.start();
+    await endpoint.addWorkbench('win-a', 'Alpha - Cursor', { path: '/tmp/Alpha' });
+    await endpoint.addWorkbench('win-a-clone', 'file.ts - Alpha - Cursor', { path: '/tmp/Alpha' });
+
+    const bridge = new CDPBridge(testConfig(`http://127.0.0.1:${endpoint.port}`));
+    bridges.push(bridge);
+
+    await Promise.all([onceEvent(bridge, 'connected'), bridge.connect('win-a')]);
+    assert.equal(bridge.activeTargetId, 'win-a');
+    const generation = bridge.getTargetGeneration('win-a');
+
+    const reconnected = onceEvent(bridge, 'connected', 2500);
+    endpoint.closeTargetSockets('win-a');
+    await reconnected;
+    assert.equal(bridge.activeTargetId, 'win-a', 'exact preferred id must win over a same-workspace clone');
+    assert.equal(bridge.getTargetGeneration('win-a'), generation + 1);
+    assert.equal(bridge.isConnected(), true);
+  });
+
+  it('remaps automatic reconnect to a unique workspace match after the preferred target id is replaced', async () => {
+    const endpoint = new MockCdpEndpoint();
+    endpoints.push(endpoint);
+    await endpoint.start();
+    await endpoint.addWorkbench('win-b', 'Beta - Cursor', { path: '/tmp/Beta' });
+    await endpoint.addWorkbench('win-a', 'Alpha - Cursor', { path: '/tmp/Alpha' });
+
+    const bridge = new CDPBridge(testConfig(`http://127.0.0.1:${endpoint.port}`));
+    bridges.push(bridge);
+
+    await Promise.all([onceEvent(bridge, 'connected'), bridge.connect('win-a')]);
+    assert.equal(bridge.activeTargetId, 'win-a');
+    const oldGeneration = bridge.getTargetGeneration('win-a');
+
+    endpoint.removeTarget('win-a');
+    await endpoint.addWorkbench('win-a2', 'file.ts - Alpha - Cursor');
+    const reconnected = onceEvent(bridge, 'connected', 2500);
+    endpoint.closeTargetSockets('win-a');
+    await reconnected;
+
+    assert.equal(bridge.activeTargetId, 'win-a2', 'unique Alpha match must win; must not score-pick Beta');
+    assert.equal(bridge.isConnected(), true);
+    assert.equal(bridge.getTargetGeneration(), 1);
+    assert.equal(bridge.getTargetGeneration('win-a'), oldGeneration, 'old target generation must be preserved');
+    assert.equal(bridge.getDiscoveryStatus().preferredTargetPresent, true);
+    assert.equal(bridge.getDiscoveryStatus().status, 'ok');
+  });
+
+  it('fails closed when multiple windows match the preferred workspace after target replacement', async () => {
+    const endpoint = new MockCdpEndpoint();
+    endpoints.push(endpoint);
+    await endpoint.start();
+    await endpoint.addWorkbench('win-b', 'Beta - Cursor', { path: '/tmp/Beta' });
+    await endpoint.addWorkbench('win-a', 'Alpha - Cursor', { path: '/tmp/Alpha' });
+
+    const bridge = new CDPBridge(testConfig(`http://127.0.0.1:${endpoint.port}`));
+    bridges.push(bridge);
+    bridge.on('error', () => { /* reconnect loop */ });
+
+    await Promise.all([onceEvent(bridge, 'connected'), bridge.connect('win-a')]);
+    assert.equal(bridge.activeTargetId, 'win-a');
+
+    endpoint.removeTarget('win-a');
+    await endpoint.addWorkbench('win-a2', 'Alpha - Cursor');
+    await endpoint.addWorkbench('win-a3', 'file.ts - Alpha - Cursor');
+    const failed = onceEvent(bridge, 'error', 2500);
+    endpoint.closeTargetSockets('win-a');
+    await failed;
+
+    assert.equal(bridge.isConnected(), false);
+    assert.equal(bridge.activeTargetId, '', 'ambiguous Alpha must not pick Beta or either Alpha');
+    assert.equal(bridge.getClient(), null);
+    const discovery = bridge.getDiscoveryStatus();
+    assert.equal(discovery.status, 'target_unverified');
+    assert.equal(discovery.lastError?.code, 'preferred_target_ambiguous');
+    assert.equal(discovery.preferredTargetPresent, false);
+  });
+
+  it('does not remap an explicit failed switch to the previous workspace', async () => {
+    const endpoint = new MockCdpEndpoint();
+    endpoints.push(endpoint);
+    await endpoint.start();
+    await endpoint.addWorkbench('win-a', 'Alpha - Cursor', { path: '/tmp/Alpha' });
+    await endpoint.addWorkbench('win-b', 'Beta - Cursor', { path: '/tmp/Beta' });
+
+    const bridge = new CDPBridge(testConfig(`http://127.0.0.1:${endpoint.port}`));
+    bridges.push(bridge);
+    bridge.on('error', () => { /* reconnect loop */ });
+
+    await Promise.all([onceEvent(bridge, 'connected'), bridge.connect('win-a')]);
+    assert.equal(bridge.activeTargetId, 'win-a');
+
+    await assert.rejects(
+      () => bridge.switchWindow('missing-window'),
+      /not found/,
+    );
+    assert.equal(bridge.isConnected(), false);
+    assert.equal(bridge.activeTargetId, '');
+
+    await onceEvent(bridge, 'error', 2500);
+    assert.equal(bridge.isConnected(), false, 'failed switch must keep retrying the requested id, not remap to Alpha');
+    assert.equal(bridge.activeTargetId, '');
+    assert.equal(bridge.getClient(), null);
+    const discovery = bridge.getDiscoveryStatus();
+    assert.equal(discovery.status, 'target_unverified');
+    assert.equal(discovery.lastError?.code, 'target_unverified');
+    assert.match(discovery.lastError?.message ?? '', /not found/);
+  });
+
+  it('does not remap to an unrelated window when the preferred target disappears', async () => {
+    const endpoint = new MockCdpEndpoint();
+    endpoints.push(endpoint);
+    await endpoint.start();
+    await endpoint.addWorkbench('win-b', 'Beta - Cursor', { path: '/tmp/Beta' });
+    await endpoint.addWorkbench('win-a', 'Alpha - Cursor', { path: '/tmp/Alpha' });
+
+    const bridge = new CDPBridge(testConfig(`http://127.0.0.1:${endpoint.port}`));
+    bridges.push(bridge);
+    bridge.on('error', () => { /* reconnect loop */ });
+
+    await Promise.all([onceEvent(bridge, 'connected'), bridge.connect('win-a')]);
+    assert.equal(bridge.activeTargetId, 'win-a');
+
+    endpoint.removeTarget('win-a');
+    const failed = onceEvent(bridge, 'error', 2500);
+    endpoint.closeTargetSockets('win-a');
+    await failed;
+
+    assert.equal(bridge.isConnected(), false);
+    assert.equal(bridge.activeTargetId, '', 'zero matches must not fall back to Beta');
+    assert.equal(bridge.getClient(), null);
+    const discovery = bridge.getDiscoveryStatus();
+    assert.equal(discovery.status, 'target_unverified');
+    assert.equal(discovery.lastError?.code, 'target_unverified');
+  });
+
+  it('does not expose a client when /json/version is not Cursor', async () => {
+    const endpoint = new MockCdpEndpoint();
+    endpoints.push(endpoint);
+    await endpoint.start();
+    await endpoint.addWorkbench('win-a', 'Alpha - Cursor');
+    endpoint.userAgent =
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) ' +
+      'Chrome/144.0.0.0 Safari/537.36';
+
+    const bridge = new CDPBridge(testConfig(`http://127.0.0.1:${endpoint.port}`));
+    bridges.push(bridge);
+    bridge.on('error', () => { /* reconnect loop */ });
+
+    let connected = false;
+    bridge.on('connected', () => { connected = true; });
+
+    await Promise.all([onceEvent(bridge, 'error', 2500), bridge.connect()]);
+    assert.equal(connected, false);
+    assert.equal(bridge.isConnected(), false);
+    assert.equal(bridge.getClient(), null);
+    assert.equal(bridge.isEndpointVerified(), false);
+    assert.equal(bridge.activeTargetId, '');
+    const discovery = bridge.getDiscoveryStatus();
+    assert.equal(discovery.status, 'endpoint_unverified');
+    assert.equal(discovery.endpoint.verified, false);
+    assert.equal(discovery.endpoint.browserFamily, 'chrome');
+    assert.equal(discovery.windowCount, 0);
   });
 });

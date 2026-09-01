@@ -27,7 +27,7 @@ export interface FormattedMessage {
 
 export function formatElement(
   element: ChatElement,
-  hashCallback: (selectorPath: string) => string
+  hashCallback: (selectorPath: string, actionId?: string | null) => string
 ): FormattedMessage {
   switch (element.type) {
     case 'human': return formatHuman(element);
@@ -91,7 +91,7 @@ function toolDiffStatsSuffix(msg: Pick<ToolCallElement, 'additions' | 'deletions
 
 function formatTool(
   msg: ToolCallElement,
-  hashCallback: (selectorPath: string) => string
+  hashCallback: (selectorPath: string, actionId?: string | null) => string
 ): FormattedMessage {
   const icon = msg.status === 'completed' ? '✓' : '●';
 
@@ -108,12 +108,13 @@ function formatTool(
     }
 
     const kb = tgKeyboard();
-    const diffHash = hashCallback(msg.toolCallId);
+    const diffHash = hashCallback(msg.toolCallId, null);
     kb.text('📄 View Diff', `dif:${msg.toolCallId.substring(0, 8)}:${diffHash}`);
 
     if (msg.actions && msg.actions.length > 0) {
       for (const act of msg.actions) {
-        const hash = hashCallback(act.selectorPath);
+        const hash = hashCallback(act.selectorPath, act.actionId);
+        if (!hash) continue;
         const prefix = act.type === 'run' ? 'run' : act.type === 'skip' ? 'skp' : 'alw';
         const label = act.type === 'run' ? '✅ Accept'
           : act.type === 'skip' ? '⏭ Skip'
@@ -132,7 +133,7 @@ function formatTool(
 
     if (hasCode) {
       const html = `${icon} <b>${escapeHtml(msg.action || 'Tool')}</b>\n<pre>${escapeHtml(text.substring(0, 500))}</pre>`;
-      const hash = hashCallback(msg.toolCallId);
+      const hash = hashCallback(msg.toolCallId, null);
       const keyboard = tgKeyboard().text('📄 View Full', `dif:${msg.toolCallId.substring(0, 8)}:${hash}`).build();
       return { html, keyboard };
     }
@@ -217,7 +218,7 @@ function formatLoading(msg: LoadingIndicator): FormattedMessage {
 
 function formatPlan(
   msg: PlanBlock,
-  hashCallback: (selectorPath: string) => string
+  hashCallback: (selectorPath: string, actionId?: string | null) => string
 ): FormattedMessage {
   const lines: string[] = [];
   lines.push(`<b>📋 ${escapeHtml(msg.title)}</b>`);
@@ -244,7 +245,8 @@ function formatPlan(
   if (msg.actions && msg.actions.length > 0) {
     const kb = tgKeyboard();
     for (const action of msg.actions) {
-      const hash = hashCallback(action.selectorPath);
+      const hash = hashCallback(action.selectorPath, action.actionId);
+      if (!hash) continue;
       const label = action.type === 'build' ? '▶ Build' : '📄 View Plan';
       const data = `${action.type === 'build' ? 'bld' : 'vpl'}:${msg.id.substring(0, 8)}:${hash}`;
       kb.text(label, data);
@@ -269,7 +271,7 @@ function formatTodoList(msg: TodoListBlock): FormattedMessage {
 
 function formatRunCommand(
   msg: RunCommand,
-  hashCallback: (selectorPath: string) => string
+  hashCallback: (selectorPath: string, actionId?: string | null) => string
 ): FormattedMessage {
   const lines: string[] = [];
   let header = `<b>🖥 ${escapeHtml(msg.description)}</b>`;
@@ -281,7 +283,8 @@ function formatRunCommand(
   if (msg.actions.length > 0) {
     const kb = tgKeyboard();
     for (const action of msg.actions) {
-      const hash = hashCallback(action.selectorPath);
+      const hash = hashCallback(action.selectorPath, action.actionId);
+      if (!hash) continue;
       const prefix = action.type === 'run' ? 'run' : action.type === 'skip' ? 'skp' : 'alw';
       const label = action.type === 'run' ? '▶ Run'
         : action.type === 'skip' ? '⏭ Skip'
@@ -423,7 +426,7 @@ export function formatPlanFull(msg: PlanBlock): string {
 
 export function formatApprovals(
   approvals: Approval[],
-  hashCallback: (selectorPath: string) => string
+  hashCallback: (selectorPath: string, actionId?: string | null) => string
 ): FormattedMessage {
   if (approvals.length === 0) return { html: '' };
 
@@ -432,7 +435,8 @@ export function formatApprovals(
 
   const kb = tgKeyboard();
   for (const action of approval.actions) {
-    const hash = hashCallback(action.selectorPath);
+    if (!action.actionId) continue;
+    const hash = hashCallback(action.selectorPath, action.actionId);
     const prefix = action.type === 'approve' ? 'apr'
       : action.type === 'reject' ? 'rej'
       : 'all';
@@ -447,7 +451,7 @@ export function formatApprovals(
 
 export function formatQuestionnaire(
   questionnaire: Questionnaire,
-  hashCallback: (selectorPath: string) => string
+  hashCallback: (selectorPath: string, actionId?: string | null) => string
 ): FormattedMessage {
   if (!questionnaire.questions.length) return { html: '' };
 
@@ -471,15 +475,18 @@ export function formatQuestionnaire(
   // Keyboard buttons only for the active question
   const kb = tgKeyboard();
   for (const opt of activeQ.options) {
-    const hash = hashCallback(opt.selectorPath);
+    const hash = hashCallback(opt.selectorPath, opt.actionId);
+    if (!hash) continue;
     kb.text(`${opt.letter}) ${opt.label}`, `qan:${hash}`);
     kb.row();
   }
   if (questionnaire.skipSelectorPath) {
-    kb.text('⏭ Skip', `qsk:${hashCallback(questionnaire.skipSelectorPath)}`);
+    const skipHash = hashCallback(questionnaire.skipSelectorPath, questionnaire.skipActionId);
+    if (skipHash) kb.text('⏭ Skip', `qsk:${skipHash}`);
   }
   if (questionnaire.continueSelectorPath && !questionnaire.continueDisabled) {
-    kb.text('▶ Continue', `qco:${hashCallback(questionnaire.continueSelectorPath)}`);
+    const continueHash = hashCallback(questionnaire.continueSelectorPath, questionnaire.continueActionId);
+    if (continueHash) kb.text('▶ Continue', `qco:${continueHash}`);
   }
 
   return { html: lines.join('\n'), keyboard: kb.build() };

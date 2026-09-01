@@ -1,7 +1,7 @@
 {
   "name": "cursor-remote",
   "displayName": "CursorRemote",
-  "version": "0.1.54",
+  "version": "0.1.56",
   "description": "Remote control your local Cursor AI agent — monitor, approve, and send tasks from your phone or Telegram.",
   "publisher": "cursor-remote",
   "repository": {
@@ -217,6 +217,7 @@
     "replay": "tsx scripts/replay-cdp.ts",
     "test": "npx tsx --test tests/*.test.ts",
     "probe": "tsx scripts/probe-cdp.ts",
+    "report:target-capabilities": "tsx scripts/report-target-capabilities.ts",
     "wait-record": "tsx scripts/wait-record.ts"
   },
   "dependencies": {

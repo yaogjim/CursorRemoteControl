@@ -1,4 +1,5 @@
 import { CdpClient } from '../server/cdp-client.js';
+import { probeCursorEndpoint, selectCursorTarget, type TargetDescriptor } from '../server/target-discovery.js';
 
 const CDP_URL = process.env.CDP_URL ?? 'http://127.0.0.1:9222';
 
@@ -36,19 +37,28 @@ async function main(): Promise<void> {
     console.log(`    WS:  ${t.webSocketDebuggerUrl ?? 'N/A'}\n`);
   }
 
-  // 2. Connect to the best target
-  const target =
-    targets.find(t => t.type === 'page' && t.url.includes('workbench')) ??
-    targets.find(t => t.type === 'page') ??
-    targets[0];
+  // Apply the same endpoint identity and target eligibility gate as the
+  // production bridge. A webview, worker, or non-Cursor CDP endpoint is never
+  // a discovery source and cannot accidentally become a command target.
+  const identity = await probeCursorEndpoint(CDP_URL);
+  if (!identity.verified) {
+    console.error(`Endpoint verification failed: ${identity.diagnosticMessage}`);
+    process.exit(1);
+  }
 
-  if (!target?.webSocketDebuggerUrl) {
-    console.error('No suitable target found');
+  const preferredTargetId = process.env.CDP_TARGET_ID ?? '';
+  const target = selectCursorTarget(targets as TargetDescriptor[], preferredTargetId);
+  if (!target) {
+    console.error('No verified Cursor workbench page target found');
     process.exit(1);
   }
 
   console.log(`--- Connecting to: "${target.title}" ---\n`);
 
+  if (!target.webSocketDebuggerUrl) {
+    console.error('Selected Cursor workbench target has no debugger URL');
+    process.exit(1);
+  }
   const client = new CdpClient();
   await client.connect(target.webSocketDebuggerUrl);
 
@@ -208,8 +218,8 @@ async function main(): Promise<void> {
     console.log('  No text inputs found.\n');
   }
 
-  console.log('--- Discovery Complete ---');
-  console.log('\nUse the selectors above to update selectors.json');
+  console.log('\n--- Discovery Complete ---');
+  console.log('\nDiscovery is observational only. Review the evidence before creating a pending adapter.');
 
   client.disconnect();
 }

@@ -49,8 +49,9 @@ Replaced the horizontal window bar + session bar with:
    - New Chat button only affects current window
 
 ## Data Constraints
-- No `createdAt`/`updatedAt` in `ChatTab` interface
-- `state.chatTabs` array order is used directly (no sorting logic)
+- **Data source and order**: sessions in Cursor's horizontal open-tab strip are extracted first in their native left-to-right DOM order, then window-scoped history sessions are appended. Utility rows such as New Agent and Customize are excluded. The Web client preserves that open-first grouping and maps it to top-to-bottom order.
+- **Open state**: `ChatTab.isOpen` distinguishes open sessions from history-only sessions; `isActive` remains the current focused session.
+- **Scrolling**: the drawer body is the bounded touch-scroll container (`min-height: 0`, `overflow-y: auto`, momentum scrolling).
 - Only current window's sessions are available from server
 - "12m ago" relative time in prototype is demonstration only (not implemented in 0.1.54)
 

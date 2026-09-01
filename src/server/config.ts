@@ -23,6 +23,9 @@ export function loadConfig(): ServerConfig {
     webappPassword: process.env.WEBAPP_PASSWORD ?? '',
     windowTitleQualifier: process.env.WINDOW_TITLE_QUALIFIER !== 'false',
     dataDir,
+    adapterStorePath: process.env.ADAPTER_STORE_PATH ?? resolve(dataDir, 'adapters.json'),
+    adapterBackupCount: parseInt(process.env.ADAPTER_BACKUP_COUNT ?? '5', 10),
+    actionTtlMs: parseInt(process.env.ACTION_TTL_MS ?? '30000', 10),
     telegram: {
       enabled: process.env.TELEGRAM_ENABLED === 'true',
       botToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
@@ -85,6 +88,17 @@ function getDefaultSelectors(): SelectorConfig {
         "[class*='thinking']",
         "[class*='spinner']",
         "[class*='loading']",
+      ],
+    },
+    chatTabList: {
+      strategies: [
+        '.agent-sidebar-cell',
+        '.glass-sidebar-agent-list-container li.ui-sidebar-menu-item > div.glass-sidebar-agent-menu-btn',
+      ],
+    },
+    openChatTabList: {
+      strategies: [
+        ".auxiliary-bar-title--agent-mode li.composite-bar-action-tab[role='tab']",
       ],
     },
   };

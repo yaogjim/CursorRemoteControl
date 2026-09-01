@@ -268,4 +268,39 @@ describe('WindowMonitor home follows CDP active window', () => {
     assert.equal(snap.windowId, 'win-b');
     assert.equal(snap.messages.length, 1);
   });
+
+  it('does not cache extractor-fabricated mode lists without a verified capability snapshot', async () => {
+    const bridge = new FakeCdpBridge();
+    const stateManager = new StateManager(0);
+    const monitor = makeMonitor(bridge, stateManager);
+    monitor.start();
+
+    const windows = [win('win-a', 'ws://a'), win('win-b', 'ws://b')];
+    stateManager.onConnectionChanged(true);
+    stateManager.updateWindows(windows, 'win-b');
+    bridge.activeTargetId = 'win-b';
+    bridge.windows = windows;
+    bridge.emit('connected');
+
+    stateManager.onExtraction(extractionState({
+      mode: {
+        current: 'agent',
+        available: [
+          { id: 'agent', label: 'Agent', icon: 'infinity' },
+          { id: 'plan', label: 'Plan', icon: 'todos' },
+          { id: 'debug', label: 'Debug', icon: 'bug' },
+          { id: 'chat', label: 'Ask', icon: 'chat' },
+        ],
+      },
+      model: { current: 'Auto', currentId: 'auto' },
+    }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    const snap = monitor.getSnapshot('win-b');
+    assert.ok(snap);
+    assert.deepEqual(snap.mode.available, []);
+    assert.equal(snap.mode.current, '');
+    assert.equal(snap.model.current, '');
+    assert.equal(snap.model.currentId, '');
+  });
 });

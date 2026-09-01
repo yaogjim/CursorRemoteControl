@@ -55,6 +55,11 @@
       ".glass-sidebar-agent-list-container li.ui-sidebar-menu-item > div.glass-sidebar-agent-menu-btn"
     ]
   },
+  "openChatTabList": {
+    "strategies": [
+      ".auxiliary-bar-title--agent-mode li.composite-bar-action-tab[role='tab']"
+    ]
+  },
   "newChatButton": {
     "strategies": [
       "[data-command-id='composer.createNewComposerTab']",

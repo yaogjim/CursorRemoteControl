@@ -86,8 +86,8 @@
     pendingApprovals: [],
     inputAvailable: false,
     chatTabs: [],
-    mode: { current: 'agent', available: [] },
-    model: { current: 'Auto', currentId: '' },
+    mode: { current: '', available: [] },
+    model: { current: '', currentId: '' },
     windows: [],
     activeWindowId: '',
     composerQueue: { items: [] },
@@ -130,6 +130,11 @@
     ].join('-');
   }
 
+  /** Matches Relay OPERATION_ID_RE: 8–128 of [A-Za-z0-9._:-]. Unique per mutation. */
+  function newOperationId() {
+    return 'op-' + newCommandId();
+  }
+
   async function checkAuth() {
     try {
       const res = await fetch('/health', {
@@ -163,6 +168,15 @@
   function bootstrap() {
 
   let state = { ...defaultState };
+  let capabilityState = null;
+  let capabilityDiff = null;
+  let adapterHistory = { activeBindings: {}, adapters: [], history: [] };
+  let activeSheet = null;
+  let cachedModelOptions = null;
+  let capabilityLive = true;
+  let awaitingCapabilityFull = false;
+  let csrfTokenCache = '';
+  const CSRF_COOKIE_NAME = 'cursor_remote_csrf';
 
   let userScrolledUp = false;
   let autoScrollJob = 0;
@@ -229,6 +243,14 @@
   const $pillModeText = document.getElementById('pill-mode-text');
   const $pillModel = document.getElementById('pill-model');
   const $pillModelText = document.getElementById('pill-model-text');
+  const $modeModelStatus = document.getElementById('mode-model-status');
+  const $modeModelStatusText = document.getElementById('mode-model-status-text');
+  const $btnModeModelRefresh = document.getElementById('btn-mode-model-refresh');
+  const $capabilityDiagnostics = document.getElementById('capability-diagnostics');
+  const $capabilityDiagnosticsSummary = document.getElementById('capability-diagnostics-summary');
+  const $capabilityDiagnosticsBody = document.getElementById('capability-diagnostics-body');
+  const $btnCapabilityRefresh = document.getElementById('btn-capability-refresh');
+  const $capabilityRefreshStatus = document.getElementById('capability-refresh-status');
   const $sheetOverlay = document.getElementById('sheet-overlay');
   const $sheetMode = document.getElementById('sheet-mode');
   const $sheetModeList = document.getElementById('sheet-mode-list');
@@ -257,9 +279,61 @@
     },
   });
 
+  const DANGEROUS_SOCKET_COMMANDS = new Set([
+    'send_message',
+    'approve',
+    'approve_all',
+    'new_chat',
+    'set_mode',
+    'set_model',
+    'set_plan_model',
+  ]);
+  const DANGEROUS_ACTION_TYPES = new Set([
+    'approve',
+    'approve_all',
+    'allow',
+    'run',
+    'build',
+    'continue',
+  ]);
+
+  function socketRoute(eventName) {
+    return eventName.indexOf('command:') === 0 ? eventName.slice('command:'.length) : eventName;
+  }
+
+  function commandRequiresOperationId(eventName, payload) {
+    const route = socketRoute(eventName);
+    if (DANGEROUS_SOCKET_COMMANDS.has(route)) return true;
+    return route === 'click_action' && !!(payload && DANGEROUS_ACTION_TYPES.has(payload.actionType));
+  }
+
+  function withCommandEnvelope(eventName, payload) {
+    const body = Object.assign({}, payload || {});
+    if (typeof body.commandId !== 'string' || body.commandId.length === 0) {
+      body.commandId = newCommandId();
+    }
+    if (commandRequiresOperationId(eventName, body)) {
+      if (typeof body.operationId !== 'string' || body.operationId.length === 0) {
+        body.operationId = newOperationId();
+      }
+    }
+    return body;
+  }
+
+  function emitCommand(eventName, payload) {
+    const body = withCommandEnvelope(eventName, payload);
+    socket.emit(eventName, body);
+    return body;
+  }
+
+  function hasOpaqueActionId(value) {
+    return typeof value === 'string' && value.length > 0;
+  }
+
   function sendCommandAwaitResult(eventName, payload) {
     return new Promise((resolve) => {
-      const commandId = payload.commandId;
+      const body = withCommandEnvelope(eventName, payload);
+      const commandId = body.commandId;
       const timer = setTimeout(() => {
         pendingCommandResults.delete(commandId);
         resolve({ commandId, ok: false, error: 'Command timed out' });
@@ -270,15 +344,238 @@
         resolve(result);
       });
 
-      socket.emit(eventName, payload);
+      socket.emit(eventName, body);
     });
   }
 
+  function readCookie(name) {
+    try {
+      const parts = String(document.cookie || '').split(';');
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i].trim();
+        if (part.indexOf(name + '=') === 0) {
+          return decodeURIComponent(part.slice(name.length + 1));
+        }
+      }
+    } catch { /* cookies blocked */ }
+    return '';
+  }
+
+  async function getCsrfToken() {
+    if (csrfTokenCache) return csrfTokenCache;
+    const fromCookie = readCookie(CSRF_COOKIE_NAME);
+    if (fromCookie) {
+      csrfTokenCache = fromCookie;
+      return csrfTokenCache;
+    }
+    if (typeof fetch !== 'function') return '';
+    const res = await fetch('/api/csrf', {
+      credentials: 'same-origin',
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) return '';
+    const data = await res.json();
+    csrfTokenCache = typeof data.csrfToken === 'string' ? data.csrfToken : '';
+    return csrfTokenCache;
+  }
+
+  async function apiWrite(path, body) {
+    const csrf = await getCsrfToken();
+    const headers = Object.assign({
+      'Content-Type': 'application/json',
+      'X-Operation-Id': newOperationId(),
+    }, getAuthHeaders());
+    if (csrf) headers['X-CSRF-Token'] = csrf;
+    return fetch(path, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: headers,
+      body: body === undefined ? '{}' : JSON.stringify(body),
+    });
+  }
+
+  function clearDiagnosticsBody() {
+    if (!$capabilityDiagnosticsBody) return;
+    while ($capabilityDiagnosticsBody.firstChild) {
+      $capabilityDiagnosticsBody.removeChild($capabilityDiagnosticsBody.firstChild);
+    }
+  }
+
+  function appendDiagnosticRow(label, value, className) {
+    const row = document.createElement('div');
+    row.className = 'capability-diagnostics-row';
+    const key = document.createElement('span');
+    key.className = 'capability-diagnostics-label';
+    key.textContent = label;
+    const text = document.createElement('span');
+    text.className = 'capability-diagnostics-value' + (className ? ' ' + className : '');
+    text.textContent = value;
+    row.append(key, text);
+    $capabilityDiagnosticsBody.appendChild(row);
+  }
+
+  function renderCapabilityDiagnostics() {
+    if (!$capabilityDiagnostics || !$capabilityDiagnosticsSummary || !$capabilityDiagnosticsBody) return;
+    const status = capabilityState?.status || {};
+    const stateLabel = !capabilityLive ? 'stale' : (status.state || 'unknown');
+    const completeness = !capabilityLive
+      ? 'reconnecting'
+      : (status.completeness || capabilityState?.models?.completeness || 'unknown');
+    const modes = Array.isArray(capabilityState?.modes) ? capabilityState.modes : [];
+    const models = Array.isArray(capabilityState?.models?.items) ? capabilityState.models.items : [];
+    const tools = Array.isArray(capabilityState?.tools) ? capabilityState.tools : [];
+    const adapters = Array.isArray(adapterHistory.adapters) ? adapterHistory.adapters : [];
+    const pending = adapters.filter((adapter) => adapter?.status === 'pending_confirmation');
+    const issueCount = pending.length + (stateLabel === 'ok' && completeness === 'complete' ? 0 : 1);
+    const layers = connectionLayers();
+
+    $capabilityDiagnostics.classList.remove(
+      'ok', 'warning', 'stale', 'degraded', 'unknown', 'unavailable', 'partial', 'changed',
+    );
+    $capabilityDiagnostics.classList.add(issueCount ? 'warning' : 'ok');
+    if (stateLabel && stateLabel !== 'ok') $capabilityDiagnostics.classList.add(stateLabel);
+    if (completeness === 'partial') $capabilityDiagnostics.classList.add('partial');
+    $capabilityDiagnostics.dataset.capabilityState = stateLabel;
+    $capabilityDiagnostics.dataset.completeness = completeness;
+    $capabilityDiagnostics.dataset.socket = layers.socket;
+    $capabilityDiagnostics.dataset.cdp = layers.cdp;
+    $capabilityDiagnostics.dataset.extractor = layers.extractor;
+    $capabilityDiagnosticsSummary.textContent = `Capabilities: ${stateLabel} · ${completeness}${pending.length ? ` · ${pending.length} pending adapter${pending.length === 1 ? '' : 's'}` : ''}`;
+    $capabilityDiagnosticsSummary.title = connectionA11yTitle(layers, `Capabilities ${stateLabel}/${completeness}`);
+    clearDiagnosticsBody();
+
+    appendDiagnosticRow('Discovery', `${stateLabel} / ${completeness}`, issueCount ? 'warning' : 'ok');
+    appendDiagnosticRow(
+      'Connection',
+      `relay ${layers.socket} · CDP ${layers.cdp} · extractor ${layers.extractor}`,
+      layers.socket === 'connected' && layers.cdp === 'connected' && layers.extractor === 'ok' ? 'ok' : 'warning',
+    );
+    appendDiagnosticRow('Available', `${modes.length} modes · ${models.length} models · ${tools.length} tools`);
+    if (capabilityState?.targetId) {
+      appendDiagnosticRow('Target', `${String(capabilityState.targetId).slice(0, 12)} · generation ${Number(capabilityState.targetGeneration || 0)}`);
+    }
+
+    if (capabilityDiff) {
+      const added = Array.isArray(capabilityDiff.added) ? capabilityDiff.added.length : 0;
+      const removed = Array.isArray(capabilityDiff.removed) ? capabilityDiff.removed.length : 0;
+      const changed = Array.isArray(capabilityDiff.changed) ? capabilityDiff.changed.length : 0;
+      const conflicts = Array.isArray(capabilityDiff.conflicts) ? capabilityDiff.conflicts.length : 0;
+      appendDiagnosticRow('Observed diff', `+${added} / −${removed} / ${changed} changed / ${conflicts} conflicts`);
+    }
+
+    const bindings = Array.isArray(adapterHistory.activeBindings)
+      ? adapterHistory.activeBindings.length
+      : (adapterHistory.activeBindings && typeof adapterHistory.activeBindings === 'object'
+        ? Object.keys(adapterHistory.activeBindings).length : 0);
+    appendDiagnosticRow('Adapters', `${bindings} active binding${bindings === 1 ? '' : 's'} · ${pending.length} awaiting confirmation`, pending.length ? 'warning' : '');
+    if (pending.length) {
+      appendDiagnosticRow('Activation', 'unavailable from this UI — confirm manually', 'warning');
+    }
+
+    for (const adapter of pending) {
+      const card = document.createElement('div');
+      card.className = 'pending-adapter';
+      const title = document.createElement('strong');
+      title.textContent = Array.isArray(adapter.capabilityKinds) && adapter.capabilityKinds.length
+        ? `${adapter.capabilityKinds.join('/')} adapter` : 'Capability adapter';
+      const metadata = document.createElement('span');
+      metadata.textContent = `${String(adapter.id || '').slice(0, 12)} · activation unavailable — confirm manually`;
+      card.append(title, metadata);
+      $capabilityDiagnosticsBody.appendChild(card);
+    }
+  }
+
+  async function refreshCapabilityDiagnostics() {
+    if (typeof fetch !== 'function') return;
+    try {
+      const headers = getAuthHeaders();
+      const [diffResponse, adapterResponse] = await Promise.all([
+        fetch('/api/capabilities/diff', { credentials: 'same-origin', headers }),
+        fetch('/api/adapters/history', { credentials: 'same-origin', headers }),
+      ]);
+      if (diffResponse.ok) capabilityDiff = await diffResponse.json();
+      if (adapterResponse.ok) adapterHistory = await adapterResponse.json();
+      renderCapabilityDiagnostics();
+    } catch {
+      // Socket capability state remains usable while diagnostics endpoints recover.
+    }
+  }
+
+  function setCapabilityRefreshStatus(message, isError) {
+    if (!$capabilityRefreshStatus) return;
+    if (!message) {
+      $capabilityRefreshStatus.hidden = true;
+      $capabilityRefreshStatus.textContent = '';
+      $capabilityRefreshStatus.classList.remove('error');
+      return;
+    }
+    $capabilityRefreshStatus.hidden = false;
+    $capabilityRefreshStatus.textContent = message;
+    $capabilityRefreshStatus.classList.toggle('error', !!isError);
+  }
+
+  function setCapabilityRefreshBusy(busy) {
+    if ($btnCapabilityRefresh) {
+      $btnCapabilityRefresh.disabled = busy;
+      $btnCapabilityRefresh.textContent = busy ? 'Refreshing Cursor capabilities…' : 'Refresh Cursor capabilities';
+    }
+    if ($btnModeModelRefresh) {
+      $btnModeModelRefresh.disabled = busy;
+      $btnModeModelRefresh.textContent = busy ? 'Refreshing…' : 'Refresh capabilities';
+    }
+  }
+
+  async function runCapabilityDiscovery() {
+    if (($btnCapabilityRefresh && $btnCapabilityRefresh.disabled)
+      || ($btnModeModelRefresh && $btnModeModelRefresh.disabled)) return;
+    setCapabilityRefreshBusy(true);
+    setCapabilityRefreshStatus('Refreshing Cursor capabilities… this may open and close menus.');
+    try {
+      const res = await apiWrite('/api/discovery/run', {});
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.ok !== false) {
+        setCapabilityRefreshStatus('Capability refresh finished.');
+        void refreshCapabilityDiagnostics();
+      } else {
+        setCapabilityRefreshStatus(data.error || `Capability refresh failed (${res.status})`, true);
+      }
+    } catch {
+      setCapabilityRefreshStatus('Capability refresh failed', true);
+    } finally {
+      setCapabilityRefreshBusy(false);
+    }
+  }
+
+  if ($btnCapabilityRefresh) {
+    $btnCapabilityRefresh.title = 'Opens Cursor mode and model menus to rediscover capabilities. Never runs automatically.';
+    $btnCapabilityRefresh.addEventListener('click', () => { void runCapabilityDiscovery(); });
+  }
+  if ($btnModeModelRefresh) {
+    $btnModeModelRefresh.title = 'Explicitly opens and closes Cursor mode and model menus to verify this window.';
+    $btnModeModelRefresh.addEventListener('click', () => { void runCapabilityDiscovery(); });
+  }
+
+  renderCapabilityDiagnostics();
+
   socket.on('connect', () => {
+    capabilityLive = true;
+    awaitingCapabilityFull = true;
     renderConnectionStatus();
     renderInputState();
+    renderModeModel();
+    renderCapabilityDiagnostics();
+    void refreshCapabilityDiagnostics();
   });
   socket.on('disconnect', () => {
+    capabilityLive = false;
+    awaitingCapabilityFull = true;
+    if (capabilityState) {
+      capabilityState = { ...capabilityState, status: { ...(capabilityState.status || {}), state: 'stale' } };
+    }
+    cachedModelOptions = null;
+    if (activeSheet === 'mode' || activeSheet === 'model') closeSheet();
+    renderModeModel();
+    renderCapabilityDiagnostics();
     renderConnectionStatus();
     renderInputState();
   });
@@ -302,6 +599,183 @@
   socket.on('state:patch', (patch) => {
     Object.assign(state, patch);
     applyStatePatch(patch);
+  });
+
+  const CAPABILITY_MUTATION_STATES = new Set(['ok', 'changed']);
+
+  function capabilityStatusState() {
+    return capabilityState?.status?.state || 'unknown';
+  }
+
+  function capabilityModelCompleteness() {
+    return capabilityState?.models?.completeness
+      || capabilityState?.status?.completeness
+      || 'unknown';
+  }
+
+  function observedModes() {
+    return Array.isArray(capabilityState?.modes) ? capabilityState.modes : [];
+  }
+
+  function observedModels() {
+    return Array.isArray(capabilityState?.models?.items) ? capabilityState.models.items : [];
+  }
+
+  function selectableModes() {
+    return observedModes().filter((mode) =>
+      mode && typeof mode.id === 'string' && mode.id && mode.selectable === true);
+  }
+
+  function selectableComposerModels() {
+    return observedModels().filter((model) =>
+      model
+      && typeof model.id === 'string'
+      && model.id
+      && model.selectable === true
+      && model.scope === 'composer');
+  }
+
+  function isModeMutationEnabled() {
+    if (!capabilityLive || awaitingCapabilityFull) return false;
+    if (!capabilityState) return false;
+    if (!CAPABILITY_MUTATION_STATES.has(capabilityStatusState())) return false;
+    return selectableModes().length > 0;
+  }
+
+  function isModelMutationEnabled() {
+    if (!capabilityLive || awaitingCapabilityFull) return false;
+    if (!capabilityState) return false;
+    if (!CAPABILITY_MUTATION_STATES.has(capabilityStatusState())) return false;
+    if (capabilityModelCompleteness() !== 'complete') return false;
+    return selectableComposerModels().length > 0;
+  }
+
+  function clearModelOptionsIfUnusable() {
+    if (!isModelMutationEnabled() || capabilityModelCompleteness() !== 'complete') {
+      cachedModelOptions = null;
+    }
+  }
+
+  function projectObservedCapabilities(snapshot) {
+    const modes = Array.isArray(snapshot.modes) ? snapshot.modes : [];
+    const models = Array.isArray(snapshot.models?.items) ? snapshot.models.items : [];
+    const currentMode = modes.find((mode) => mode.current);
+    // Selectable ids only — never fabricate Agent/Plan/Ask/Debug defaults.
+    state.mode = {
+      current: currentMode?.id || '',
+      available: modes
+        .filter((mode) => mode && typeof mode.id === 'string' && mode.id && mode.selectable === true)
+        .map((mode) => ({ id: mode.id, label: mode.label, icon: mode.icon || '' })),
+    };
+    const selectedComposer = models.find((model) => model.selected && model.scope === 'composer');
+    state.model = selectedComposer
+      ? { current: selectedComposer.label || selectedComposer.id, currentId: selectedComposer.id }
+      : { current: '', currentId: '' };
+  }
+
+  function resetCapabilityCaches() {
+    cachedModelOptions = null;
+    state.mode = { current: '', available: [] };
+    state.model = { current: '', currentId: '' };
+    if ($sheetModeList) $sheetModeList.textContent = '';
+    if ($sheetModelList) $sheetModelList.textContent = '';
+    if (activeSheet === 'mode' || activeSheet === 'model') closeSheet();
+  }
+
+  function snapshotFromCapabilityFull(payload) {
+    if (!payload || typeof payload !== 'object') return { activeTargetId: '', snapshot: null };
+    if (Array.isArray(payload.snapshots)) {
+      const activeTargetId = typeof payload.activeTargetId === 'string' ? payload.activeTargetId : '';
+      const snapshot = payload.snapshots.find((item) => item && item.targetId === activeTargetId)
+        || payload.snapshots[0]
+        || null;
+      return { activeTargetId: activeTargetId || snapshot?.targetId || '', snapshot };
+    }
+    if (typeof payload.targetId === 'string' && payload.targetId) {
+      return { activeTargetId: payload.targetId, snapshot: payload };
+    }
+    return { activeTargetId: '', snapshot: null };
+  }
+
+  function capabilityIdentityChanged(snapshot) {
+    if (!snapshot) return !!capabilityState;
+    if (!capabilityState) return false;
+    return capabilityState.targetId !== snapshot.targetId
+      || Number(capabilityState.targetGeneration || 0) !== Number(snapshot.targetGeneration || 0);
+  }
+
+  function applyCapabilitySnapshot(snapshot) {
+    if (!snapshot) return;
+    if (capabilityState && capabilityState.targetId === snapshot.targetId) {
+      const currentGeneration = Number(capabilityState.targetGeneration || 0);
+      const nextGeneration = Number(snapshot.targetGeneration || 0);
+      const currentRevision = Number(capabilityState.revision || 0);
+      const nextRevision = Number(snapshot.revision || 0);
+      if (nextGeneration < currentGeneration || (nextGeneration === currentGeneration && nextRevision < currentRevision)) return;
+    }
+    if (capabilityIdentityChanged(snapshot)) resetCapabilityCaches();
+    capabilityState = snapshot;
+    projectObservedCapabilities(snapshot);
+    clearModelOptionsIfUnusable();
+    renderModeModel();
+    renderCapabilityDiagnostics();
+    renderConnectionStatus();
+    if (activeSheet === 'mode') renderModeSheet();
+    else if (activeSheet === 'model' && cachedModelOptions) renderModelSheet(cachedModelOptions);
+  }
+
+  function patchTargetAccepted(targetId) {
+    if (!targetId) return false;
+    if (capabilityState && capabilityState.targetId) return targetId === capabilityState.targetId;
+    if (state.activeWindowId) return targetId === state.activeWindowId;
+    return true;
+  }
+
+  socket.on('capabilities:full', (payload) => {
+    const parsed = snapshotFromCapabilityFull(payload);
+    awaitingCapabilityFull = false;
+    if (!parsed.snapshot) {
+      if (Array.isArray(payload?.snapshots)) {
+        resetCapabilityCaches();
+        capabilityState = null;
+        renderModeModel();
+        renderCapabilityDiagnostics();
+        renderConnectionStatus();
+      }
+      return;
+    }
+    applyCapabilitySnapshot(parsed.snapshot);
+  });
+
+  socket.on('capabilities:patch', (patch) => {
+    if (!patch || !patchTargetAccepted(patch.targetId)) return;
+    const current = capabilityState && capabilityState.targetId === patch.targetId
+      ? capabilityState : { targetId: patch.targetId, modes: [], models: { items: [] } };
+    applyCapabilitySnapshot({ ...current, ...patch, status: patch.status || current.status });
+  });
+
+  socket.on('capabilities:stale', (patch) => {
+    if (capabilityState && capabilityState.targetId === patch?.targetId) {
+      capabilityState = { ...capabilityState, status: { ...(capabilityState.status || {}), state: 'stale' } };
+      cachedModelOptions = null;
+      if (activeSheet === 'mode' || activeSheet === 'model') closeSheet();
+      renderModeModel();
+      renderCapabilityDiagnostics();
+      renderConnectionStatus();
+    }
+  });
+
+  socket.on('adapter:pending', (adapter) => {
+    if (!adapter?.id) return;
+    const adapters = Array.isArray(adapterHistory.adapters) ? adapterHistory.adapters : [];
+    adapterHistory = { ...adapterHistory, adapters: [...adapters.filter((item) => item?.id !== adapter.id), adapter] };
+    renderCapabilityDiagnostics();
+    showToast(`New ${Array.isArray(adapter.capabilityKinds) ? adapter.capabilityKinds.join('/') : ''} adapter pending — activation unavailable from this UI`, 'success');
+    void refreshCapabilityDiagnostics();
+  });
+  socket.on('adapter:changed', () => {
+    showToast('Adapter configuration changed', 'success');
+    void refreshCapabilityDiagnostics();
   });
 
   socket.on('connection:status', (data) => {
@@ -358,51 +832,42 @@
   $btnApprove.addEventListener('click', () => {
     const approval = state.pendingApprovals[0];
     if (!approval) return;
-    const action = approval.actions.find(a => a.type === 'approve' || a.type === 'approve_all');
-    if (!action) return;
-    socket.emit('command:approve', {
-      commandId: newCommandId(),
-      approvalId: approval.id,
-      selectorPath: action.selectorPath,
-    });
+    const action = approval.actions.find(a => (a.type === 'approve' || a.type === 'approve_all') && hasOpaqueActionId(a.actionId));
+    if (!action) { showToast('Approval authorization is unavailable; refresh CursorRemote', 'error'); return; }
+    const eventName = action.type === 'approve_all' ? 'command:approve_all' : 'command:approve';
+    emitCommand(eventName, { approvalId: approval.id, actionId: action.actionId });
     showToast('Approve sent', 'success');
   });
 
   $btnReject.addEventListener('click', () => {
     const approval = state.pendingApprovals[0];
     if (!approval) return;
-    const action = approval.actions.find(a => a.type === 'reject');
-    if (!action) return;
-    socket.emit('command:reject', {
-      commandId: newCommandId(),
-      approvalId: approval.id,
-      selectorPath: action.selectorPath,
-    });
+    const action = approval.actions.find(a => a.type === 'reject' && hasOpaqueActionId(a.actionId));
+    if (!action) { showToast('Approval authorization is unavailable; refresh CursorRemote', 'error'); return; }
+    emitCommand('command:reject', { approvalId: approval.id, actionId: action.actionId });
     showToast('Reject sent', 'success');
   });
 
   $btnQSkip.addEventListener('click', () => {
-    if (!state.questionnaire) return;
-    socket.emit('command:click_action', {
-      commandId: newCommandId(),
-      selectorPath: state.questionnaire.skipSelectorPath,
-      actionLabel: 'Skip',
-    });
+    if (!state.questionnaire || !hasOpaqueActionId(state.questionnaire.skipActionId)) {
+      showToast('Questionnaire authorization is unavailable; refresh CursorRemote', 'error');
+      return;
+    }
+    emitClickAction('skip', state.questionnaire.skipActionId);
     showToast('Skip sent', 'success');
   });
 
   $btnQContinue.addEventListener('click', () => {
-    if (!state.questionnaire || state.questionnaire.continueDisabled) return;
-    socket.emit('command:click_action', {
-      commandId: newCommandId(),
-      selectorPath: state.questionnaire.continueSelectorPath,
-      actionLabel: 'Continue',
-    });
+    if (!state.questionnaire || state.questionnaire.continueDisabled || !hasOpaqueActionId(state.questionnaire.continueActionId)) {
+      showToast('Questionnaire authorization is unavailable; refresh CursorRemote', 'error');
+      return;
+    }
+    emitClickAction('continue', state.questionnaire.continueActionId);
     showToast('Continue sent', 'success');
   });
 
   $btnNewChat.addEventListener('click', () => {
-    socket.emit('command:new_chat', { commandId: newCommandId() });
+    emitCommand('command:new_chat', {});
     showToast('Creating new chat...', 'success');
   });
 
@@ -410,8 +875,14 @@
   $drawerClose.addEventListener('click', closeDrawer);
   $drawerOverlay.addEventListener('click', closeDrawer);
 
-  $pillMode.addEventListener('click', () => openSheet('mode'));
-  $pillModel.addEventListener('click', () => openSheet('model'));
+  $pillMode.addEventListener('click', () => {
+    if (!isModeMutationEnabled()) return;
+    openSheet('mode');
+  });
+  $pillModel.addEventListener('click', () => {
+    if (!isModelMutationEnabled()) return;
+    openSheet('model');
+  });
   $sheetOverlay.addEventListener('click', closeSheet);
   $planModalClose.addEventListener('click', closePlanModal);
   $planModalOverlay.addEventListener('click', (e) => {
@@ -421,7 +892,7 @@
   function sendMessage() {
     const text = $input.value.trim();
     if (!text) return;
-    socket.emit('command:send_message', { commandId: newCommandId(), text });
+    emitCommand('command:send_message', { text });
     $input.value = '';
     $input.style.height = 'auto';
     $btnSend.disabled = true;
@@ -470,6 +941,14 @@
     }
     if (has('composerQueue')) renderComposerQueue();
     if (has('windows') || has('activeWindowId') || has('chatTabs')) renderWindowsAndSessions();
+    if (has('activeWindowId') && state.activeWindowId && capabilityState && capabilityState.targetId !== state.activeWindowId) {
+      resetCapabilityCaches();
+      capabilityState = null;
+      awaitingCapabilityFull = true;
+      renderModeModel();
+      renderCapabilityDiagnostics();
+      renderConnectionStatus();
+    }
     if (has('messages')) renderMessages();
     if (has('pendingApprovals')) renderApprovals();
     if (has('questionnaire')) renderQuestionnaire();
@@ -479,7 +958,7 @@
 
   function renderConnectionStatus() {
     const ui = getConnectionUiState();
-    updateConnectionUI(ui.status, ui.label);
+    updateConnectionUI(ui);
     if (state.messages.length === 0) {
       $emptyState.style.display = '';
       $emptyPrimary.textContent = ui.emptyPrimary;
@@ -487,19 +966,55 @@
     }
   }
 
-  function updateConnectionUI(status, label) {
-    $connDot.className = 'dot ' + status;
-    const labels = { connected: 'Connected', disconnected: 'Disconnected', reconnecting: 'Connecting...' };
-    $connText.textContent = label || labels[status] || status;
+  function connectionLayers() {
+    const capability = !capabilityLive
+      ? 'stale'
+      : (awaitingCapabilityFull ? 'awaiting' : (capabilityState?.status?.state || 'unknown'));
+    return {
+      socket: socket.connected ? 'connected' : 'disconnected',
+      cdp: state.connected ? 'connected' : 'disconnected',
+      extractor: state.extractorStatus || 'idle',
+      capability,
+      completeness: capabilityModelCompleteness(),
+    };
+  }
+
+  function connectionA11yTitle(layers, label) {
+    return [
+      label,
+      `Relay ${layers.socket}`,
+      `CDP ${layers.cdp}`,
+      `Extractor ${layers.extractor}`,
+      `Capabilities ${layers.capability}`,
+      `Model list ${layers.completeness}`,
+    ].join('. ');
+  }
+
+  function updateConnectionUI(ui) {
+    const layers = ui.layers || connectionLayers();
+    $connDot.className = 'dot ' + ui.status;
+    $connDot.dataset.socket = layers.socket;
+    $connDot.dataset.cdp = layers.cdp;
+    $connDot.dataset.extractor = layers.extractor;
+    $connDot.dataset.capability = layers.capability;
+    $connDot.dataset.completeness = layers.completeness;
+    $connDot.dataset.layer = ui.layer;
+    const title = connectionA11yTitle(layers, ui.label);
+    $connDot.title = title;
+    $connText.textContent = ui.label;
+    $connText.title = title;
   }
 
   function getConnectionUiState() {
     const lastError = (state.lastExtractionError || '').trim();
     const timeoutLike = /timeout/i.test(lastError);
+    const layers = connectionLayers();
 
     if (!socket.connected) {
       return {
         status: 'disconnected',
+        layer: 'socket',
+        layers,
         label: 'Relay disconnected',
         emptyPrimary: 'Waiting for relay connection...',
         emptyHint: 'Check that this page can reach the CursorRemote server.',
@@ -509,6 +1024,8 @@
     if (!state.connected) {
       return {
         status: 'reconnecting',
+        layer: 'cdp',
+        layers,
         label: 'Waiting for Cursor',
         emptyPrimary: 'Connecting to Cursor IDE...',
         emptyHint: 'Make sure Cursor is running with<br><code>--remote-debugging-port=9222</code>',
@@ -517,7 +1034,9 @@
 
     if (state.extractorStatus === 'stale') {
       return {
-        status: 'reconnecting',
+        status: 'stale',
+        layer: 'extractor',
+        layers,
         label: timeoutLike ? 'Cursor backgrounded' : 'Cursor stalled',
         emptyPrimary: timeoutLike
           ? 'Cursor is connected but background-throttled.'
@@ -531,6 +1050,8 @@
     if (state.extractorStatus === 'waiting') {
       return {
         status: 'reconnecting',
+        layer: 'extractor',
+        layers,
         label: 'Waiting for snapshot',
         emptyPrimary: 'Connected to Cursor, waiting for the first snapshot...',
         emptyHint: lastError
@@ -541,6 +1062,8 @@
 
     return {
       status: 'connected',
+      layer: 'ok',
+      layers,
       label: 'Connected',
       emptyPrimary: 'No messages in this chat yet.',
       emptyHint: 'Send a message below or switch chat tab / window in Cursor.',
@@ -1131,12 +1654,10 @@
 
   // --- Plan block ---
 
-  function emitClickAction(selectorPath, actionLabel) {
-    socket.emit('command:click_action', {
-      commandId: newCommandId(),
-      selectorPath,
-      actionLabel,
-    });
+  function emitClickAction(actionType, actionId) {
+    if (!hasOpaqueActionId(actionId) || typeof actionType !== 'string' || actionType.length === 0) return false;
+    emitCommand('command:click_action', { actionId, actionType });
+    return true;
   }
 
   function buildPlanFullContent(planData) {
@@ -1239,8 +1760,9 @@
   }
 
   async function openPlanModelPicker(msg) {
-    if (!msg.modelDropdownSelectorPath) {
+    if (!hasOpaqueActionId(msg.modelActionId)) {
       if (msg.model) showToast(`Plan model: ${msg.model}`, 'success');
+      else showToast('Plan model capability is unavailable; refresh CursorRemote', 'error');
       return;
     }
 
@@ -1248,18 +1770,17 @@
     const result = await sendCommandAwaitResult('command:get_plan_model_options', {
       commandId,
       type: 'get_plan_model_options',
-      selectorPath: msg.modelDropdownSelectorPath,
+      actionId: msg.modelActionId,
     });
 
     const options = Array.isArray(result.data?.options) ? result.data.options : [];
     if (!result.ok || options.length === 0) {
-      emitClickAction(msg.modelDropdownSelectorPath);
       if (!result.ok) showToast(result.error || 'Could not load plan models', 'error');
       return;
     }
 
     activePlanModelContext = {
-      selectorPath: msg.modelDropdownSelectorPath,
+      actionId: msg.modelActionId,
       title: msg.title || 'Plan',
       options,
     };
@@ -1346,7 +1867,7 @@
       card.appendChild(progress);
     }
 
-    const hasActions = (msg.actions && msg.actions.length > 0) || msg.modelDropdownSelectorPath || msg.model;
+    const hasActions = (msg.actions && msg.actions.length > 0) || hasOpaqueActionId(msg.modelActionId) || msg.model;
     if (hasActions) {
       const toolbar = document.createElement('div');
       toolbar.className = 'plan-actions-toolbar';
@@ -1368,7 +1889,7 @@
 
       const center = document.createElement('div');
       center.className = 'plan-actions-center';
-      if (msg.modelDropdownSelectorPath) {
+      if (hasOpaqueActionId(msg.modelActionId)) {
         const pill = document.createElement('button');
         pill.type = 'button';
         pill.className = 'plan-model-pill';
@@ -1399,7 +1920,12 @@
           btn.type = 'button';
           btn.className = 'plan-btn plan-btn-build';
           btn.textContent = buildAct.label || 'Build';
-          btn.addEventListener('click', () => emitClickAction(buildAct.selectorPath, buildAct.label || 'Build'));
+          if (!hasOpaqueActionId(buildAct.actionId)) {
+            btn.disabled = true;
+            btn.title = 'Action authorization is unavailable; refresh CursorRemote';
+          } else {
+            btn.addEventListener('click', () => emitClickAction('build', buildAct.actionId));
+          }
           right.appendChild(btn);
         }
       }
@@ -1473,13 +1999,14 @@
         : action.type === 'allow' ? 'run-btn run-btn-allow'
         : 'run-btn run-btn-skip';
       btn.textContent = action.label;
-      btn.addEventListener('click', function () {
-        socket.emit('command:click_action', {
-          commandId: newCommandId(),
-          selectorPath: action.selectorPath,
-          actionLabel: action.label,
+      if (!hasOpaqueActionId(action.actionId)) {
+        btn.disabled = true;
+        btn.title = 'Action authorization is unavailable; refresh CursorRemote';
+      } else {
+        btn.addEventListener('click', function () {
+          emitClickAction(action.type, action.actionId);
         });
-      });
+      }
       container.appendChild(btn);
     });
   }
@@ -1705,8 +2232,8 @@
       const approval = state.pendingApprovals[0];
       $approvalDesc.textContent = approval.description || 'Action needs approval';
 
-      const approveAction = approval.actions.find(a => a.type === 'approve' || a.type === 'approve_all');
-      const rejectAction = approval.actions.find(a => a.type === 'reject');
+      const approveAction = approval.actions.find(a => (a.type === 'approve' || a.type === 'approve_all') && hasOpaqueActionId(a.actionId));
+      const rejectAction = approval.actions.find(a => a.type === 'reject' && hasOpaqueActionId(a.actionId));
 
       $btnApprove.disabled = !approveAction;
       $btnReject.disabled = !rejectAction;
@@ -1733,7 +2260,8 @@
     }
     $questionnaireBar.classList.remove('hidden');
     $questionnaireStepper.textContent = q.totalLabel || '';
-    $btnQContinue.disabled = q.continueDisabled;
+    $btnQSkip.disabled = !hasOpaqueActionId(q.skipActionId);
+    $btnQContinue.disabled = q.continueDisabled || !hasOpaqueActionId(q.continueActionId);
 
     $questionnaireQuestions.innerHTML = '';
     for (var i = 0; i < q.questions.length; i++) {
@@ -1766,20 +2294,22 @@
         labelSpan.textContent = ' ' + opt.label;
         optBtn.appendChild(letterSpan);
         optBtn.appendChild(labelSpan);
-        optBtn.dataset.selectorPath = opt.selectorPath;
+        if (hasOpaqueActionId(opt.actionId)) {
+          optBtn.dataset.actionId = opt.actionId;
+        } else {
+          optBtn.disabled = true;
+          optBtn.title = 'Action authorization is unavailable; refresh CursorRemote';
+        }
         optBtn.dataset.questionNumber = question.number;
         optBtn.dataset.letter = opt.letter;
         optBtn.dataset.label = opt.label;
         optBtn.addEventListener('click', function() {
+          if (!hasOpaqueActionId(this.dataset.actionId)) return;
           questionnaireSelections[this.dataset.questionNumber] = this.dataset.letter;
           var siblings = this.parentNode.querySelectorAll('.questionnaire-option');
           for (var s = 0; s < siblings.length; s++) siblings[s].classList.remove('questionnaire-option-selected');
           this.classList.add('questionnaire-option-selected');
-          socket.emit('command:click_action', {
-            commandId: newCommandId(),
-            selectorPath: this.dataset.selectorPath,
-            actionLabel: this.dataset.label,
-          });
+          emitClickAction('questionnaire_option', this.dataset.actionId);
           showToast('Answer sent', 'success');
         });
         optionsDiv.appendChild(optBtn);
@@ -1890,9 +2420,20 @@
     }
   }
 
+  function orderedSessionTabs(tabs) {
+    return (tabs || [])
+      .map((tab, index) => ({ tab, index }))
+      .sort((a, b) => {
+        const aOpen = a.tab.isOpen === true || a.tab.isActive;
+        const bOpen = b.tab.isOpen === true || b.tab.isActive;
+        return Number(bOpen) - Number(aOpen) || a.index - b.index;
+      })
+      .map((entry) => entry.tab);
+  }
+
   function renderDrawer() {
     const windows = state.windows || [];
-    const tabs = state.chatTabs || [];
+    const tabs = orderedSessionTabs(state.chatTabs || []);
     
     // Update hint
     const sessionCount = tabs.length;
@@ -1921,8 +2462,7 @@
       // Click to switch window (only for non-active windows)
       if (!isActive) {
         head.addEventListener('click', () => {
-          socket.emit('command:switch_window', {
-            commandId: newCommandId(),
+          emitCommand('command:switch_window', {
             windowId: win.id,
           });
           showToast('Switching window...', 'success');
@@ -1936,7 +2476,7 @@
       if (isActive && tabs.length > 0) {
         const sessHdr = document.createElement('div');
         sessHdr.className = 'sessions-header';
-        sessHdr.innerHTML = `<span>Sessions · ${tabs.length}</span><span>Array order</span>`;
+        sessHdr.innerHTML = `<span>Sessions · ${tabs.length}</span><span>Open first</span>`;
         card.appendChild(sessHdr);
 
         const sessList = document.createElement('div');
@@ -1944,26 +2484,32 @@
 
         tabs.forEach((tab) => {
           const row = document.createElement('div');
-          row.className = 'session-row' + (tab.isActive ? ' is-active' : '');
+          const isOpen = tab.isOpen === true || tab.isActive;
+          row.className = 'session-row'
+            + (isOpen ? ' is-open' : ' is-closed')
+            + (tab.isActive ? ' is-active' : '');
+          row.dataset.sessionOpen = String(isOpen);
+          row.dataset.sessionActive = String(Boolean(tab.isActive));
           
           const statusDot = getStatusDot(tab.status);
           const statusText = getStatusText(tab.status);
+          const availabilityLabel = tab.isActive ? 'Current' : (isOpen ? 'Open' : 'History');
           
           row.innerHTML = `
             ${statusDot}
             <div class="session-body">
               <div class="session-title">${escapeHtml(tab.title || 'Untitled Chat')}</div>
               <div class="session-sub">
+                <span class="session-availability">${availabilityLabel}</span>
+                <span class="sep">·</span>
                 <span class="session-state ${statusText.class}">${statusText.label}</span>
               </div>
             </div>
           `;
 
           row.addEventListener('click', () => {
-            socket.emit('command:switch_tab', {
-              commandId: newCommandId(),
+            emitCommand('command:switch_tab', {
               tabTitle: tab.title,
-              selectorPath: tab.selectorPath,
             });
             closeDrawer();
           });
@@ -1986,6 +2532,7 @@
 
   function getStatusDot(status) {
     const colors = {
+      active: 'var(--accent-blue)',
       running: 'var(--accent-yellow)',
       completed: 'var(--accent-green)',
       error: 'var(--accent-red)',
@@ -1997,6 +2544,7 @@
 
   function getStatusText(status) {
     const map = {
+      active: { label: 'Active', class: 'active' },
       running: { label: 'Running', class: 'running' },
       completed: { label: 'Completed', class: 'done' },
       error: { label: 'Error', class: 'error' },
@@ -2043,36 +2591,105 @@
 
   // --- Mode / Model rendering ---
 
-  const MODE_ICONS = {
-    agent: '\u221E',
-    plan: '\u2611',
-    debug: '\uD83D\uDC1B',
-    chat: '\uD83D\uDCAC',
-  };
+  // Cursor exposes mode icons as either displayable glyphs (for example, "∞")
+  // or Codicon CSS class names. The web client does not load Cursor's private
+  // Codicon font, so class names must not be rendered as visible text.
+  function displayableModeIcon(icon) {
+    const value = String(icon || '').trim();
+    if (!value) return '';
+    if (/^(?:codicon(?:-[\w-]+)?\s*)+$/i.test(value)) return '';
+    if (/^[a-z][a-z0-9_-]*$/i.test(value)) return '';
+    return value;
+  }
 
-  const MODE_LABELS = {
-    agent: 'Agent',
-    plan: 'Plan',
-    debug: 'Debug',
-    chat: 'Ask',
-  };
+  const CAPABILITY_PILL_STATES = ['ok', 'changed', 'stale', 'degraded', 'unknown', 'unavailable', 'partial', 'awaiting'];
+
+  function applyPillPresentation(el, kind, enabled, stateLabel, completeness) {
+    const catalogCount = kind === 'mode' ? observedModes().length : observedModels().length;
+    const visualState = !capabilityLive
+      ? 'stale'
+      : (awaitingCapabilityFull ? 'awaiting' : stateLabel);
+    el.disabled = !enabled;
+    el.classList.toggle('disabled', !enabled);
+    el.setAttribute('aria-disabled', String(!enabled));
+    el.dataset.capabilityKind = kind;
+    el.dataset.capabilityState = visualState;
+    el.dataset.completeness = completeness;
+    el.dataset.mutation = enabled ? 'enabled' : 'locked';
+    el.dataset.catalog = catalogCount > 0 ? 'present' : 'empty';
+    el.dataset.awaitingFull = awaitingCapabilityFull ? 'true' : 'false';
+    for (const name of CAPABILITY_PILL_STATES) el.classList.remove('pill-' + name);
+    el.classList.add('pill-' + visualState);
+    if (kind === 'model' && completeness === 'partial' && visualState !== 'partial') {
+      el.classList.add('pill-partial');
+    }
+  }
 
   function renderModeModel() {
-    const mode = state.mode || { current: 'agent', available: [] };
-    const model = state.model || { current: 'Auto', currentId: '' };
+    const statusLabel = capabilityStatusState();
+    const completeness = capabilityModelCompleteness();
+    const modeEnabled = isModeMutationEnabled();
+    const modelEnabled = isModelMutationEnabled();
 
-    $pillModeIcon.textContent = MODE_ICONS[mode.current] || '';
-    $pillModeText.textContent = MODE_LABELS[mode.current] || mode.current;
-    $pillModelText.textContent = model.current || 'Auto';
+    const currentMode = observedModes().find((mode) => mode.current)
+      || observedModes().find((mode) => mode.id === state.mode?.current);
+    const modeLabel = currentMode?.label || currentMode?.id || state.mode?.current || 'Mode unavailable';
+    const modeIcon = displayableModeIcon(currentMode?.icon);
+
+    const currentModel = observedModels().find((model) => model.selected && model.scope === 'composer');
+    const modelLabel = currentModel?.label || currentModel?.id || state.model?.current || 'Model unavailable';
+
+    applyPillPresentation($pillMode, 'mode', modeEnabled, statusLabel, completeness);
+    applyPillPresentation($pillModel, 'model', modelEnabled, statusLabel, completeness);
+    $pillMode.setAttribute('aria-label', modeEnabled ? 'Select mode' : `Mode ${statusLabel}`);
+    $pillModel.setAttribute('aria-label', modelEnabled ? 'Select model' : `Model ${statusLabel}, completeness ${completeness}`);
+
+    $pillMode.title = modeEnabled
+      ? `Mode capability: ${statusLabel}`
+      : `Mode capability: ${statusLabel} — unavailable`;
+    $pillModel.title = modelEnabled
+      ? `Model capability: ${statusLabel}`
+      : `Model capability: ${statusLabel}/${completeness} — unavailable`;
+    $pillModeIcon.textContent = modeIcon;
+    $pillModeText.textContent = modeLabel;
+    $pillModelText.textContent = modelLabel;
+
+    if ($modeModelStatus && $modeModelStatusText && $btnModeModelRefresh) {
+      const waiting = !capabilityLive || awaitingCapabilityFull || !capabilityState;
+      const unavailable = !modeEnabled || !modelEnabled;
+      $modeModelStatus.hidden = !unavailable;
+      if (unavailable) {
+        if (waiting) {
+          $modeModelStatusText.textContent = capabilityLive
+            ? 'Waiting for this window’s verified capabilities.'
+            : 'Mode and model controls are locked while the relay reconnects.';
+        } else if (statusLabel === 'stale') {
+          $modeModelStatusText.textContent = 'This window changed or reconnected. Refresh its capabilities to unlock Mode and Model.';
+        } else if (statusLabel === 'ok' || statusLabel === 'changed') {
+          $modeModelStatusText.textContent = completeness !== 'complete'
+            ? 'The model list is not fully verified. Refresh capabilities to unlock Model.'
+            : 'No verified selectable Mode or Model is available for this window.';
+        } else {
+          $modeModelStatusText.textContent = `Capabilities are ${statusLabel}. Refresh them before changing Mode or Model.`;
+        }
+        $btnModeModelRefresh.hidden = waiting;
+      } else {
+        $modeModelStatusText.textContent = '';
+        $btnModeModelRefresh.hidden = true;
+      }
+    }
+
+    if (activeSheet === 'mode' && !modeEnabled) closeSheet();
+    else if (activeSheet === 'model' && !modelEnabled) closeSheet();
   }
 
   renderAll();
 
   // --- Bottom sheet logic ---
 
-  let activeSheet = null;
-
   function openSheet(type) {
+    if (type === 'mode' && !isModeMutationEnabled()) return;
+    if (type === 'model' && !isModelMutationEnabled()) return;
     closeSheet();
     activeSheet = type;
     $sheetOverlay.classList.remove('hidden');
@@ -2111,38 +2728,65 @@
 
   function renderModeSheet() {
     $sheetModeList.innerHTML = '';
-    const modes = [
-      { id: 'agent', label: 'Agent', icon: '\u221E' },
-      { id: 'plan', label: 'Plan', icon: '\u2611' },
-      { id: 'debug', label: 'Debug', icon: '\uD83D\uDC1B' },
-      { id: 'chat', label: 'Ask', icon: '\uD83D\uDCAC' },
-    ];
-    const current = (state.mode || {}).current || 'agent';
+    const modes = Array.isArray(state.mode?.available) ? state.mode.available : [];
+    const current = (state.mode || {}).current || '';
+
+    if (modes.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'sheet-empty';
+      empty.textContent = 'Modes unavailable';
+      $sheetModeList.appendChild(empty);
+      return;
+    }
 
     modes.forEach(m => {
       const btn = document.createElement('button');
       btn.className = 'sheet-item' + (m.id === current ? ' selected' : '');
-      btn.innerHTML =
-        `<span class="sheet-item-icon">${m.icon}</span>` +
-        `<span>${escapeHtml(m.label)}</span>` +
-        (m.id === current ? '<span class="sheet-item-check">\u2713</span>' : '');
+      btn.setAttribute('aria-selected', String(m.id === current));
+
+      const icon = displayableModeIcon(m.icon);
+      if (icon) {
+        const iconEl = document.createElement('span');
+        iconEl.className = 'sheet-item-icon';
+        iconEl.setAttribute('aria-hidden', 'true');
+        iconEl.textContent = icon;
+        btn.appendChild(iconEl);
+      }
+
+      const label = document.createElement('span');
+      label.className = 'sheet-item-label';
+      label.textContent = m.label || m.id;
+      btn.appendChild(label);
+
+      const right = document.createElement('span');
+      right.className = 'sheet-item-right';
+      if (m.id === current) {
+        const check = document.createElement('span');
+        check.className = 'sheet-item-check';
+        check.setAttribute('aria-hidden', 'true');
+        check.textContent = '✓';
+        right.appendChild(check);
+      }
+      btn.appendChild(right);
+
       btn.addEventListener('click', () => {
-        socket.emit('command:set_mode', { commandId: newCommandId(), modeId: m.id });
+        if (!isModeMutationEnabled()) return;
+        emitCommand('command:set_mode', { modeId: m.id });
         closeSheet();
-        showToast(`Mode: ${m.label}`, 'success');
+        showToast(`Mode: ${m.label || m.id}`, 'success');
       });
       $sheetModeList.appendChild(btn);
     });
   }
 
-  let cachedModelOptions = null;
-
   async function fetchModelOptions() {
+    if (!isModelMutationEnabled()) return null;
     const commandId = newCommandId();
     const result = await sendCommandAwaitResult('command:get_model_options', {
       commandId,
       type: 'get_model_options',
     });
+    if (!isModelMutationEnabled()) return null;
     if (result.ok && Array.isArray(result.data?.options)) {
       cachedModelOptions = result.data.options;
       return result.data.options;
@@ -2156,7 +2800,10 @@
     if (!options || options.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'sheet-empty';
-      empty.textContent = 'No models available';
+      const completeness = capabilityState?.models?.completeness || 'unknown';
+      empty.textContent = completeness === 'unknown'
+        ? 'Model list unavailable — refresh after opening the model menu'
+        : completeness === 'partial' ? 'Model list is partial — scroll or refresh in Cursor' : 'No models available';
       $sheetModelList.appendChild(empty);
       return;
     }
@@ -2177,7 +2824,8 @@
 
       btn.innerHTML = inner;
       btn.addEventListener('click', () => {
-        socket.emit('command:set_model', { commandId: newCommandId(), modelId: opt.id });
+        if (!isModelMutationEnabled()) return;
+        emitCommand('command:set_model', { modelId: opt.id });
         closeSheet();
         showToast(`Model: ${opt.label}`, 'success');
       });
@@ -2206,10 +2854,11 @@
         `<span class="sheet-item-label">${escapeHtml(opt.label)}</span>` +
         `<span class="sheet-item-right">${opt.selected ? '<span class="sheet-item-check">\u2713</span>' : ''}</span>`;
       btn.addEventListener('click', async () => {
+        if (!hasOpaqueActionId(ctx.actionId) || !opt.id) return;
         const result = await sendCommandAwaitResult('command:set_plan_model', {
           commandId: newCommandId(),
           type: 'set_plan_model',
-          selectorPath: ctx.selectorPath,
+          actionId: ctx.actionId,
           planModelId: opt.id,
         });
         if (!result.ok) {

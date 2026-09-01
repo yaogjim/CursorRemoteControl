@@ -13,6 +13,8 @@ export interface TrackedMessage {
 interface PersistedData {
   messages: Record<string, TrackedMessage>;
   selectorHashes: Record<string, string>;
+  /** Opaque action tokens; selector paths are never used for executable callbacks. */
+  actionHashes?: Record<string, string>;
 }
 
 const SAVE_DEBOUNCE_MS = 5000;
@@ -20,6 +22,7 @@ const SAVE_DEBOUNCE_MS = 5000;
 export class MessageTracker {
   private messages = new Map<string, TrackedMessage>();
   private selectorHashes = new Map<string, string>();
+  private actionHashes = new Map<string, string>();
   private persistPath: string | null;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private dirty = false;
@@ -91,6 +94,7 @@ export class MessageTracker {
   clearAll(): void {
     this.messages.clear();
     this.selectorHashes.clear();
+    this.actionHashes.clear();
     this.dirty = true;
     this.flush();
   }
@@ -108,6 +112,18 @@ export class MessageTracker {
 
   resolveHash(hash: string): string | undefined {
     return this.selectorHashes.get(hash);
+  }
+
+  /** Store an opaque action id for a compact Telegram callback token. */
+  hashAction(actionId: string): string {
+    const hash = createHash('sha256').update(`action:${actionId}`).digest('hex').substring(0, 12);
+    this.actionHashes.set(hash, actionId);
+    this.scheduleSave();
+    return hash;
+  }
+
+  resolveActionHash(hash: string): string | undefined {
+    return this.actionHashes.get(hash);
   }
 
   private scheduleSave(): void {
@@ -143,8 +159,11 @@ export class MessageTracker {
       for (const [key, msg] of Object.entries(data.messages)) {
         this.messages.set(key, msg);
       }
-      for (const [hash, path] of Object.entries(data.selectorHashes)) {
+      for (const [hash, path] of Object.entries(data.selectorHashes ?? {})) {
         this.selectorHashes.set(hash, path);
+      }
+      for (const [hash, actionId] of Object.entries(data.actionHashes ?? {})) {
+        if (typeof actionId === 'string' && actionId.startsWith('act_')) this.actionHashes.set(hash, actionId);
       }
       console.log(`[message-tracker] Loaded ${this.messages.size} tracked messages from ${this.persistPath}`);
     } catch {
@@ -158,6 +177,7 @@ export class MessageTracker {
       const data: PersistedData = {
         messages: Object.fromEntries(this.messages),
         selectorHashes: Object.fromEntries(this.selectorHashes),
+        actionHashes: Object.fromEntries(this.actionHashes),
       };
       writeJsonAtomic(this.persistPath, data);
     } catch (err) {
