@@ -229,6 +229,12 @@ export function extractionFunction(
       return false;
     }
 
+    function visibleSummary(text: string, max = 160): string {
+      const t = text.replace(/\s+/g, ' ').trim();
+      if (t.length <= max) return t;
+      return t.slice(0, max - 1) + '…';
+    }
+
     function parseThoughtSpansFromHeader(headerEl: Element | null): {
       action: string;
       detail: string;
@@ -241,6 +247,7 @@ export function extractionFunction(
       let duration = '';
       for (const s of Array.from(headerSpans)) {
         if (s.classList.contains('cursor-icon') || s.classList.contains('ui-icon')) continue;
+        if (s.classList.contains('ui-step-group-preview')) continue;
         const t = (s.textContent || '').trim();
         if (!t) continue;
         const d = durationFromThoughtText(t);
@@ -257,10 +264,18 @@ export function extractionFunction(
           detail = detail || t;
         }
       }
+      // Cursor already shows a short step preview in the header. Never read
+      // .ui-collapsible-content (thinking body).
+      const previewEl = headerEl.querySelector('.ui-step-group-preview');
+      if (previewEl) {
+        const preview = visibleSummary(previewEl.textContent || '');
+        if (preview && preview !== action) detail = detail || preview;
+      }
       if (!duration) {
         const fullHeader = (headerEl.textContent || '').replace(/\s+/g, ' ').trim();
         duration = durationFromThoughtText(fullHeader);
       }
+      if (detail) detail = visibleSummary(detail);
       return { action, detail, duration };
     }
 
@@ -826,6 +841,8 @@ export function extractionFunction(
               actionPart = txt;
             } else if (!descPart) {
               descPart = txt;
+            } else {
+              descPart = `${descPart} ${txt}`;
             }
           }
         } else {
@@ -844,9 +861,8 @@ export function extractionFunction(
         }
 
         const compactActions = extractToolActions(compactEl);
-        const summaryText = headerContent
-          ? ''
-          : (compactEl.textContent || '').trim();
+        const joinedSummary = [actionPart, descPart].filter(Boolean).join(' ').trim()
+          || (!headerContent ? (compactEl.textContent || '').trim() : '');
         const compactDiff = tryParseDiffStatsFromWrapper(toolRoot);
         const diffBlockCompact = extractDiffBlockFromScope(toolRoot);
         return {
@@ -857,8 +873,10 @@ export function extractionFunction(
             toolCallId,
             status: toolStatus,
             action: actionPart || '',
-            details: descPart || '',
-            summaryText: !actionPart && !descPart && summaryText ? summaryText : undefined,
+            details: descPart ? visibleSummary(descPart) : '',
+            summaryText: joinedSummary && joinedSummary !== actionPart
+              ? visibleSummary(joinedSummary)
+              : undefined,
             additions: compactDiff.additions,
             deletions: compactDiff.deletions,
             actions: compactActions.length > 0 ? compactActions : undefined,
@@ -910,7 +928,7 @@ export function extractionFunction(
           toolCallId,
           status: toolStatus,
           action: action || 'Tool',
-          details,
+          details: details ? visibleSummary(details) : details,
           filename: filename2 || (action === 'Edit' || action === 'Write' ? details : undefined),
           additions: additions2,
           deletions: deletions2,
@@ -1757,7 +1775,7 @@ export function extractionFunction(
     }
 
     // --- Questionnaire widget ---
-    type QOption = { letter: string; label: string; isFreeform: boolean; selectorPath: string };
+    type QOption = { letter: string; label: string; isFreeform: boolean; selectorPath: string; selected: boolean };
     type QQuestion = { number: string; text: string; options: QOption[]; isActive: boolean };
     let questionnaire: {
       questions: QQuestion[];
@@ -1784,6 +1802,35 @@ export function extractionFunction(
         const sameTag = Array.from(parent.children).filter((c) => c.tagName === el.tagName);
         return sameTag.indexOf(el) + 1;
       };
+      const ariaStateTrue = (el: Element | null, names: string[]): boolean => {
+        if (!el) return false;
+        for (const name of names) {
+          if (el.getAttribute(name) === 'true') return true;
+        }
+        return false;
+      };
+      const optionIsSelected = (optEl: Element): boolean => {
+        const ariaNames = ['aria-pressed', 'aria-checked', 'aria-selected'];
+        if (ariaStateTrue(optEl, ariaNames)) return true;
+        const dataSelected = optEl.getAttribute('data-selected');
+        if (dataSelected === 'true') return true;
+        const dataState = optEl.getAttribute('data-state');
+        if (dataState === 'selected' || dataState === 'checked') return true;
+        if (optEl.classList.contains('selected')) return true;
+        if (optEl.classList.contains('composer-questionnaire-toolbar-option-selected')) return true;
+        const letterBtn = optEl.querySelector('.composer-questionnaire-toolbar-option-letter');
+        if (ariaStateTrue(letterBtn, ariaNames)) return true;
+        if (letterBtn && letterBtn.getAttribute('data-selected') === 'true') return true;
+        return false;
+      };
+      const elementIsDisabled = (el: Element): boolean => {
+        if (el.getAttribute('data-disabled') === 'true') return true;
+        if (el.getAttribute('aria-disabled') === 'true') return true;
+        if (el.hasAttribute('disabled')) return true;
+        const formEl = el as HTMLButtonElement;
+        if (typeof formEl.disabled === 'boolean' && formEl.disabled) return true;
+        return false;
+      };
       for (let qi = 0; qi < questionEls.length; qi++) {
         const qEl = questionEls[qi];
         const isActive = qEl.classList.contains('composer-questionnaire-toolbar-question-active');
@@ -1801,7 +1848,7 @@ export function extractionFunction(
           const selectorPath =
             `.composer-questionnaire-toolbar-question:nth-of-type(${nthOfType(qEl)})` +
             ` .composer-questionnaire-toolbar-option:nth-of-type(${nthOfType(optEl)})`;
-          options.push({ letter, label, isFreeform, selectorPath });
+          options.push({ letter, label, isFreeform, selectorPath, selected: optionIsSelected(optEl) });
         }
         questions.push({ number: num, text, options, isActive });
       }
@@ -1815,15 +1862,16 @@ export function extractionFunction(
         // prefer legacy button classes, then fall back to Cursor 3.8+ data-click-ready divs.
         const findActionByLabel = (label: string): Element | null => {
           const expected = label.trim().toLowerCase();
-          for (const child of Array.from(actionsContainer.querySelectorAll(':scope > div[data-click-ready]'))) {
-            const truncateText = (child.querySelector('span.truncate')?.textContent || '').trim().toLowerCase();
+          for (const child of Array.from(actionsContainer.querySelectorAll(':scope > [data-click-ready]'))) {
+            const truncateText = (child.querySelector('span.truncate')?.textContent || child.textContent || '').trim().toLowerCase();
             if (truncateText === expected) return child;
           }
           return null;
         };
         const stableClickReadyPath = (el: Element): string => {
           const childIndex = el.parentElement ? Array.from(el.parentElement.children).indexOf(el) + 1 : 1;
-          return `.composer-questionnaire-toolbar-actions > div[data-click-ready]:nth-child(${childIndex})`;
+          const tagName = el.tagName.toLowerCase();
+          return `.composer-questionnaire-toolbar-actions > ${tagName}[data-click-ready]:nth-child(${childIndex})`;
         };
         const skipLegacy = actionsContainer.querySelector('.composer-skip-button');
         if (skipLegacy) {
@@ -1836,7 +1884,7 @@ export function extractionFunction(
         const contBtn = contLegacy || findActionByLabel('Continue');
         if (contBtn) {
           continuePath = contLegacy ? buildSelectorPath(contLegacy) : stableClickReadyPath(contBtn);
-          continueDisabled = contBtn.getAttribute('data-disabled') === 'true';
+          continueDisabled = elementIsDisabled(contBtn);
         }
       }
 

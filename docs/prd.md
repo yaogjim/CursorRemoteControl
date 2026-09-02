@@ -468,7 +468,7 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 
 | 事件 | 载荷 | 何时 |
 | ------------------- | ------------------------ | ------------------------------------- |
-| `state:full` | `CursorState` | 客户端初次连接时 |
+| `state:full` | `CursorState` | 客户端初次连接或重连时；也用于响应 `state:request` |
 | `state:patch` | `Partial<CursorState>` | 任何状态字段变化时 |
 | `connection:status` | `{ connected: boolean }` | CDP 连接或断开时（内部 EventEmitter 事件是 `connection:changed`） |
 | `command:result` | `{ commandId, ok, error?, data? }` | 命令执行或失败后 |
@@ -482,6 +482,7 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 
 | 事件 | 载荷 | 说明 |
 | ---------------------- | --------------------------------------------- | ---------------------------------- |
+| `state:request` | 无 | 重连后主动请求最新 `state:full` 快照 |
 | `command:send_message` | `{ commandId, operationId, text }` | 输入并提交新提示；`operationId` 用于服务端幂等与限流 |
 | `command:approve` | `{ commandId, operationId, approvalId, actionId }` | 点击审批。授权依据是服务端 `actionId`；`selectorPath` 不是授权 |
 | `command:approve_all` | `{ commandId, operationId, actionId }` | 点击 “Accept All”；`actionType` 必须是 `approve_all`，不能用 `approve` 冒充 |
@@ -495,7 +496,7 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 | `command:get_plan_model_options` | `{ commandId, actionId }` | 刮取计划作用域模型菜单；只接受已注册的 plan-model action |
 | `command:set_plan_model` | `{ commandId, operationId, planModelId, actionId }` | 把所选计划模型应用回 Cursor；属于危险写命令 |
 | `command:switch_window` | `{ commandId, windowId }` | 切换到不同 Cursor 窗口 |
-| `command:click_action` | `{ commandId, actionId, actionType, operationId? }` | 点击已注册动作。缺少有效 `actionId`/`actionType` 时拒绝；`approve`、`approve_all`、`allow`、`run`、`build`、`continue` 要求 bounded `operationId`，`reject`、`skip`、问卷选项和只读动作不要求 |
+| `command:click_action` | `{ commandId, actionId, actionType, operationId? }` | 点击已注册动作。缺少有效 `actionId`/`actionType` 时拒绝；`approve`、`approve_all`、`allow`、`run`、`build`、`continue`、`skip`、`questionnaire_option` 要求 bounded `operationId`，`reject` 和只读动作不要求 |
 
 每个客户端命令包含一个 `commandId`（UUID），会在 `command:result` 中回显以便关联。问卷回答没有单独的 socket 事件；Web 客户端通过 `command:click_action` 发送选项/Skip/Continue 的 `actionId`。`SIDE_EFFECT` 按动作显式批准：点 Plan **Build** 只授权 `build`，不授予 Run/Approve/Allow/Mode/Model/adapter apply。授权级别与验收分层见 §15 和 `docs/cursor-capability-sync-plan.md` 第 21 节。
 

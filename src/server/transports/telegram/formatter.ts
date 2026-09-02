@@ -201,7 +201,7 @@ function formatThought(msg: ThoughtBlock): FormattedMessage {
   }
   if (msg.thoughtKind === 'thinking_step' && msg.action) {
     const timing = msg.duration ? ` · ${escapeHtml(msg.duration)}` : '';
-    const detail = msg.detail && !msg.duration ? ` ${escapeHtml(msg.detail)}` : '';
+    const detail = msg.detail ? ` — <code>${escapeHtml(msg.detail)}</code>` : '';
     return { html: `<i>◆ ${escapeHtml(msg.action)}${detail}${timing}</i>${spoiler}` };
   }
   if (msg.action) {

@@ -7,6 +7,25 @@
   const THEME_KEY = 'cursor-remote-theme';
   const THEME_COLOR_LIGHT = '#f7f8fa';
   const THEME_COLOR_DARK = '#141414';
+  const HEALTH_TIMEOUT_MS = 3000;
+  const STATE_FULL_WATCHDOG_MS = 1500;
+  const QUESTIONNAIRE_NULL_HOLD_MS = 600;
+  const QUESTIONNAIRE_SYNC_WATCHDOG_MS = 1500;
+  const SOCKET_CONNECT_TIMEOUT_MS = 20000;
+  const startupNow = () => (
+    typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now()
+  );
+  const startupTiming = {
+    startedAt: startupNow(),
+    authStartedAt: 0,
+    authDoneAt: 0,
+    socketConnectedAt: 0,
+    stateFullAt: 0,
+    firstRenderAt: 0,
+    reported: false,
+  };
 
   function readThemePreference() {
     try {
@@ -136,11 +155,20 @@
   }
 
   async function checkAuth() {
+    startupTiming.authStartedAt = startupNow();
     try {
-      const res = await fetch('/health', {
-        credentials: 'same-origin',
-        headers: getAuthHeaders(),
-      });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+      let res;
+      try {
+        res = await fetch('/health', {
+          credentials: 'same-origin',
+          headers: getAuthHeaders(),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
       if (res.ok) {
         const data = await res.json();
         if (data.authRequired) {
@@ -161,7 +189,9 @@
   }
 
   async function init() {
-    if (!await checkAuth()) return;
+    const authorized = await checkAuth();
+    startupTiming.authDoneAt = startupNow();
+    if (!authorized) return;
     bootstrap();
   }
 
@@ -189,6 +219,9 @@
   let activePlanModal = null;
   let activePlanModelContext = null;
   const pendingCommandResults = new Map();
+  const lateCommandResults = new Map();
+  const settledCommandIds = new Set();
+  const MAX_TRACKED_COMMAND_RESULTS = 128;
 
   function isNearMessagesBottom() {
     const threshold = 80;
@@ -217,7 +250,6 @@
   const $approvalDesc = document.getElementById('approval-desc');
   const $btnApprove = document.getElementById('btn-approve');
   const $btnReject = document.getElementById('btn-reject');
-  var questionnaireSelections = {};
   const $questionnaireBar = document.getElementById('questionnaire-bar');
   const $questionnaireStepper = document.getElementById('questionnaire-stepper');
   const $questionnaireQuestions = document.getElementById('questionnaire-questions');
@@ -269,6 +301,9 @@
     reconnection: true,
     reconnectionDelay: 1000,
     reconnectionDelayMax: 10000,
+    timeout: SOCKET_CONNECT_TIMEOUT_MS,
+    rememberUpgrade: true,
+    tryAllTransports: true,
     withCredentials: true,
     auth: (cb) => {
       try {
@@ -278,6 +313,24 @@
       }
     },
   });
+
+  let socketPhase = 'connecting';
+  let stateSnapshotFresh = false;
+  let stateFullWatchdog = 0;
+  let sendInFlight = false;
+  let sendEnvelope = null;
+  let approvalInFlight = false;
+  let approvalEnvelope = null;
+  let rejectInFlight = false;
+  let rejectEnvelope = null;
+  let qActionInFlight = false;
+  const qEnvelopes = new Map();
+  const genericActionInFlight = new Set();
+  const genericActionEnvelopes = new Map();
+  let questionnaireNullHoldTimer = 0;
+  let questionnaireAwaitingSnapshot = false;
+  let questionnaireSyncWatchdog = 0;
+  let questionnaireOptimistic = {};
 
   const DANGEROUS_SOCKET_COMMANDS = new Set([
     'send_message',
@@ -295,6 +348,8 @@
     'run',
     'build',
     'continue',
+    'skip',
+    'questionnaire_option',
   ]);
 
   function socketRoute(eventName) {
@@ -320,6 +375,35 @@
     return body;
   }
 
+  /** Reuse an already-enveloped payload for retries of the same mutation. */
+  function reuseEnvelope(eventName, payload, previous) {
+    if (previous && mutationFieldsMatch(previous, payload)) return previous;
+    return withCommandEnvelope(eventName, payload);
+  }
+
+  function mutationFieldsMatch(previous, payload) {
+    const next = payload || {};
+    for (const key of Object.keys(next)) {
+      if (key === 'commandId' || key === 'operationId') continue;
+      if (previous[key] !== next[key]) return false;
+    }
+    return true;
+  }
+
+  function commandErrorMessage(result, fallback) {
+    const err = result && typeof result.error === 'string' ? result.error.trim() : '';
+    if (!err) return fallback;
+    if (/action_expired/i.test(err)) return 'This action expired. Wait for the next snapshot and try again.';
+    if (/action_consumed/i.test(err)) return 'This action was already used. Wait for a new prompt.';
+    if (/timed out/i.test(err)) return 'Command timed out. Check the connection and try again.';
+    if (/disconnected from relay/i.test(err)) return 'Relay disconnected. Waiting to reconnect.';
+    return err;
+  }
+
+  function mutationOutcomeUncertain(result) {
+    return result?.outcomeUnknown === true;
+  }
+
   function emitCommand(eventName, payload) {
     const body = withCommandEnvelope(eventName, payload);
     socket.emit(eventName, body);
@@ -330,17 +414,44 @@
     return typeof value === 'string' && value.length > 0;
   }
 
+  function rememberBounded(mapOrSet, key, value) {
+    if (mapOrSet instanceof Map) mapOrSet.set(key, value);
+    else mapOrSet.add(key);
+    while (mapOrSet.size > MAX_TRACKED_COMMAND_RESULTS) {
+      const oldest = mapOrSet.keys().next().value;
+      mapOrSet.delete(oldest);
+    }
+  }
+
+  function markCommandSettled(commandId) {
+    lateCommandResults.delete(commandId);
+    rememberBounded(settledCommandIds, commandId);
+  }
+
+  /**
+   * Await command:result for this emit. If `payload` already has commandId
+   * (and operationId when required), those ids are reused so retries stay idempotent.
+   */
   function sendCommandAwaitResult(eventName, payload) {
     return new Promise((resolve) => {
       const body = withCommandEnvelope(eventName, payload);
       const commandId = body.commandId;
+      const lateResult = lateCommandResults.get(commandId);
+      if (lateResult) {
+        lateCommandResults.delete(commandId);
+        markCommandSettled(commandId);
+        resolve(lateResult);
+        return;
+      }
+      settledCommandIds.delete(commandId);
       const timer = setTimeout(() => {
         pendingCommandResults.delete(commandId);
-        resolve({ commandId, ok: false, error: 'Command timed out' });
+        resolve({ commandId, ok: false, error: 'Command timed out', outcomeUnknown: true });
       }, 12000);
 
       pendingCommandResults.set(commandId, (result) => {
         clearTimeout(timer);
+        if (!mutationOutcomeUncertain(result)) markCommandSettled(commandId);
         resolve(result);
       });
 
@@ -557,16 +668,108 @@
 
   renderCapabilityDiagnostics();
 
-  socket.on('connect', () => {
-    capabilityLive = true;
-    awaitingCapabilityFull = true;
+  function reportStartupTiming() {
+    if (startupTiming.reported || !startupTiming.firstRenderAt) return;
+    startupTiming.reported = true;
+    const resourceMs = {};
+    try {
+      if (typeof performance !== 'undefined' && typeof performance.getEntriesByType === 'function') {
+        for (const entry of performance.getEntriesByType('resource')) {
+          const name = String(entry.name || '');
+          const file = ['styles.css', 'vendor-socket.io.min.js', 'app.js'].find((item) => name.includes(item));
+          if (file) resourceMs[file] = Math.round(entry.duration || 0);
+        }
+      }
+    } catch { /* Resource Timing may be unavailable or privacy-restricted. */ }
+    const healthMs = Math.round(Math.max(0, startupTiming.authDoneAt - startupTiming.authStartedAt));
+    window.__cursorRemoteStartupTiming = {
+      healthMs,
+      authMs: healthMs,
+      socketMs: Math.round(Math.max(0, startupTiming.socketConnectedAt - startupTiming.startedAt)),
+      stateFullMs: Math.round(Math.max(0, startupTiming.stateFullAt - startupTiming.startedAt)),
+      firstRenderMs: Math.round(Math.max(0, startupTiming.firstRenderAt - startupTiming.startedAt)),
+      resourceMs,
+    };
+  }
+
+  function isSocketLive() {
+    return !!socket.connected && stateSnapshotFresh && state.connected === true;
+  }
+
+  function relaySocketLayer() {
+    if (socket.connected) return 'connected';
+    if (socketPhase === 'connecting') return 'connecting';
+    if (socketPhase === 'reconnecting') return 'reconnecting';
+    return 'disconnected';
+  }
+
+  function tryReconnectSocket() {
+    if (socket.connected) return;
+    if (typeof socket.connect === 'function') socket.connect();
+  }
+
+  function clearStateFullWatchdog() {
+    if (stateFullWatchdog) {
+      clearTimeout(stateFullWatchdog);
+      stateFullWatchdog = 0;
+    }
+  }
+
+  function armStateFullWatchdog() {
+    clearStateFullWatchdog();
+    stateFullWatchdog = setTimeout(() => {
+      stateFullWatchdog = 0;
+      if (!socket.connected) return;
+      socket.emit('state:request');
+    }, STATE_FULL_WATCHDOG_MS);
+  }
+
+  function failPendingCommands(error) {
+    const pending = Array.from(pendingCommandResults.entries());
+    pendingCommandResults.clear();
+    lateCommandResults.clear();
+    settledCommandIds.clear();
+    for (let i = 0; i < pending.length; i++) {
+      pending[i][1]({
+        commandId: pending[i][0],
+        ok: false,
+        error: error,
+        outcomeUnknown: true,
+      });
+    }
+  }
+
+  function refreshInteractiveUi() {
     renderConnectionStatus();
     renderInputState();
+    renderMessages();
+    renderApprovals();
+    renderQuestionnaire();
+  }
+
+  window.addEventListener('online', tryReconnectSocket);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) tryReconnectSocket();
+  });
+
+  socket.on('connect', () => {
+    socketPhase = 'connected';
+    stateSnapshotFresh = false;
+    if (!startupTiming.socketConnectedAt) startupTiming.socketConnectedAt = startupNow();
+    capabilityLive = true;
+    awaitingCapabilityFull = true;
+    armStateFullWatchdog();
     renderModeModel();
     renderCapabilityDiagnostics();
+    refreshInteractiveUi();
     void refreshCapabilityDiagnostics();
   });
-  socket.on('disconnect', () => {
+  socket.on('disconnect', (reason) => {
+    socketPhase = reason === 'io client disconnect' ? 'disconnected' : 'reconnecting';
+    stateSnapshotFresh = false;
+    clearQuestionnaireSyncWait();
+    clearStateFullWatchdog();
+    failPendingCommands('Disconnected from relay');
     capabilityLive = false;
     awaitingCapabilityFull = true;
     if (capabilityState) {
@@ -576,9 +779,19 @@
     if (activeSheet === 'mode' || activeSheet === 'model') closeSheet();
     renderModeModel();
     renderCapabilityDiagnostics();
-    renderConnectionStatus();
-    renderInputState();
+    refreshInteractiveUi();
   });
+
+  if (socket.io && typeof socket.io.on === 'function') {
+    socket.io.on('reconnect_attempt', () => {
+      socketPhase = 'reconnecting';
+      refreshInteractiveUi();
+    });
+    socket.io.on('reconnect_failed', () => {
+      socketPhase = 'disconnected';
+      refreshInteractiveUi();
+    });
+  }
 
   socket.on('connect_error', (err) => {
     const msg = typeof err === 'string' ? err : (err && err.message) ? String(err.message) : '';
@@ -592,12 +805,26 @@
   });
 
   socket.on('state:full', (newState) => {
+    clearStateFullWatchdog();
+    clearQuestionnaireNullHold();
+    stateSnapshotFresh = true;
+    clearQuestionnaireSyncWait();
+    if (!startupTiming.stateFullAt) startupTiming.stateFullAt = startupNow();
+    reconcileQuestionnaireEnvelopes(newState?.questionnaire ?? null, state.questionnaire);
     state = { ...defaultState, ...newState };
     renderAll();
+    if (!startupTiming.firstRenderAt) {
+      startupTiming.firstRenderAt = startupNow();
+      reportStartupTiming();
+    }
   });
 
   socket.on('state:patch', (patch) => {
+    const prevQuestionnaire = state.questionnaire;
     Object.assign(state, patch);
+    if (hasPatchKey(patch, 'questionnaire')) {
+      stabilizeQuestionnairePatch(patch.questionnaire, prevQuestionnaire);
+    }
     applyStatePatch(patch);
   });
 
@@ -780,8 +1007,7 @@
 
   socket.on('connection:status', (data) => {
     state.connected = data.connected;
-    renderConnectionStatus();
-    renderInputState();
+    refreshInteractiveUi();
   });
 
   socket.on('command:result', (result) => {
@@ -791,7 +1017,8 @@
       pending(result);
       return;
     }
-    if (!result.ok) showToast(result.error || 'Command failed', 'error');
+    if (settledCommandIds.has(result.commandId)) return;
+    rememberBounded(lateCommandResults, result.commandId, result);
   });
 
   $messages.addEventListener('scroll', () => {
@@ -802,7 +1029,7 @@
   $input.addEventListener('input', () => {
     $input.style.height = 'auto';
     $input.style.height = Math.min($input.scrollHeight, 120) + 'px';
-    $btnSend.disabled = !$input.value.trim();
+    renderInputState();
   });
 
   // Send-on-Enter behaves differently per primary input device:
@@ -829,41 +1056,38 @@
 
   $btnSend.addEventListener('click', sendMessage);
 
-  $btnApprove.addEventListener('click', () => {
-    const approval = state.pendingApprovals[0];
-    if (!approval) return;
-    const action = approval.actions.find(a => (a.type === 'approve' || a.type === 'approve_all') && hasOpaqueActionId(a.actionId));
-    if (!action) { showToast('Approval authorization is unavailable; refresh CursorRemote', 'error'); return; }
-    const eventName = action.type === 'approve_all' ? 'command:approve_all' : 'command:approve';
-    emitCommand(eventName, { approvalId: approval.id, actionId: action.actionId });
-    showToast('Approve sent', 'success');
-  });
+  $btnApprove.addEventListener('click', () => { void submitApproval('approve'); });
 
-  $btnReject.addEventListener('click', () => {
-    const approval = state.pendingApprovals[0];
-    if (!approval) return;
-    const action = approval.actions.find(a => a.type === 'reject' && hasOpaqueActionId(a.actionId));
-    if (!action) { showToast('Approval authorization is unavailable; refresh CursorRemote', 'error'); return; }
-    emitCommand('command:reject', { approvalId: approval.id, actionId: action.actionId });
-    showToast('Reject sent', 'success');
-  });
+  $btnReject.addEventListener('click', () => { void submitApproval('reject'); });
 
   $btnQSkip.addEventListener('click', () => {
-    if (!state.questionnaire || !hasOpaqueActionId(state.questionnaire.skipActionId)) {
+    if (!state.questionnaire) return;
+    if (!isSocketLive()) {
+      showToast('Relay disconnected', 'error');
+      return;
+    }
+    if (!hasOpaqueActionId(state.questionnaire.skipActionId)) {
       showToast('Questionnaire authorization is unavailable; refresh CursorRemote', 'error');
       return;
     }
-    emitClickAction('skip', state.questionnaire.skipActionId);
-    showToast('Skip sent', 'success');
+    void submitQuestionnaireAction('skip', state.questionnaire.skipActionId);
   });
 
   $btnQContinue.addEventListener('click', () => {
-    if (!state.questionnaire || state.questionnaire.continueDisabled || !hasOpaqueActionId(state.questionnaire.continueActionId)) {
+    if (!state.questionnaire) return;
+    if (!isSocketLive()) {
+      showToast('Relay disconnected', 'error');
+      return;
+    }
+    if (state.questionnaire.continueDisabled) {
+      showToast('Continue is still disabled until Cursor accepts an answer', 'error');
+      return;
+    }
+    if (!hasOpaqueActionId(state.questionnaire.continueActionId)) {
       showToast('Questionnaire authorization is unavailable; refresh CursorRemote', 'error');
       return;
     }
-    emitClickAction('continue', state.questionnaire.continueActionId);
-    showToast('Continue sent', 'success');
+    void submitQuestionnaireAction('continue', state.questionnaire.continueActionId);
   });
 
   $btnNewChat.addEventListener('click', () => {
@@ -890,13 +1114,118 @@
   });
 
   function sendMessage() {
+    void submitSendMessage();
+  }
+
+  async function submitSendMessage() {
+    if (sendInFlight || !isSocketLive()) return;
     const text = $input.value.trim();
     if (!text) return;
-    emitCommand('command:send_message', { text });
-    $input.value = '';
-    $input.style.height = 'auto';
-    $btnSend.disabled = true;
+    sendEnvelope = reuseEnvelope('command:send_message', { text }, sendEnvelope);
+    sendInFlight = true;
+    renderInputState();
+    const result = await sendCommandAwaitResult('command:send_message', sendEnvelope);
+    sendInFlight = false;
+    if (!result.ok) {
+      if (!mutationOutcomeUncertain(result)) sendEnvelope = null;
+      renderInputState();
+      showToast(commandErrorMessage(result, 'Failed to send message'), 'error');
+      return;
+    }
+    if ($input.value.trim() === text) {
+      $input.value = '';
+      $input.style.height = 'auto';
+    }
+    sendEnvelope = null;
+    renderInputState();
     showToast('Message sent', 'success');
+  }
+
+  async function submitApproval(kind) {
+    const approval = state.pendingApprovals[0];
+    if (!approval) return;
+    if (!isSocketLive()) {
+      showToast('Relay disconnected', 'error');
+      return;
+    }
+    if (kind === 'reject') {
+      if (rejectInFlight || approvalInFlight) return;
+      const action = approval.actions.find(a => a.type === 'reject' && hasOpaqueActionId(a.actionId));
+      if (!action) { showToast('Approval authorization is unavailable; refresh CursorRemote', 'error'); return; }
+      rejectEnvelope = reuseEnvelope('command:reject', { approvalId: approval.id, actionId: action.actionId }, rejectEnvelope);
+      rejectInFlight = true;
+      renderApprovals();
+      const result = await sendCommandAwaitResult('command:reject', rejectEnvelope);
+      rejectInFlight = false;
+      renderApprovals();
+      if (!result.ok) {
+        if (!mutationOutcomeUncertain(result)) rejectEnvelope = null;
+        showToast(commandErrorMessage(result, 'Reject failed'), 'error');
+        return;
+      }
+      rejectEnvelope = null;
+      showToast('Rejected', 'success');
+      return;
+    }
+    if (approvalInFlight || rejectInFlight) return;
+    const action = approval.actions.find(a => (a.type === 'approve' || a.type === 'approve_all') && hasOpaqueActionId(a.actionId));
+    if (!action) { showToast('Approval authorization is unavailable; refresh CursorRemote', 'error'); return; }
+    const eventName = action.type === 'approve_all' ? 'command:approve_all' : 'command:approve';
+    approvalEnvelope = reuseEnvelope(eventName, { approvalId: approval.id, actionId: action.actionId }, approvalEnvelope);
+    approvalInFlight = true;
+    renderApprovals();
+    const result = await sendCommandAwaitResult(eventName, approvalEnvelope);
+    approvalInFlight = false;
+    renderApprovals();
+    if (!result.ok) {
+      if (!mutationOutcomeUncertain(result)) approvalEnvelope = null;
+      showToast(commandErrorMessage(result, 'Approve failed'), 'error');
+      return;
+    }
+    approvalEnvelope = null;
+    showToast(action.type === 'approve_all' ? 'Accepted all' : 'Approved', 'success');
+  }
+
+  async function submitQuestionnaireAction(actionType, actionId, questionNumber) {
+    if (!isSocketLive()) {
+      showToast('Relay disconnected', 'error');
+      return;
+    }
+    if (questionnaireNullHoldTimer || questionnaireAwaitingSnapshot) {
+      showToast('Questionnaire is refreshing. Wait for the next snapshot.', 'error');
+      return;
+    }
+    if (qActionInFlight) return;
+    if (!hasOpaqueActionId(actionId) || typeof actionType !== 'string' || actionType.length === 0) return;
+    const payload = { actionId, actionType };
+    const previous = qEnvelopes.get(actionId);
+    const envelope = reuseEnvelope('command:click_action', payload, previous);
+    qEnvelopes.set(actionId, envelope);
+    qActionInFlight = true;
+    renderQuestionnaire();
+    const result = await sendCommandAwaitResult('command:click_action', envelope);
+    qActionInFlight = false;
+    if (!result.ok && actionType === 'questionnaire_option' && questionNumber) {
+      delete questionnaireOptimistic[questionNumber];
+    }
+    renderQuestionnaire();
+    if (!result.ok) {
+      if (!mutationOutcomeUncertain(result)) qEnvelopes.delete(actionId);
+      showToast(commandErrorMessage(result, questionnaireActionError(actionType)), 'error');
+      return;
+    }
+    qEnvelopes.delete(actionId);
+    awaitQuestionnaireSnapshot();
+    renderQuestionnaire();
+    if (actionType === 'skip') showToast('Skipped', 'success');
+    else if (actionType === 'continue') showToast('Continued', 'success');
+    else showToast('Answer submitted', 'success');
+  }
+
+  function questionnaireActionError(actionType) {
+    if (actionType === 'skip') return 'Skip failed';
+    if (actionType === 'continue') return 'Continue failed';
+    return 'Failed to submit questionnaire answer';
   }
 
   function renderAll() {
@@ -931,6 +1260,11 @@
       renderConnectionStatus();
     }
     if (has('connected') || has('inputAvailable')) renderInputState();
+    if (has('connected')) {
+      renderApprovals();
+      renderQuestionnaire();
+      if (!has('messages')) renderMessages();
+    }
     if (
       has('agentStatus') ||
       has('agentActivityText') ||
@@ -956,6 +1290,96 @@
     if (has('messages') || has('mode') || has('model')) syncPlanModalFromState();
   }
 
+  function questionnaireIsPresent(q) {
+    return !!(q && Array.isArray(q.questions) && q.questions.length > 0);
+  }
+
+  function questionnaireIdentity(q) {
+    if (!questionnaireIsPresent(q)) return '';
+    return JSON.stringify({
+      totalLabel: q.totalLabel || '',
+      questions: q.questions.map((question) => ({
+        number: question.number,
+        text: question.text,
+        options: question.options.map((option) => [option.letter, option.label, option.actionId || '']),
+      })),
+      skipActionId: q.skipActionId || '',
+      continueActionId: q.continueActionId || '',
+    });
+  }
+
+  function reconcileQuestionnaireEnvelopes(nextQuestionnaire, previousQuestionnaire) {
+    if (!questionnaireIsPresent(nextQuestionnaire)) {
+      qEnvelopes.clear();
+      return;
+    }
+    if (
+      questionnaireIsPresent(previousQuestionnaire)
+      && questionnaireIdentity(nextQuestionnaire) !== questionnaireIdentity(previousQuestionnaire)
+    ) {
+      qEnvelopes.clear();
+    }
+    const liveActionIds = new Set([
+      nextQuestionnaire.skipActionId,
+      nextQuestionnaire.continueActionId,
+      ...nextQuestionnaire.questions.flatMap((question) => question.options.map((option) => option.actionId)),
+    ].filter(hasOpaqueActionId));
+    for (const actionId of qEnvelopes.keys()) {
+      if (!liveActionIds.has(actionId)) qEnvelopes.delete(actionId);
+    }
+  }
+
+  function clearQuestionnaireSyncWait() {
+    questionnaireAwaitingSnapshot = false;
+    if (questionnaireSyncWatchdog) {
+      clearTimeout(questionnaireSyncWatchdog);
+      questionnaireSyncWatchdog = 0;
+    }
+  }
+
+  function awaitQuestionnaireSnapshot() {
+    clearQuestionnaireSyncWait();
+    questionnaireAwaitingSnapshot = true;
+    if (socket.connected) socket.emit('state:request');
+    questionnaireSyncWatchdog = setTimeout(() => {
+      questionnaireSyncWatchdog = 0;
+      questionnaireAwaitingSnapshot = false;
+      renderQuestionnaire();
+      showToast('Questionnaire confirmation is still pending. You can retry.', 'error');
+    }, QUESTIONNAIRE_SYNC_WATCHDOG_MS);
+  }
+
+  function clearQuestionnaireNullHold() {
+    if (questionnaireNullHoldTimer) {
+      clearTimeout(questionnaireNullHoldTimer);
+      questionnaireNullHoldTimer = 0;
+    }
+  }
+
+  function stabilizeQuestionnairePatch(nextQuestionnaire, previousQuestionnaire) {
+    if (questionnaireIsPresent(nextQuestionnaire)) {
+      clearQuestionnaireNullHold();
+      clearQuestionnaireSyncWait();
+      reconcileQuestionnaireEnvelopes(nextQuestionnaire, previousQuestionnaire);
+      return;
+    }
+    if (!questionnaireIsPresent(previousQuestionnaire)) {
+      clearQuestionnaireNullHold();
+      reconcileQuestionnaireEnvelopes(null, previousQuestionnaire);
+      return;
+    }
+    state.questionnaire = previousQuestionnaire;
+    if (questionnaireNullHoldTimer) return;
+    questionnaireNullHoldTimer = setTimeout(() => {
+      questionnaireNullHoldTimer = 0;
+      reconcileQuestionnaireEnvelopes(null, state.questionnaire);
+      state.questionnaire = null;
+      clearQuestionnaireSyncWait();
+      questionnaireOptimistic = {};
+      renderQuestionnaire();
+    }, QUESTIONNAIRE_NULL_HOLD_MS);
+  }
+
   function renderConnectionStatus() {
     const ui = getConnectionUiState();
     updateConnectionUI(ui);
@@ -971,7 +1395,7 @@
       ? 'stale'
       : (awaitingCapabilityFull ? 'awaiting' : (capabilityState?.status?.state || 'unknown'));
     return {
-      socket: socket.connected ? 'connected' : 'disconnected',
+      socket: relaySocketLayer(),
       cdp: state.connected ? 'connected' : 'disconnected',
       extractor: state.extractorStatus || 'idle',
       capability,
@@ -1011,6 +1435,27 @@
     const layers = connectionLayers();
 
     if (!socket.connected) {
+      const layer = relaySocketLayer();
+      if (layer === 'connecting') {
+        return {
+          status: 'reconnecting',
+          layer: 'socket',
+          layers,
+          label: 'Connecting…',
+          emptyPrimary: 'Connecting to relay...',
+          emptyHint: 'Waiting for the CursorRemote server.',
+        };
+      }
+      if (layer === 'reconnecting') {
+        return {
+          status: 'reconnecting',
+          layer: 'socket',
+          layers,
+          label: 'Reconnecting…',
+          emptyPrimary: 'Reconnecting to relay...',
+          emptyHint: 'The page will resume automatically when the connection returns.',
+        };
+      }
       return {
         status: 'disconnected',
         layer: 'socket',
@@ -1018,6 +1463,17 @@
         label: 'Relay disconnected',
         emptyPrimary: 'Waiting for relay connection...',
         emptyHint: 'Check that this page can reach the CursorRemote server.',
+      };
+    }
+
+    if (!stateSnapshotFresh) {
+      return {
+        status: 'reconnecting',
+        layer: 'socket',
+        layers,
+        label: 'Syncing state…',
+        emptyPrimary: 'Connected to relay, waiting for current state...',
+        emptyHint: 'Actions will unlock after a fresh snapshot arrives.',
       };
     }
 
@@ -1483,24 +1939,18 @@
     icon.textContent = msg.status === 'completed' ? '\u2713' : '\u2022';
     line.appendChild(icon);
 
-    if (msg.summaryText) {
-      const summary = document.createElement('span');
-      summary.className = 'tool-summary';
-      summary.textContent = msg.summaryText;
-      line.appendChild(summary);
-    } else {
-      if (msg.action) {
-        const action = document.createElement('span');
-        action.className = 'tool-action';
-        action.textContent = msg.action;
-        line.appendChild(action);
-      }
-      if (msg.details) {
-        const details = document.createElement('span');
-        details.className = 'tool-details';
-        details.textContent = msg.details;
-        line.appendChild(details);
-      }
+    if (msg.action) {
+      const action = document.createElement('span');
+      action.className = 'tool-action';
+      action.textContent = msg.action;
+      line.appendChild(action);
+    }
+    const summary = (msg.details || msg.summaryText || '').trim();
+    if (summary && summary !== (msg.action || '').trim()) {
+      const details = document.createElement('span');
+      details.className = msg.details ? 'tool-details' : 'tool-summary';
+      details.textContent = summary;
+      line.appendChild(details);
     }
 
     if (msg.filename || msg.additions != null || msg.deletions != null) {
@@ -1601,28 +2051,35 @@
   function formatThoughtLine(msg) {
     const dur = (msg.duration || '').trim();
     const detail = (msg.detail || '').trim();
+    const action = (msg.action || '').trim();
+
+    function withDetail(base) {
+      if (!detail || detail === action || (base && base.indexOf(detail) !== -1)) return base;
+      return base ? `${base} — ${detail}` : detail;
+    }
+
+    function formatActionLabel(raw) {
+      if (!raw) return '';
+      if (/^thought$/i.test(raw)) return 'Thought';
+      if (/ing$/i.test(raw)) return `${raw.replace(/\.+$/, '')}…`;
+      return raw;
+    }
+
     if (msg.thoughtKind === 'step_summary') {
-      const a = (msg.action || '').trim();
-      return detail ? `${a || 'Steps'} — ${detail}` : (a || 'Steps');
+      return withDetail(action || 'Steps') || 'Steps';
     }
     if (msg.thoughtKind === 'thinking_step') {
-      const a = (msg.action || '').trim();
-      if (dur) return `${a || 'Step'} · ${dur}`;
-      if (a) {
-        if (/^thought$/i.test(a)) return 'Thought';
-        if (/ing$/i.test(a)) return `${a.replace(/\.\.\.?$/, '')}…`;
-        return a;
-      }
-      return 'Thinking…';
+      let label = formatActionLabel(action) || 'Thinking…';
+      if (dur) label = `${label} · ${dur}`;
+      return withDetail(label);
     }
-    if (dur) return `Thought for ${dur}`;
-    const action = (msg.action || '').trim();
     if (action) {
-      if (/^thought$/i.test(action)) return 'Thought';
-      if (/ing$/i.test(action)) return `${action.replace(/\.\.\.?$/, '')}…`;
-      return action;
+      let label = formatActionLabel(action);
+      if (dur) label = `${label} · ${dur}`;
+      return withDetail(label);
     }
-    return 'Thinking…';
+    if (dur) return withDetail(`Thought for ${dur}`);
+    return withDetail('Thinking…') || 'Thinking…';
   }
 
   function syncThoughtLineClasses(inner, msg) {
@@ -1654,9 +2111,33 @@
 
   // --- Plan block ---
 
-  function emitClickAction(actionType, actionId) {
+  async function emitClickAction(actionType, actionId) {
     if (!hasOpaqueActionId(actionId) || typeof actionType !== 'string' || actionType.length === 0) return false;
-    emitCommand('command:click_action', { actionId, actionType });
+    if (!isSocketLive()) {
+      showToast('Relay disconnected', 'error');
+      return false;
+    }
+    if (genericActionInFlight.has(actionId)) return false;
+    const payload = { actionId, actionType };
+    const envelope = reuseEnvelope(
+      'command:click_action',
+      payload,
+      genericActionEnvelopes.get(actionId),
+    );
+    genericActionEnvelopes.set(actionId, envelope);
+    genericActionInFlight.add(actionId);
+    renderMessages();
+    syncPlanModalFromState();
+    const result = await sendCommandAwaitResult('command:click_action', envelope);
+    genericActionInFlight.delete(actionId);
+    if (result.ok || !mutationOutcomeUncertain(result)) genericActionEnvelopes.delete(actionId);
+    renderMessages();
+    syncPlanModalFromState();
+    if (!result.ok) {
+      showToast(commandErrorMessage(result, `${actionType} failed`), 'error');
+      return false;
+    }
+    showToast(`${actionType} submitted`, 'success');
     return true;
   }
 
@@ -1923,8 +2404,10 @@
           if (!hasOpaqueActionId(buildAct.actionId)) {
             btn.disabled = true;
             btn.title = 'Action authorization is unavailable; refresh CursorRemote';
+          } else if (genericActionInFlight.has(buildAct.actionId) || !isSocketLive()) {
+            btn.disabled = true;
           } else {
-            btn.addEventListener('click', () => emitClickAction('build', buildAct.actionId));
+            btn.addEventListener('click', () => { void emitClickAction('build', buildAct.actionId); });
           }
           right.appendChild(btn);
         }
@@ -2002,9 +2485,11 @@
       if (!hasOpaqueActionId(action.actionId)) {
         btn.disabled = true;
         btn.title = 'Action authorization is unavailable; refresh CursorRemote';
+      } else if (genericActionInFlight.has(action.actionId) || !isSocketLive()) {
+        btn.disabled = true;
       } else {
         btn.addEventListener('click', function () {
-          emitClickAction(action.type, action.actionId);
+          void emitClickAction(action.type, action.actionId);
         });
       }
       container.appendChild(btn);
@@ -2234,9 +2719,10 @@
 
       const approveAction = approval.actions.find(a => (a.type === 'approve' || a.type === 'approve_all') && hasOpaqueActionId(a.actionId));
       const rejectAction = approval.actions.find(a => a.type === 'reject' && hasOpaqueActionId(a.actionId));
+      const live = isSocketLive();
 
-      $btnApprove.disabled = !approveAction;
-      $btnReject.disabled = !rejectAction;
+      $btnApprove.disabled = !live || approvalInFlight || rejectInFlight || !approveAction;
+      $btnReject.disabled = !live || approvalInFlight || rejectInFlight || !rejectAction;
       if (approveAction) $btnApprove.textContent = approveAction.label || 'Accept';
       if (rejectAction) $btnReject.textContent = rejectAction.label || 'Reject';
 
@@ -2254,14 +2740,19 @@
     var q = state.questionnaire;
     if (!q || !q.questions || q.questions.length === 0) {
       $questionnaireBar.classList.add('hidden');
-      questionnaireSelections = {};
+      questionnaireOptimistic = {};
       forgetNotificationKeys('cursor-questionnaire');
       return;
     }
     $questionnaireBar.classList.remove('hidden');
-    $questionnaireStepper.textContent = q.totalLabel || '';
-    $btnQSkip.disabled = !hasOpaqueActionId(q.skipActionId);
-    $btnQContinue.disabled = q.continueDisabled || !hasOpaqueActionId(q.continueActionId);
+    var refreshing = !!questionnaireNullHoldTimer || questionnaireAwaitingSnapshot;
+    $questionnaireStepper.textContent = refreshing
+      ? ((q.totalLabel ? q.totalLabel + ' · ' : '') + 'Syncing…')
+      : (q.totalLabel || '');
+    var live = isSocketLive();
+    var qBusy = qActionInFlight || !live || refreshing;
+    $btnQSkip.disabled = qBusy || !hasOpaqueActionId(q.skipActionId);
+    $btnQContinue.disabled = qBusy || q.continueDisabled || !hasOpaqueActionId(q.continueActionId);
 
     $questionnaireQuestions.innerHTML = '';
     for (var i = 0; i < q.questions.length; i++) {
@@ -2282,10 +2773,19 @@
 
       var optionsDiv = document.createElement('div');
       optionsDiv.className = 'questionnaire-options';
+      var serverSelectedLetter = '';
+      for (var s = 0; s < question.options.length; s++) {
+        if (question.options[s].selected === true) {
+          serverSelectedLetter = question.options[s].letter;
+          break;
+        }
+      }
+      if (serverSelectedLetter) delete questionnaireOptimistic[question.number];
       for (var j = 0; j < question.options.length; j++) {
         var opt = question.options[j];
         var optBtn = document.createElement('button');
-        var isSelected = questionnaireSelections[question.number] === opt.letter;
+        var isSelected = opt.selected === true
+          || (!serverSelectedLetter && questionnaireOptimistic[question.number] === opt.letter);
         optBtn.className = 'questionnaire-option' + (isSelected ? ' questionnaire-option-selected' : '');
         var letterSpan = document.createElement('span');
         letterSpan.className = 'questionnaire-option-letter';
@@ -2300,17 +2800,18 @@
           optBtn.disabled = true;
           optBtn.title = 'Action authorization is unavailable; refresh CursorRemote';
         }
+        if (qBusy) optBtn.disabled = true;
         optBtn.dataset.questionNumber = question.number;
         optBtn.dataset.letter = opt.letter;
         optBtn.dataset.label = opt.label;
         optBtn.addEventListener('click', function() {
           if (!hasOpaqueActionId(this.dataset.actionId)) return;
-          questionnaireSelections[this.dataset.questionNumber] = this.dataset.letter;
+          if (!isSocketLive() || qActionInFlight || questionnaireNullHoldTimer || questionnaireAwaitingSnapshot) return;
+          questionnaireOptimistic[this.dataset.questionNumber] = this.dataset.letter;
           var siblings = this.parentNode.querySelectorAll('.questionnaire-option');
-          for (var s = 0; s < siblings.length; s++) siblings[s].classList.remove('questionnaire-option-selected');
+          for (var sib = 0; sib < siblings.length; sib++) siblings[sib].classList.remove('questionnaire-option-selected');
           this.classList.add('questionnaire-option-selected');
-          emitClickAction('questionnaire_option', this.dataset.actionId);
-          showToast('Answer sent', 'success');
+          void submitQuestionnaireAction('questionnaire_option', this.dataset.actionId, this.dataset.questionNumber);
         });
         optionsDiv.appendChild(optBtn);
       }
@@ -2322,8 +2823,8 @@
   }
 
   function renderInputState() {
-    $input.disabled = !state.inputAvailable && !state.connected;
-    $btnSend.disabled = !$input.value.trim() || $input.disabled;
+    $input.disabled = isSocketLive() ? !state.inputAvailable : false;
+    $btnSend.disabled = !isSocketLive() || sendInFlight || !$input.value.trim() || $input.disabled;
   }
 
   function isClientForeground() {

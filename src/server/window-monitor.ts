@@ -87,7 +87,7 @@ function elementContentKey(el: ChatElement): string {
   switch (el.type) {
     case 'assistant': return String(el.html?.length ?? el.text?.length ?? 0);
     case 'human': return String(el.text.length);
-    case 'tool': return `${el.status}:${el.action}:${el.filename ?? ''}`;
+    case 'tool': return `${el.status}:${el.action}:${el.filename ?? ''}:${el.details ?? ''}:${el.summaryText ?? ''}`;
     case 'run_command': return `${el.command.length}:${el.actions.length}`;
     case 'thought':
       return `${el.thoughtKind ?? ''}:${el.action ?? ''}:${el.detail ?? ''}:${el.duration ?? ''}`;
@@ -134,7 +134,8 @@ export function questionnaireFingerprint(questionnaire: Questionnaire | null): s
   if (!questionnaire || questionnaire.questions.length === 0) return '';
   const q = questionnaire.questions[questionnaire.activeIndex] ?? questionnaire.questions[0];
   const optionLabels = q?.options.map((option) => option.label).join(',') ?? '';
-  return `${questionnaire.totalLabel}|${questionnaire.activeIndex}|${questionnaire.continueDisabled ? 1 : 0}|${q?.number ?? ''}|${q?.options.length ?? 0}|${optionLabels}`;
+  const selected = q?.options.filter((option) => option.selected).map((option) => option.letter).join(',') ?? '';
+  return `${questionnaire.totalLabel}|${questionnaire.activeIndex}|${questionnaire.continueDisabled ? 1 : 0}|${q?.number ?? ''}|${q?.options.length ?? 0}|${optionLabels}|${selected}`;
 }
 
 /**
@@ -142,18 +143,49 @@ export function questionnaireFingerprint(questionnaire: Questionnaire | null): s
  * Catches mid-list changes (tool status transitions, plan progress, type
  * changes at non-tail positions) that the last-element fingerprint misses.
  */
-function elementsSignature(messages: ChatElement[]): string {
-  let sig = '';
-  for (const m of messages) {
-    sig += m.type[0] + m.id;
-    if (m.type === 'tool') sig += m.status[0];
-    else if (m.type === 'plan') {
-      sig += m.todosCompleted + (m.descriptionHtml?.length ?? 0) + (m.title?.length ?? 0);
-    }     else if (m.type === 'todo_list') sig += m.todosCompleted;
-    else if (m.type === 'thought') sig += (m.duration || '') + (m.thoughtKind || '');
-    else if (m.type === 'loading' && m.text) sig += m.text.length;
-  }
-  return sig;
+export function elementsSignature(messages: ChatElement[]): string {
+  return JSON.stringify(messages.map((message) => {
+    switch (message.type) {
+      case 'tool':
+        return [
+          message.type,
+          message.id,
+          message.status,
+          message.action,
+          message.details,
+          message.summaryText ?? '',
+          message.filename ?? '',
+          message.additions ?? null,
+          message.deletions ?? null,
+          message.blocked ?? '',
+          (message.actions ?? []).map((action) => [action.type, action.label, action.actionId ?? '']),
+        ];
+      case 'thought':
+        return [
+          message.type,
+          message.id,
+          message.thoughtKind ?? '',
+          message.action ?? '',
+          message.detail ?? '',
+          message.duration ?? '',
+        ];
+      case 'plan':
+        return [
+          message.type,
+          message.id,
+          message.todosCompleted,
+          message.descriptionHtml?.length ?? 0,
+          message.title,
+          message.model ?? '',
+        ];
+      case 'todo_list':
+        return [message.type, message.id, message.todosCompleted];
+      case 'loading':
+        return [message.type, message.id, message.text ?? ''];
+      default:
+        return [message.type, message.id];
+    }
+  }));
 }
 
 /**

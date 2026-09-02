@@ -153,6 +153,33 @@ async function collectResults(
   return found;
 }
 
+async function collectNamed(
+  origin: string,
+  sid: string,
+  eventName: string,
+  count: number,
+  timeoutMs = 4000,
+): Promise<unknown[]> {
+  const found: unknown[] = [];
+  const deadline = Date.now() + timeoutMs;
+  while (found.length < count && Date.now() < deadline) {
+    const res = await fetch(pollingUrl(origin, sid));
+    const text = await res.text();
+    if (res.status !== 200) throw new Error(`poll ${res.status} ${text}`);
+    for (const packet of splitPackets(text)) {
+      if (packet === '2') {
+        await eioPost(origin, sid, '3');
+        continue;
+      }
+      if (!packet.startsWith('42')) continue;
+      const data = JSON.parse(packet.slice(2)) as [string, unknown];
+      if (data[0] === eventName) found.push(data[1]);
+    }
+  }
+  if (found.length < count) throw new Error(`timed out waiting for ${count} ${eventName}, got ${found.length}`);
+  return found;
+}
+
 async function emitCommand(
   origin: string,
   sid: string,
@@ -182,8 +209,8 @@ describe('socket inbound protocol helpers', () => {
     assert.equal(socketCommandRequiresOperationId('reject'), false);
     assert.equal(socketCommandRequiresOperationId('click_action', 'run'), true);
     assert.equal(socketCommandRequiresOperationId('click_action', 'continue'), true);
-    assert.equal(socketCommandRequiresOperationId('click_action', 'skip'), false);
-    assert.equal(socketCommandRequiresOperationId('click_action', 'questionnaire_option'), false);
+    assert.equal(socketCommandRequiresOperationId('click_action', 'skip'), true);
+    assert.equal(socketCommandRequiresOperationId('click_action', 'questionnaire_option'), true);
     assert.equal(socketCommandRequiresOperationId('get_plan_full'), false);
     assert.equal(OPERATION_ID_RE.test('op-click-01'), true);
     assert.equal(OPERATION_ID_RE.test('short'), false);
@@ -261,6 +288,7 @@ describe('Relay inbound action protocol', () => {
       commandId: 'cmd-skip-1',
       actionId: 'act_skip',
       actionType: 'skip',
+      operationId: 'op-skip-forward-1',
     });
     assert.equal(result.ok, true);
     assert.equal(result.commandId, 'cmd-skip-1');
@@ -370,6 +398,7 @@ describe('Relay inbound action protocol', () => {
       commandId: 'cmd-skip-rate',
       actionId: 'act_skip',
       actionType: 'skip',
+      operationId: 'op-skip-rate-01',
     });
     assert.equal(skip.ok, true);
   });
@@ -387,5 +416,36 @@ describe('Relay inbound action protocol', () => {
     const res = await eioPost(origin, sid, huge);
     assert.equal(res.status, 413);
     assert.equal(calls.length, 0);
+  });
+
+  it('replies to state:request with a full snapshot', async () => {
+    const calls: ExecutorCall[] = [];
+    const { origin } = await startRelay(calls);
+    const { sid } = await connectSocket(origin);
+    await postCommand(origin, sid, 'state:request', {});
+    const snapshots = await collectNamed(origin, sid, 'state:full', 1);
+    assert.equal(snapshots.length, 1);
+    assert.equal(typeof snapshots[0], 'object');
+  });
+
+  it('replays questionnaire_option with the same operationId and does not double-click', async () => {
+    const calls: ExecutorCall[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const { origin } = await startRelay(calls, { gate });
+    const { sid } = await connectSocket(origin);
+    const payload = {
+      actionId: 'act_opt_a',
+      actionType: 'questionnaire_option',
+      operationId: 'op-q-opt-same-1',
+    };
+    await postCommand(origin, sid, 'command:click_action', { commandId: 'cmd-q-a', ...payload });
+    await postCommand(origin, sid, 'command:click_action', { commandId: 'cmd-q-b', ...payload });
+    release();
+    const results = await collectResults(origin, sid, 2);
+    const byId = new Map(results.map((item) => [item.commandId, item]));
+    assert.equal(byId.get('cmd-q-a')?.ok, true);
+    assert.equal(byId.get('cmd-q-b')?.ok, true);
+    assert.equal(calls.length, 1);
   });
 });

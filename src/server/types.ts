@@ -47,6 +47,8 @@ export interface QuestionnaireOption {
   letter: string;
   label: string;
   isFreeform: boolean;
+  /** True when Cursor's option row is selected (aria / data / selected class). */
+  selected?: boolean;
   /** Internal extractor path; stripped from public socket state. */
   selectorPath: string;
   actionId?: string;

@@ -68,6 +68,8 @@ export const DANGEROUS_ACTION_TYPES = new Set([
   'run',
   'build',
   'continue',
+  'skip',
+  'questionnaire_option',
 ]);
 
 export function isValidActionType(value: unknown): value is string {
@@ -1267,6 +1269,10 @@ export class Relay {
       if (this.capabilityStateManager) {
         socket.emit('capabilities:full', this.capabilityStateManager.getPublicState());
       }
+
+      socket.on('state:request', () => {
+        socket.emit('state:full', toPublicState(this.stateManager.getCurrentState()));
+      });
 
       const onCommand = (
         route: string,

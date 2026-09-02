@@ -107,6 +107,17 @@ describe('formatElement thought shimmer', () => {
     assert.match(html, /◆/);
     assert.match(html, /<tg-spoiler>/);
   });
+
+  it('keeps thinking_step detail when a duration is present', () => {
+    const msg: ThoughtBlock = {
+      type: 'thought', id: 't1', flatIndex: 0, duration: '4s',
+      action: 'Reading', detail: 'src/server/relay.ts', thoughtKind: 'thinking_step',
+    };
+    const { html } = formatElement(msg, dummyHash);
+    assert.match(html, /Reading/);
+    assert.match(html, /src\/server\/relay\.ts/);
+    assert.match(html, /4s/);
+  });
 });
 
 // ─── activityRedundantWithInProgressStepSummary ───

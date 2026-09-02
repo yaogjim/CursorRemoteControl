@@ -211,6 +211,103 @@ describe('extractionFunction', () => {
     assert.equal(state.questionnaire.continueDisabled, false);
   });
 
+  it('marks questionnaire options selected from aria/data attributes', () => {
+    const state = withDom(`
+      <main id="root"></main>
+      <div id="composer-toolbar-section">
+        <div class="composer-questionnaire-toolbar">
+          <div class="composer-questionnaire-toolbar-questions">
+            <div class="composer-questionnaire-toolbar-question composer-questionnaire-toolbar-question-active">
+              <div class="composer-questionnaire-toolbar-question-number">1.</div>
+              <div class="composer-questionnaire-toolbar-options">
+                <div class="composer-questionnaire-toolbar-option" role="button" aria-pressed="true">
+                  <button class="composer-questionnaire-toolbar-option-letter" type="button">A</button>
+                  <span class="composer-questionnaire-toolbar-option-label">Explore</span>
+                </div>
+                <div class="composer-questionnaire-toolbar-option" role="button">
+                  <button class="composer-questionnaire-toolbar-option-letter" type="button">B</button>
+                  <span class="composer-questionnaire-toolbar-option-label">Skip this</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <section class="composer-questionnaire-toolbar-actions">
+            <div data-click-ready="true"><span><span class="truncate">Skip</span></span></div>
+            <div data-click-ready="true" aria-disabled="true"><span><span class="truncate">Continue</span></span></div>
+          </section>
+        </div>
+      </div>
+    `);
+    assert.ok(state.questionnaire);
+    assert.equal(state.questionnaire.questions[0].options[0].selected, true);
+    assert.equal(state.questionnaire.questions[0].options[1].selected, false);
+    assert.equal(state.questionnaire.continueDisabled, true);
+  });
+
+  it('marks a native disabled questionnaire Continue button as disabled', () => {
+    const state = withDom(`
+      <main id="root"></main>
+      <div id="composer-toolbar-section">
+        <div class="composer-questionnaire-toolbar">
+          <div class="composer-questionnaire-toolbar-questions">
+            <div class="composer-questionnaire-toolbar-question composer-questionnaire-toolbar-question-active">
+              <div class="composer-questionnaire-toolbar-question-number">1.</div>
+            </div>
+          </div>
+          <section class="composer-questionnaire-toolbar-actions">
+            <button data-click-ready="true">Skip</button>
+            <button data-click-ready="true" disabled>Continue</button>
+          </section>
+        </div>
+      </div>
+    `);
+
+    assert.ok(state.questionnaire);
+    assert.equal(state.questionnaire.continueDisabled, true);
+  });
+
+  it('copies step-group preview into thought detail and ignores thinking body', () => {
+    const state = withDom(`
+      <main id="root">
+        <article data-flat-index="0">
+          <div class="ui-collapsible ui-step-group-collapsible">
+            <div class="ui-collapsible-header">
+              <span>Explored</span>
+              <span class="ui-step-group-preview">Found 3 files in src/server</span>
+            </div>
+            <div class="ui-collapsible-content">SECRET_THINKING_BODY should stay hidden</div>
+          </div>
+        </article>
+      </main>
+    `);
+    const thought = state.messages.find((message) => message.type === 'thought');
+    assert.ok(thought);
+    assert.equal(thought.action, 'Explored');
+    assert.match(thought.detail || '', /Found 3 files/);
+    assert.equal((thought.detail || '').includes('SECRET_THINKING_BODY'), false);
+  });
+
+  it('keeps compact tool details when header-content is present', () => {
+    const state = withDom(`
+      <main id="root">
+        <article data-flat-index="0" data-message-role="ai" data-message-kind="tool" data-message-id="m-tool">
+          <div data-tool-call-id="call-2" data-tool-status="completed">
+            <div class="composer-tool-former-message">
+              <div class="composer-tool-call-header-content">
+                <span>Read</span>
+                <span>src/server/relay.ts</span>
+              </div>
+            </div>
+          </div>
+        </article>
+      </main>
+    `);
+    const tool = state.messages.find((message) => message.type === 'tool');
+    assert.ok(tool);
+    assert.equal(tool.action, 'Read');
+    assert.equal(tool.details, 'src/server/relay.ts');
+  });
+
   it('uses the local history sidebar when Cursor hides the unified cross-project sidebar', () => {
     const state = withDom(`
       <body class="sidebarvisible unifiedsidebarhidden">

@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { questionnaireFingerprint } from '../src/server/window-monitor.js';
-import type { Questionnaire } from '../src/server/types.js';
+import { elementsSignature, questionnaireFingerprint } from '../src/server/window-monitor.js';
+import type { ChatElement, Questionnaire } from '../src/server/types.js';
 
 function makeQuestionnaire(overrides: Partial<Questionnaire> = {}): Questionnaire {
   return {
@@ -85,5 +85,83 @@ describe('questionnaireFingerprint', () => {
       questionnaireFingerprint(makeQuestionnaire()),
       questionnaireFingerprint(makeQuestionnaire())
     );
+  });
+
+  it('changes when an option becomes selected', () => {
+    const first = makeQuestionnaire();
+    const second = makeQuestionnaire({
+      questions: [{
+        ...first.questions[0],
+        options: [
+          { ...first.questions[0].options[0], selected: true },
+          first.questions[0].options[1],
+        ],
+      }],
+    });
+    assert.notEqual(questionnaireFingerprint(first), questionnaireFingerprint(second));
+  });
+});
+
+describe('elementsSignature', () => {
+  it('changes when a non-tail tool summary or action changes', () => {
+    const first: ChatElement[] = [
+      {
+        type: 'tool',
+        id: 'tool-1',
+        flatIndex: 0,
+        toolCallId: 'call-1',
+        status: 'loading',
+        action: 'Reading',
+        details: 'src/server/relay.ts',
+      },
+      {
+        type: 'assistant',
+        id: 'assistant-1',
+        flatIndex: 1,
+        text: 'Done',
+        html: '<p>Done</p>',
+        codeBlocks: [],
+      },
+    ];
+    const detailChanged: ChatElement[] = [
+      { ...first[0], details: 'src/server/window-monitor.ts' } as ChatElement,
+      first[1],
+    ];
+    const actionChanged: ChatElement[] = [
+      { ...first[0], action: 'Searched' } as ChatElement,
+      first[1],
+    ];
+
+    assert.notEqual(elementsSignature(first), elementsSignature(detailChanged));
+    assert.notEqual(elementsSignature(first), elementsSignature(actionChanged));
+  });
+
+  it('changes when a non-tail thought summary changes and stays stable otherwise', () => {
+    const first: ChatElement[] = [
+      {
+        type: 'thought',
+        id: 'thought-1',
+        flatIndex: 0,
+        duration: '2s',
+        action: 'Reading',
+        detail: 'src/client/app.js',
+        thoughtKind: 'thinking_step',
+      },
+      {
+        type: 'assistant',
+        id: 'assistant-1',
+        flatIndex: 1,
+        text: 'Done',
+        html: '<p>Done</p>',
+        codeBlocks: [],
+      },
+    ];
+    const changed: ChatElement[] = [
+      { ...first[0], detail: 'tests/web-client.test.ts', duration: '3s' } as ChatElement,
+      first[1],
+    ];
+
+    assert.equal(elementsSignature(first), elementsSignature(structuredClone(first)));
+    assert.notEqual(elementsSignature(first), elementsSignature(changed));
   });
 });

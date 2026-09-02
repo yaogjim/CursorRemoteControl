@@ -17,9 +17,11 @@ interface MockSocket {
   on(event: string, fn: EventHandler): void;
   emit(event: string, ...args: unknown[]): void;
   fire(event: string, ...args: unknown[]): void;
+  connect(): void;
   connected: boolean;
   id: string;
   emitted: Array<{ event: string; args: unknown[] }>;
+  io: MockSocket;
 }
 
 function loadFixture(name: string): Array<{ ts: number; state: CursorState | null }> {
@@ -33,7 +35,11 @@ interface MockNotificationRecord {
   tag?: string;
 }
 
-function createTestEnv(opts: { storage?: Record<string, string>; prefersDark?: boolean } = {}) {
+function createTestEnv(opts: {
+  storage?: Record<string, string>;
+  prefersDark?: boolean;
+  healthHangs?: boolean;
+} = {}) {
   const html = readFileSync(HTML_PATH, 'utf-8');
   const appJs = readFileSync(APP_JS_PATH, 'utf-8');
 
@@ -47,6 +53,7 @@ function createTestEnv(opts: { storage?: Record<string, string>; prefersDark?: b
         connected: true,
         id: 'test-socket-id',
         emitted: [],
+        io: undefined as unknown as MockSocket,
         on(event: string, fn: EventHandler) {
           this.handlers.set(event, fn);
         },
@@ -57,9 +64,16 @@ function createTestEnv(opts: { storage?: Record<string, string>; prefersDark?: b
           const handler = this.handlers.get(event);
           if (handler) handler(...args);
         },
+        connect() {
+          if (this.connected) return;
+          this.connected = true;
+          this.fire('connect');
+        },
       };
+      mockSocket.io = mockSocket;
 
-      (window as any).io = function () {
+      (window as any).io = function (opts?: unknown) {
+        (window as any).__ioOptions = opts || {};
         return mockSocket;
       };
 
@@ -141,6 +155,13 @@ function createTestEnv(opts: { storage?: Record<string, string>; prefersDark?: b
         const url = String(input);
         fetchCalls.push({ url, init });
         if (url.includes('/health')) {
+          if (opts.healthHangs) {
+            return await new Promise((_resolve, reject) => {
+              const abort = () => reject(new window.DOMException('Aborted', 'AbortError'));
+              if (init?.signal?.aborted) abort();
+              else init?.signal?.addEventListener('abort', abort, { once: true });
+            });
+          }
           return { ok: true, status: 200, json: async () => ({ authRequired: false, sessionValid: true }) };
         }
         if (url.includes('/api/csrf')) {
@@ -219,6 +240,13 @@ function firePatch(mockSocket: MockSocket, patch: Partial<CursorState>) {
   mockSocket.fire('state:patch', patch);
 }
 
+function settleLastCommand(mockSocket: MockSocket, ok = true, extra: Record<string, unknown> = {}) {
+  const last = mockSocket.emitted[mockSocket.emitted.length - 1];
+  assert.ok(last, 'expected a command emit to settle');
+  const payload = last.args[0] as Record<string, unknown>;
+  mockSocket.fire('command:result', { commandId: payload.commandId, ok, ...extra });
+}
+
 // ─── Connection status rendering ───
 
 describe('web: connection status', () => {
@@ -247,6 +275,109 @@ describe('web: connection status', () => {
     assert.equal(dot.getAttribute('data-socket'), 'connected');
     assert.equal(dot.getAttribute('data-cdp'), 'connected');
     assert.match(dot.title, /Extractor stale/i);
+  });
+
+  it('configures fast WebSocket reuse with polling fallback available', () => {
+    const opts = (env.window as any).__ioOptions;
+    assert.equal(opts.reconnection, true);
+    assert.equal(opts.rememberUpgrade, true);
+    assert.equal(opts.tryAllTransports, true);
+    assert.equal(opts.timeout, 20000);
+  });
+
+  it('continues bootstrapping after a hung health check reaches its deadline', async () => {
+    const hung = createTestEnv({ healthHangs: true });
+    assert.equal((hung.window as any).__ioOptions, undefined);
+    await new Promise((resolve) => setTimeout(resolve, 3100));
+    assert.ok((hung.window as any).__ioOptions);
+  });
+
+  it('records startup timing without requiring the Resource Timing API', () => {
+    assert.equal(typeof env.window.performance.getEntriesByType, 'undefined');
+    fireFullState(env.mockSocket, loadFixture('connection-states.jsonl')[0].state!);
+    const timing = (env.window as any).__cursorRemoteStartupTiming;
+    assert.ok(timing);
+    for (const key of ['healthMs', 'socketMs', 'stateFullMs', 'firstRenderMs']) {
+      assert.equal(Number.isFinite(timing[key]), true, `${key} should be finite`);
+      assert.ok(timing[key] >= 0, `${key} should not be negative`);
+    }
+    assert.equal(Object.keys(timing.resourceMs).length, 0);
+  });
+
+  it('keeps typed input on disconnect and disables send until reconnect', () => {
+    fireFullState(env.mockSocket, {
+      ...loadFixture('connection-states.jsonl')[0].state!,
+      inputAvailable: true,
+    });
+    const input = env.document.getElementById('message-input') as HTMLTextAreaElement;
+    const send = env.document.getElementById('btn-send') as HTMLButtonElement;
+    input.value = 'keep this draft';
+    input.dispatchEvent(new env.window.Event('input', { bubbles: true }));
+    assert.equal(send.disabled, false);
+
+    env.mockSocket.connected = false;
+    env.mockSocket.fire('disconnect');
+    assert.equal(input.value, 'keep this draft');
+    assert.equal(input.disabled, false);
+    assert.equal(send.disabled, true);
+    assert.match(env.document.getElementById('connection-text')!.textContent!, /Reconnecting/);
+  });
+
+  it('keeps mutations locked after reconnect until a fresh full snapshot arrives', () => {
+    const full = {
+      ...loadFixture('connection-states.jsonl')[0].state!,
+      inputAvailable: true,
+    };
+    fireFullState(env.mockSocket, full);
+    const input = env.document.getElementById('message-input') as HTMLTextAreaElement;
+    const send = env.document.getElementById('btn-send') as HTMLButtonElement;
+    input.value = 'wait for fresh state';
+    input.dispatchEvent(new env.window.Event('input', { bubbles: true }));
+    assert.equal(send.disabled, false);
+
+    env.mockSocket.connected = false;
+    env.mockSocket.fire('disconnect');
+    env.mockSocket.connected = true;
+    env.mockSocket.fire('connect');
+    assert.equal(send.disabled, true);
+
+    fireFullState(env.mockSocket, full);
+    assert.equal(send.disabled, false);
+  });
+
+  it('calls socket.connect when the browser comes online', () => {
+    env.mockSocket.connected = false;
+    env.window.dispatchEvent(new env.window.Event('online'));
+    assert.equal(env.mockSocket.connected, true);
+  });
+
+  it('calls socket.connect when the app returns to the foreground', () => {
+    env.mockSocket.connected = false;
+    Object.defineProperty(env.document, 'hidden', { configurable: true, value: false });
+    env.document.dispatchEvent(new env.window.Event('visibilitychange'));
+    assert.equal(env.mockSocket.connected, true);
+  });
+
+  it('requests a full snapshot if state:full does not arrive after connect', async () => {
+    env.mockSocket.connected = false;
+    env.mockSocket.fire('disconnect');
+    env.mockSocket.emitted.length = 0;
+    env.mockSocket.connected = true;
+    env.mockSocket.fire('connect');
+    assert.equal(env.mockSocket.emitted.some((item) => item.event === 'state:request'), false);
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    assert.equal(env.mockSocket.emitted.some((item) => item.event === 'state:request'), true);
+  });
+
+  it('does not request a snapshot after state:full arrives', async () => {
+    env.mockSocket.connected = false;
+    env.mockSocket.fire('disconnect');
+    env.mockSocket.emitted.length = 0;
+    env.mockSocket.connected = true;
+    env.mockSocket.fire('connect');
+    fireFullState(env.mockSocket, loadFixture('connection-states.jsonl')[0].state!);
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    assert.equal(env.mockSocket.emitted.some((item) => item.event === 'state:request'), false);
   });
 });
 
@@ -975,10 +1106,10 @@ describe('web: connection/capability state matrix', () => {
 
     env.mockSocket.connected = false;
     env.mockSocket.fire('disconnect');
-    assert.equal(connectionDot().className, 'dot disconnected');
-    assert.equal(connectionDot().getAttribute('data-socket'), 'disconnected');
+    assert.equal(connectionDot().className, 'dot reconnecting');
+    assert.equal(connectionDot().getAttribute('data-socket'), 'reconnecting');
     assert.equal(connectionDot().getAttribute('data-layer'), 'socket');
-    assert.match(env.document.getElementById('connection-text')!.textContent!, /Relay disconnected/);
+    assert.match(env.document.getElementById('connection-text')!.textContent!, /Reconnecting/);
     assert.equal(modePill().disabled, true);
     assert.equal(modelPill().disabled, true);
     assert.equal(env.document.getElementById('pill-mode-text')!.textContent, 'Agent');
@@ -992,7 +1123,7 @@ describe('web: connection/capability state matrix', () => {
     assert.equal(modePill().getAttribute('data-awaiting-full'), 'true');
     assert.equal(modePill().getAttribute('data-capability-state'), 'awaiting');
     assert.equal(env.document.getElementById('pill-mode-text')!.textContent, 'Agent');
-    assert.ok(connectionDot().classList.contains('connected'));
+    assert.match(env.document.getElementById('connection-text')!.textContent!, /Syncing state/);
     assert.equal(connectionDot().getAttribute('data-capability'), 'awaiting');
 
     env.mockSocket.fire('capabilities:patch', {
@@ -1276,7 +1407,7 @@ describe('web: questionnaire widget', () => {
     assert.ok(btn.disabled, 'Continue should be disabled');
   });
 
-  it('hides questionnaire bar when questionnaire becomes null via patch', () => {
+  it('hides questionnaire bar when questionnaire becomes null via patch', async () => {
     const state = baseState();
     state.questionnaire = {
       questions: [{ number: '1.', text: 'Q?', isActive: true, options: [] }],
@@ -1289,7 +1420,99 @@ describe('web: questionnaire widget', () => {
     assert.ok(!bar.classList.contains('hidden'), 'Should be visible initially');
 
     firePatch(env.mockSocket, { questionnaire: null });
-    assert.ok(bar.classList.contains('hidden'), 'Should hide after patch with null');
+    assert.ok(!bar.classList.contains('hidden'), 'Should keep the bar across a brief null flicker');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(!bar.classList.contains('hidden'), 'Should still be visible inside the hold window');
+  });
+
+  it('keeps stale questionnaire UI visible but blocks every action until a fresh snapshot arrives', () => {
+    const state = baseState();
+    state.questionnaire = {
+      questions: [{
+        number: '1.', text: 'Pick?', isActive: true,
+        options: [{
+          letter: 'A', label: 'Red', isFreeform: false,
+          selectorPath: 'sp-red', actionId: 'act_red',
+        }],
+      }],
+      activeIndex: 0, totalLabel: '1 of 1',
+      skipSelectorPath: 'sp-skip', skipActionId: 'act_skip',
+      continueSelectorPath: 'sp-continue', continueActionId: 'act_continue',
+      continueDisabled: false,
+    };
+    fireFullState(env.mockSocket, state);
+    firePatch(env.mockSocket, { questionnaire: null });
+
+    const option = env.document.querySelector('.questionnaire-option') as HTMLButtonElement;
+    const skip = env.document.getElementById('btn-q-skip') as HTMLButtonElement;
+    const continueButton = env.document.getElementById('btn-q-continue') as HTMLButtonElement;
+    assert.equal(option.disabled, true);
+    assert.equal(skip.disabled, true);
+    assert.equal(continueButton.disabled, true);
+    assert.match(env.document.getElementById('questionnaire-stepper')!.textContent || '', /Syncing/);
+    option.click();
+    skip.click();
+    continueButton.click();
+    assert.equal(commandEmits(env.mockSocket, 'command:click_action').length, 0);
+
+    firePatch(env.mockSocket, { questionnaire: state.questionnaire });
+    const refreshedOption = env.document.querySelector('.questionnaire-option') as HTMLButtonElement;
+    assert.equal(refreshedOption.disabled, false);
+    assert.equal((env.document.getElementById('btn-q-skip') as HTMLButtonElement).disabled, false);
+    assert.equal((env.document.getElementById('btn-q-continue') as HTMLButtonElement).disabled, false);
+    assert.doesNotMatch(env.document.getElementById('questionnaire-stepper')!.textContent || '', /Syncing/);
+    refreshedOption.click();
+    assert.equal(commandEmits(env.mockSocket, 'command:click_action').length, 1);
+  });
+
+  it('hides questionnaire bar after the null-hold window', async () => {
+    const state = baseState();
+    state.questionnaire = {
+      questions: [{ number: '1.', text: 'Q?', isActive: true, options: [] }],
+      activeIndex: 0, totalLabel: '1 of 1',
+      skipSelectorPath: '', continueSelectorPath: '',
+      continueDisabled: false,
+    };
+    fireFullState(env.mockSocket, state);
+    const bar = env.document.getElementById('questionnaire-bar')!;
+    firePatch(env.mockSocket, { questionnaire: null });
+    assert.ok(!bar.classList.contains('hidden'));
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    assert.ok(bar.classList.contains('hidden'), 'Should hide after the hold window');
+  });
+
+  it('hides questionnaire immediately on state:full null', () => {
+    const state = baseState();
+    state.questionnaire = {
+      questions: [{ number: '1.', text: 'Q?', isActive: true, options: [] }],
+      activeIndex: 0, totalLabel: '1 of 1',
+      skipSelectorPath: '', continueSelectorPath: '',
+      continueDisabled: false,
+    };
+    fireFullState(env.mockSocket, state);
+    const bar = env.document.getElementById('questionnaire-bar')!;
+    fireFullState(env.mockSocket, { ...state, questionnaire: null });
+    assert.ok(bar.classList.contains('hidden'), 'state:full null is authoritative');
+  });
+
+  it('uses server option.selected as the selected source of truth', () => {
+    const state = baseState();
+    state.questionnaire = {
+      questions: [{
+        number: '1.', text: 'Pick?', isActive: true,
+        options: [
+          { letter: 'A', label: 'Red', isFreeform: false, selectorPath: 'sp-red', selected: true, actionId: 'act_a' },
+          { letter: 'B', label: 'Blue', isFreeform: false, selectorPath: 'sp-blue', selected: false, actionId: 'act_b' },
+        ],
+      }],
+      activeIndex: 0, totalLabel: '1 of 1',
+      skipSelectorPath: '', continueSelectorPath: '',
+      continueDisabled: false,
+    };
+    fireFullState(env.mockSocket, state);
+    const options = [...env.document.querySelectorAll('.questionnaire-option')];
+    assert.ok(options[0].classList.contains('questionnaire-option-selected'));
+    assert.equal(options[1].classList.contains('questionnaire-option-selected'), false);
   });
 
   it('marks active question with active class', () => {
@@ -1308,6 +1531,112 @@ describe('web: questionnaire widget', () => {
     assert.equal(questions.length, 2);
     assert.ok(!questions[0].classList.contains('questionnaire-question-active'));
     assert.ok(questions[1].classList.contains('questionnaire-question-active'));
+  });
+
+  it('rolls back an optimistic option when the command fails', async () => {
+    const state = baseState();
+    state.questionnaire = {
+      questions: [{
+        number: '1.', text: 'Pick?', isActive: true,
+        options: [
+          { letter: 'A', label: 'Red', isFreeform: false, selectorPath: 'sp-red', actionId: 'act_a' },
+          { letter: 'B', label: 'Blue', isFreeform: false, selectorPath: 'sp-blue', actionId: 'act_b' },
+        ],
+      }],
+      activeIndex: 0, totalLabel: '1 of 1',
+      skipSelectorPath: '', continueSelectorPath: '',
+      continueDisabled: true,
+    };
+    fireFullState(env.mockSocket, state);
+    const first = env.document.querySelector('.questionnaire-option') as HTMLButtonElement;
+    first.click();
+    settleLastCommand(env.mockSocket, false, { error: 'action_expired' });
+    await Promise.resolve();
+    const options = [...env.document.querySelectorAll('.questionnaire-option')];
+    assert.equal(options[0].classList.contains('questionnaire-option-selected'), false);
+  });
+
+  it('unlocks a questionnaire if the post-success snapshot never changes', async () => {
+    const state = baseState();
+    state.questionnaire = {
+      questions: [{
+        number: '1.', text: 'Pick?', isActive: true,
+        options: [{
+          letter: 'A', label: 'Red', isFreeform: false,
+          selectorPath: 'sp-red', actionId: 'act_red',
+        }],
+      }],
+      activeIndex: 0, totalLabel: '1 of 1',
+      skipSelectorPath: 'sp-skip', skipActionId: 'act_skip',
+      continueSelectorPath: 'sp-continue', continueActionId: 'act_continue',
+      continueDisabled: false,
+    };
+    fireFullState(env.mockSocket, state);
+    (env.document.querySelector('.questionnaire-option') as HTMLButtonElement).click();
+    settleLastCommand(env.mockSocket);
+    await Promise.resolve();
+    assert.equal((env.document.getElementById('btn-q-skip') as HTMLButtonElement).disabled, true);
+
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    assert.equal((env.document.getElementById('btn-q-skip') as HTMLButtonElement).disabled, false);
+    assert.equal((env.document.getElementById('btn-q-continue') as HTMLButtonElement).disabled, false);
+  });
+
+  it('drops an uncertain questionnaire operation after the questionnaire is authoritatively gone', async () => {
+    const state = baseState();
+    state.questionnaire = {
+      questions: [{
+        number: '1.', text: 'Pick?', isActive: true,
+        options: [{
+          letter: 'A', label: 'Red', isFreeform: false,
+          selectorPath: 'sp-red', actionId: 'act_reused',
+        }],
+      }],
+      activeIndex: 0, totalLabel: '1 of 1',
+      skipSelectorPath: '', continueSelectorPath: '',
+      continueDisabled: true,
+    };
+    fireFullState(env.mockSocket, state);
+    (env.document.querySelector('.questionnaire-option') as HTMLButtonElement).click();
+    const first = lastCommandPayload(env.mockSocket, 'command:click_action');
+
+    env.mockSocket.connected = false;
+    env.mockSocket.fire('disconnect');
+    await Promise.resolve();
+    env.mockSocket.connected = true;
+    env.mockSocket.fire('connect');
+    fireFullState(env.mockSocket, { ...state, questionnaire: null });
+    fireFullState(env.mockSocket, state);
+
+    (env.document.querySelector('.questionnaire-option') as HTMLButtonElement).click();
+    const second = lastCommandPayload(env.mockSocket, 'command:click_action');
+    assert.notEqual(second.operationId, first.operationId);
+    assert.notEqual(second.commandId, first.commandId);
+    settleLastCommand(env.mockSocket);
+    await Promise.resolve();
+  });
+
+  it('disables questionnaire actions while the relay is disconnected', () => {
+    const state = baseState();
+    state.questionnaire = {
+      questions: [{
+        number: '1.', text: 'Pick?', isActive: true,
+        options: [
+          { letter: 'A', label: 'Red', isFreeform: false, selectorPath: 'sp-red', actionId: 'act_a' },
+        ],
+      }],
+      activeIndex: 0, totalLabel: '1 of 1',
+      skipSelectorPath: '', skipActionId: 'act_skip',
+      continueSelectorPath: '', continueActionId: 'act_continue',
+      continueDisabled: false,
+    };
+    fireFullState(env.mockSocket, state);
+    env.mockSocket.connected = false;
+    env.mockSocket.fire('disconnect');
+    const option = env.document.querySelector('.questionnaire-option') as HTMLButtonElement;
+    assert.equal(option.disabled, true);
+    assert.equal((env.document.getElementById('btn-q-continue') as HTMLButtonElement).disabled, true);
+    assert.equal((env.document.getElementById('btn-q-skip') as HTMLButtonElement).disabled, true);
   });
 });
 
@@ -1944,10 +2273,12 @@ describe('web: relay command protocol', () => {
     (env.document.getElementById('btn-send') as HTMLButtonElement).click();
   }
 
-  it('sends a bounded unique operationId on send_message and new_chat while keeping commandId', () => {
+  it('sends a bounded unique operationId on send_message and new_chat while keeping commandId', async () => {
     fireState({ inputAvailable: true });
     const seen = new Set<string>();
     sendComposerText('hello from phone');
+    settleLastCommand(env.mockSocket);
+    await Promise.resolve();
     sendComposerText('second message');
     const sends = commandEmits(env.mockSocket, 'command:send_message');
     assert.equal(sends.length, 2);
@@ -1962,7 +2293,62 @@ describe('web: relay command protocol', () => {
     assertBoundedUniqueOperation(created, seen);
   });
 
-  it('preserves approve vs approve_all and never sends selectorPath', () => {
+  it('uses a new operationId after an explicit server failure, including a server timeout error', async () => {
+    fireState({ inputAvailable: true });
+    sendComposerText('retry after a settled failure');
+    const first = lastCommandPayload(env.mockSocket, 'command:send_message');
+    settleLastCommand(env.mockSocket, false, { error: 'Command timed out in executor' });
+    await Promise.resolve();
+
+    sendComposerText('retry after a settled failure');
+    const second = lastCommandPayload(env.mockSocket, 'command:send_message');
+    assert.notEqual(second.operationId, first.operationId);
+    assert.notEqual(second.commandId, first.commandId);
+    settleLastCommand(env.mockSocket);
+    await Promise.resolve();
+  });
+
+  it('reuses the same operationId when disconnect leaves the result unknown', async () => {
+    fireState({ inputAvailable: true });
+    sendComposerText('retry after disconnect');
+    const first = lastCommandPayload(env.mockSocket, 'command:send_message');
+
+    env.mockSocket.connected = false;
+    env.mockSocket.fire('disconnect');
+    await Promise.resolve();
+    env.mockSocket.connected = true;
+    env.mockSocket.fire('connect');
+    fireState({ inputAvailable: true });
+
+    sendComposerText('retry after disconnect');
+    const second = lastCommandPayload(env.mockSocket, 'command:send_message');
+    assert.equal(second.operationId, first.operationId);
+    assert.equal(second.commandId, first.commandId);
+    settleLastCommand(env.mockSocket);
+    await Promise.resolve();
+  });
+
+  it('uses a late result for an unknown operation instead of binding it to a retry waiter', async () => {
+    fireState({ inputAvailable: true });
+    sendComposerText('late result after disconnect');
+    const first = lastCommandPayload(env.mockSocket, 'command:send_message');
+
+    env.mockSocket.connected = false;
+    env.mockSocket.fire('disconnect');
+    await Promise.resolve();
+    env.mockSocket.fire('command:result', { commandId: first.commandId, ok: true });
+    env.mockSocket.connected = true;
+    env.mockSocket.fire('connect');
+    fireState({ inputAvailable: true });
+    const emitCount = commandEmits(env.mockSocket, 'command:send_message').length;
+
+    sendComposerText('late result after disconnect');
+    await Promise.resolve();
+    assert.equal(commandEmits(env.mockSocket, 'command:send_message').length, emitCount);
+    assert.equal((env.document.getElementById('message-input') as HTMLTextAreaElement).value, '');
+  });
+
+  it('preserves approve vs approve_all and never sends selectorPath', async () => {
     fireState({
       pendingApprovals: [{
         id: 'appr-1',
@@ -1979,6 +2365,8 @@ describe('web: relay command protocol', () => {
     assertBoundedUniqueOperation(approve);
     assert.equal('selectorPath' in approve, false);
     assert.equal(commandEmits(env.mockSocket, 'command:approve_all').length, 0);
+    settleLastCommand(env.mockSocket);
+    await Promise.resolve();
 
     fireState({
       pendingApprovals: [{
@@ -2021,7 +2409,7 @@ describe('web: relay command protocol', () => {
 
     buttons.find((btn) => btn.textContent === 'Skip')!.click();
     assertClickActionPayload(lastCommandPayload(env.mockSocket, 'command:click_action'), {
-      actionId: 'act_skip', actionType: 'skip',
+      actionId: 'act_skip', actionType: 'skip', dangerous: true,
     });
 
     buttons.find((btn) => btn.textContent === 'Allowlist example.com')!.click();
@@ -2077,7 +2465,27 @@ describe('web: relay command protocol', () => {
     assert.equal(commandEmits(env.mockSocket).length, 0);
   });
 
-  it('emits exact build/continue/questionnaire_option types and disables unauthorized options', () => {
+  it('emits exact build/continue/questionnaire_option types and disables unauthorized options', async () => {
+    const questionnaire: NonNullable<CursorState['questionnaire']> = {
+      questions: [
+        {
+          number: '1.',
+          text: 'Pick a color?',
+          isActive: true,
+          options: [
+            { letter: 'A', label: 'Red', isFreeform: false, selectorPath: 'secret-red', actionId: 'act_opt_a' },
+            { letter: 'B', label: 'Blue', isFreeform: false, selectorPath: 'secret-blue' },
+          ],
+        },
+      ],
+      activeIndex: 0,
+      totalLabel: '1 of 1',
+      skipSelectorPath: 'secret-q-skip',
+      skipActionId: 'act_q_skip',
+      continueSelectorPath: 'secret-q-continue',
+      continueActionId: 'act_q_continue',
+      continueDisabled: false,
+    };
     fireState({
       messages: [{
         type: 'plan',
@@ -2095,26 +2503,7 @@ describe('web: relay command protocol', () => {
           { label: 'Build', type: 'build', selectorPath: 'secret-build', actionId: 'act_build' },
         ],
       }],
-      questionnaire: {
-        questions: [
-          {
-            number: '1.',
-            text: 'Pick a color?',
-            isActive: true,
-            options: [
-              { letter: 'A', label: 'Red', isFreeform: false, selectorPath: 'secret-red', actionId: 'act_opt_a' },
-              { letter: 'B', label: 'Blue', isFreeform: false, selectorPath: 'secret-blue' },
-            ],
-          },
-        ],
-        activeIndex: 0,
-        totalLabel: '1 of 1',
-        skipSelectorPath: 'secret-q-skip',
-        skipActionId: 'act_q_skip',
-        continueSelectorPath: 'secret-q-continue',
-        continueActionId: 'act_q_continue',
-        continueDisabled: false,
-      },
+      questionnaire,
     });
 
     const buildBtn = env.document.querySelector('.plan-btn-build') as HTMLButtonElement;
@@ -2134,14 +2523,22 @@ describe('web: relay command protocol', () => {
     assert.equal(commandEmits(env.mockSocket, 'command:click_action').length, 0);
     optionButtons[0].click();
     assertClickActionPayload(lastCommandPayload(env.mockSocket, 'command:click_action'), {
-      actionId: 'act_opt_a', actionType: 'questionnaire_option',
+      actionId: 'act_opt_a', actionType: 'questionnaire_option', dangerous: true,
     });
+    settleLastCommand(env.mockSocket);
+    await Promise.resolve();
+    assert.equal((env.document.getElementById('btn-q-skip') as HTMLButtonElement).disabled, true);
+    firePatch(env.mockSocket, { questionnaire });
 
     env.mockSocket.emitted.length = 0;
     (env.document.getElementById('btn-q-skip') as HTMLButtonElement).click();
     assertClickActionPayload(lastCommandPayload(env.mockSocket, 'command:click_action'), {
-      actionId: 'act_q_skip', actionType: 'skip',
+      actionId: 'act_q_skip', actionType: 'skip', dangerous: true,
     });
+    settleLastCommand(env.mockSocket);
+    await Promise.resolve();
+    assert.equal((env.document.getElementById('btn-q-continue') as HTMLButtonElement).disabled, true);
+    firePatch(env.mockSocket, { questionnaire });
 
     env.mockSocket.emitted.length = 0;
     (env.document.getElementById('btn-q-continue') as HTMLButtonElement).click();
@@ -2244,5 +2641,51 @@ describe('web: relay command protocol', () => {
     assert.equal(buildBtn.disabled, true);
     buildBtn.click();
     assert.equal(commandEmits(env.mockSocket, 'command:click_action').length, 0);
+  });
+});
+
+describe('web: thought and tool summaries', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  it('shows thinking detail even when a duration is present', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [{
+        type: 'thought',
+        id: 'th1',
+        flatIndex: 0,
+        duration: '4s',
+        action: 'Reading',
+        detail: 'src/server/relay.ts',
+        thoughtKind: 'thinking_step',
+      }],
+    });
+    const line = env.document.querySelector('.el-thought .thought-line');
+    assert.ok(line);
+    assert.match(line.textContent || '', /Reading/);
+    assert.match(line.textContent || '', /src\/server\/relay\.ts/);
+    assert.match(line.textContent || '', /4s/);
+  });
+
+  it('shows tool type together with the extracted summary', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [{
+        type: 'tool',
+        id: 'tool1',
+        flatIndex: 0,
+        toolCallId: 'tc1',
+        status: 'completed',
+        action: 'Read',
+        details: 'src/server/dom-extractor.ts',
+      }],
+    });
+    const el = env.document.querySelector('.el-tool')!;
+    assert.match(el.textContent || '', /Read/);
+    assert.match(el.textContent || '', /src\/server\/dom-extractor\.ts/);
   });
 });
