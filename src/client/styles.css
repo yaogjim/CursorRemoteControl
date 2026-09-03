@@ -252,6 +252,38 @@ header {
   display: none;
 }
 
+.header-right[data-status="idle"] #agent-status-text {
+  color: var(--text-tertiary);
+}
+
+.agent-status-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  min-width: 0;
+  line-height: 1.15;
+}
+
+#agent-status-detail {
+  max-width: min(200px, 45vw);
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.header-right[data-live="1"] #agent-status-icon::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 4px;
+  border-radius: 50%;
+  background: var(--accent-yellow);
+  vertical-align: middle;
+}
+
 .header-end {
   display: flex;
   align-items: center;
@@ -836,16 +868,21 @@ header {
 
 .tool-line {
   display: flex;
-  align-items: center;
-  gap: 5px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
   padding: 2px 8px;
   border-radius: 4px;
   font-size: 12px;
   font-family: var(--font-mono);
   color: var(--text-secondary);
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+}
+
+.tool-header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
 }
 
 .tool-line.completed .tool-icon { color: var(--text-tertiary); }
@@ -872,12 +909,6 @@ header {
   flex-shrink: 0;
 }
 
-.tool-details {
-  color: var(--text-tertiary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .tool-file-info {
   display: flex;
   align-items: center;
@@ -888,19 +919,28 @@ header {
 }
 
 .tool-filename {
-  color: var(--text-secondary);
-  max-width: 140px;
+  min-width: 0;
   overflow: hidden;
+  color: var(--text-secondary);
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tool-additions { color: var(--accent-green); }
 .tool-deletions { color: var(--accent-red); }
 
-.tool-summary {
-  color: var(--text-tertiary);
+.tool-summary-row {
+  display: -webkit-box;
+  margin-left: 19px;
+  padding-left: 8px;
   overflow: hidden;
-  text-overflow: ellipsis;
+  border-left: 2px solid var(--accent-soft-border);
+  color: var(--text-tertiary);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 /* --- Thought block --- */
@@ -955,6 +995,27 @@ header {
   font-size: 13px;
   font-weight: 600;
   color: var(--text-primary);
+}
+
+.plan-state {
+  align-self: flex-start;
+  padding: 1px 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.plan-state-ready,
+.plan-state-executing {
+  border-color: var(--accent-soft-border);
+  background: var(--accent-soft);
+  color: var(--accent-blue);
+}
+
+.plan-state-completed {
+  color: var(--accent-green);
 }
 
 .plan-description {
@@ -1249,6 +1310,16 @@ header {
 .plan-modal-body {
   overflow-y: auto;
   padding: 16px;
+}
+
+.plan-modal-status {
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.plan-modal-status-error {
+  color: var(--accent-red);
 }
 
 /* --- Composer queue strip --- */
@@ -1785,6 +1856,73 @@ header {
 }
 
 .context-bar.hidden { display: none; }
+
+.session-plans-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg-primary);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.session-plans-bar.hidden { display: none; }
+
+.session-plans-label {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.session-plans-items {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.session-plan-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  max-width: 220px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--accent-soft-border);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.session-plan-chip-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-plan-chip-status {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+  font-size: 9px;
+  font-weight: 500;
+}
+
+.session-plan-chip:focus {
+  outline: none;
+  border-color: var(--focus-border);
+}
 
 .context-main {
   display: flex;

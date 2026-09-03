@@ -217,6 +217,7 @@
   const notifiedMessageIds = new Set();
   const notifiedKeys = new Set();
   let activePlanModal = null;
+  let messagesSessionIdentity = '';
   let activePlanModelContext = null;
   const pendingCommandResults = new Map();
   const lateCommandResults = new Map();
@@ -245,6 +246,7 @@
   const $connText = document.getElementById('connection-text');
   const $statusIcon = document.getElementById('agent-status-icon');
   const $statusText = document.getElementById('agent-status-text');
+  const $statusDetail = document.getElementById('agent-status-detail');
   const $headerRight = document.querySelector('#header .header-right');
   const $approvalBar = document.getElementById('approval-bar');
   const $approvalDesc = document.getElementById('approval-desc');
@@ -741,6 +743,7 @@
 
   function refreshInteractiveUi() {
     renderConnectionStatus();
+    renderAgentStatus();
     renderInputState();
     renderMessages();
     renderApprovals();
@@ -812,6 +815,7 @@
     if (!startupTiming.stateFullAt) startupTiming.stateFullAt = startupNow();
     reconcileQuestionnaireEnvelopes(newState?.questionnaire ?? null, state.questionnaire);
     state = { ...defaultState, ...newState };
+    messagesSessionIdentity = currentPlanSessionIdentity();
     renderAll();
     if (!startupTiming.firstRenderAt) {
       startupTiming.firstRenderAt = startupNow();
@@ -822,6 +826,9 @@
   socket.on('state:patch', (patch) => {
     const prevQuestionnaire = state.questionnaire;
     Object.assign(state, patch);
+    if (hasPatchKey(patch, 'messages')) {
+      messagesSessionIdentity = currentPlanSessionIdentity();
+    }
     if (hasPatchKey(patch, 'questionnaire')) {
       stabilizeQuestionnairePatch(patch.questionnaire, prevQuestionnaire);
     }
@@ -1233,6 +1240,7 @@
     renderAgentStatus();
     renderComposerQueue();
     renderWindowsAndSessions();
+    renderSessionPlans();
     renderMessages();
     renderApprovals();
     renderQuestionnaire();
@@ -1266,6 +1274,8 @@
       if (!has('messages')) renderMessages();
     }
     if (
+      has('connected') ||
+      has('extractorStatus') ||
       has('agentStatus') ||
       has('agentActivityText') ||
       has('agentActivityLive') ||
@@ -1283,11 +1293,20 @@
       renderCapabilityDiagnostics();
       renderConnectionStatus();
     }
-    if (has('messages')) renderMessages();
+    if (has('messages') || has('activeComposerId') || has('activeWindowId')) {
+      if (has('messages')) renderMessages();
+      renderSessionPlans();
+    }
     if (has('pendingApprovals')) renderApprovals();
     if (has('questionnaire')) renderQuestionnaire();
     if (has('mode') || has('model')) renderModeModel();
-    if (has('messages') || has('mode') || has('model')) syncPlanModalFromState();
+    if (
+      has('messages') ||
+      has('activeComposerId') ||
+      has('activeWindowId') ||
+      has('mode') ||
+      has('model')
+    ) syncPlanModalFromState();
   }
 
   function questionnaireIsPresent(q) {
@@ -1527,38 +1546,62 @@
   }
 
   function renderAgentStatus() {
-    const icons = {
-      idle: '',
-      thinking: '',
-      generating: '',
-      running_tool: '',
-      waiting_approval: '!',
-      error: '\u2715',
-    };
-    const labels = {
-      idle: 'Idle', thinking: 'Thinking...', generating: 'Generating...',
-      running_tool: 'Running tool...', waiting_approval: 'Needs approval', error: 'Error',
-    };
-    $statusIcon.textContent = icons[state.agentStatus] || '';
+    const connectionUi = getConnectionUiState();
+    const statusFresh = connectionUi.layer === 'ok';
     const activity = (state.agentActivityText || '').trim();
     const activityLive = !!state.agentActivityLive;
-    const baseLabel = labels[state.agentStatus] || state.agentStatus;
-    if ($headerRight) {
-      if (state.agentStatus !== 'idle') $headerRight.classList.remove('header-right-hidden');
-      else $headerRight.classList.add('header-right-hidden');
-    }
-    if (activityLive && activity && state.agentStatus !== 'idle') {
-      const max = 56;
-      $statusText.textContent = activity.length > max ? activity.slice(0, max - 1) + '…' : activity;
-      $statusText.classList.add('agent-status-shimmer');
-    } else {
-      $statusText.textContent = baseLabel;
-      $statusText.classList.remove('agent-status-shimmer');
+    let primary = 'Idle';
+    let detail = '';
+    let tone = '';
+    let icon = '';
+
+    if (!statusFresh) {
+      if (connectionUi.layer === 'extractor' && state.extractorStatus === 'stale') {
+        primary = 'Status may be stale';
+      } else {
+        primary = 'Syncing state';
+      }
+      detail = connectionUi.label;
+    } else if (state.agentStatus === 'waiting_approval') {
+      primary = 'Needs approval';
+      tone = 'var(--accent-yellow)';
+      icon = '!';
+    } else if (state.agentStatus === 'error') {
+      primary = 'Execution error';
+      tone = 'var(--accent-red)';
+      icon = '\u2715';
+    } else if (activityLive) {
+      primary = 'Running';
+      detail = activity || (
+        state.agentStatus === 'running_tool'
+          ? 'Running tool'
+          : state.agentStatus === 'generating'
+            ? 'Generating'
+            : 'Thinking'
+      );
+    } else if (state.agentStatus !== 'idle') {
+      primary = state.agentStatus === 'running_tool'
+        ? 'Running'
+        : state.agentStatus === 'generating'
+          ? 'Generating'
+          : 'Thinking';
     }
 
-    if (state.agentStatus === 'waiting_approval') $statusText.style.color = 'var(--accent-yellow)';
-    else if (state.agentStatus === 'error') $statusText.style.color = 'var(--accent-red)';
-    else $statusText.style.color = '';
+    $statusIcon.textContent = icon;
+    $statusText.textContent = primary;
+    $statusText.style.color = tone;
+    $statusText.classList.toggle('agent-status-shimmer', statusFresh && activityLive);
+    if ($statusDetail) {
+      const max = 56;
+      $statusDetail.textContent = detail.length > max ? detail.slice(0, max - 1) + '…' : detail;
+      $statusDetail.hidden = !detail;
+      $statusDetail.title = detail;
+    }
+    if ($headerRight) {
+      $headerRight.classList.remove('header-right-hidden');
+      $headerRight.dataset.status = statusFresh ? (state.agentStatus || 'idle') : 'stale';
+      $headerRight.dataset.live = statusFresh && activityLive ? '1' : '0';
+    }
   }
 
   function renderComposerQueue() {
@@ -1588,6 +1631,65 @@
       row.appendChild(dot);
       row.appendChild(tx);
       itemsEl.appendChild(row);
+    });
+  }
+
+  function planDisplayStatus(plan) {
+    const todos = Array.isArray(plan.todos) ? plan.todos : [];
+    if (todos.some((todo) => todo && todo.status === 'in_progress')) return 'Executing';
+    if (plan.todosTotal > 0 && plan.todosCompleted >= plan.todosTotal) return 'Completed';
+    const actions = Array.isArray(plan.actions) ? plan.actions : [];
+    if (actions.some((action) => action && (action.type === 'build' || action.type === 'view_plan'))) {
+      return 'Ready';
+    }
+    return 'Available';
+  }
+
+  function sessionPlanMessages() {
+    if (messagesSessionIdentity !== currentPlanSessionIdentity()) return [];
+    const plans = [];
+    const indices = new Map();
+    for (const msg of state.messages || []) {
+      if (!msg || msg.type !== 'plan') continue;
+      const label = (msg.label || '').trim();
+      const key = label || msg.id;
+      if (indices.has(key)) {
+        plans[indices.get(key)] = msg;
+      } else {
+        indices.set(key, plans.length);
+        plans.push(msg);
+      }
+    }
+    return plans;
+  }
+
+  function renderSessionPlans() {
+    const bar = document.getElementById('session-plans-bar');
+    const itemsEl = document.getElementById('session-plans-items');
+    if (!bar || !itemsEl) return;
+    const plans = sessionPlanMessages();
+    if (plans.length === 0) {
+      bar.classList.add('hidden');
+      itemsEl.innerHTML = '';
+      return;
+    }
+    bar.classList.remove('hidden');
+    itemsEl.innerHTML = '';
+    plans.forEach((plan) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'session-plan-chip';
+      const title = document.createElement('span');
+      title.className = 'session-plan-chip-title';
+      title.textContent = plan.title || plan.label || 'Plan';
+      const status = document.createElement('span');
+      status.className = 'session-plan-chip-status';
+      status.textContent = planDisplayStatus(plan);
+      btn.appendChild(title);
+      btn.appendChild(status);
+      btn.setAttribute('aria-label', `${title.textContent}: ${status.textContent}`);
+      btn.addEventListener('click', () => openPlanModal(plan));
+      itemsEl.appendChild(btn);
     });
   }
 
@@ -1926,6 +2028,26 @@
 
   // --- Tool call ---
 
+  function toolDistinctSummary(msg) {
+    const action = (msg.action || '').trim();
+    const filename = (msg.filename || '').trim();
+    const details = (msg.details || '').trim();
+    const summary = (msg.summaryText || '').trim();
+    const texts = [];
+    if (details) texts.push(details);
+    if (summary && summary !== details) texts.push(summary);
+    for (const text of texts) {
+      if (!text) continue;
+      if (action && text === action) continue;
+      if (filename && (text === filename || text === `${action} ${filename}`.trim())) continue;
+      let rest = text;
+      if (action && rest.startsWith(action + ' ')) rest = rest.slice(action.length).trim();
+      if (filename && rest === filename) continue;
+      if (rest) return rest;
+    }
+    return '';
+  }
+
   function createToolEl(msg) {
     const el = document.createElement('div');
     el.className = 'chat-el el-tool';
@@ -1934,35 +2056,31 @@
     const line = document.createElement('div');
     line.className = 'tool-line ' + msg.status;
 
+    const header = document.createElement('div');
+    header.className = 'tool-header';
+
     const icon = document.createElement('span');
     icon.className = 'tool-icon';
     icon.textContent = msg.status === 'completed' ? '\u2713' : '\u2022';
-    line.appendChild(icon);
+    header.appendChild(icon);
 
-    if (msg.action) {
-      const action = document.createElement('span');
-      action.className = 'tool-action';
-      action.textContent = msg.action;
-      line.appendChild(action);
-    }
-    const summary = (msg.details || msg.summaryText || '').trim();
-    if (summary && summary !== (msg.action || '').trim()) {
-      const details = document.createElement('span');
-      details.className = msg.details ? 'tool-details' : 'tool-summary';
-      details.textContent = summary;
-      line.appendChild(details);
+    const action = document.createElement('span');
+    action.className = 'tool-action';
+    action.textContent = msg.action || 'Tool';
+    header.appendChild(action);
+
+    const filename = (msg.filename || '').trim();
+    if (filename) {
+      const fn = document.createElement('span');
+      fn.className = 'tool-filename';
+      fn.textContent = filename;
+      fn.title = filename;
+      header.appendChild(fn);
     }
 
-    if (msg.filename || msg.additions != null || msg.deletions != null) {
+    if (msg.additions != null || msg.deletions != null) {
       const fileInfo = document.createElement('span');
       fileInfo.className = 'tool-file-info';
-
-      if (msg.filename) {
-        const fn = document.createElement('span');
-        fn.className = 'tool-filename';
-        fn.textContent = msg.filename;
-        fileInfo.appendChild(fn);
-      }
       if (msg.additions != null) {
         const add = document.createElement('span');
         add.className = 'tool-additions';
@@ -1975,8 +2093,17 @@
         del.textContent = '-' + msg.deletions;
         fileInfo.appendChild(del);
       }
+      header.appendChild(fileInfo);
+    }
+    line.appendChild(header);
 
-      line.appendChild(fileInfo);
+    const summary = toolDistinctSummary(msg);
+    if (summary) {
+      const body = document.createElement('div');
+      body.className = 'tool-summary-row';
+      body.textContent = summary;
+      body.title = summary;
+      line.appendChild(body);
     }
 
     el.appendChild(line);
@@ -2180,17 +2307,50 @@
     return content;
   }
 
+  function looksLikePlanFileLabel(label) {
+    return typeof label === 'string' && /\.md$/i.test(label.trim());
+  }
+
+  function currentPlanSessionIdentity() {
+    return `${state.activeWindowId || ''}\n${state.activeComposerId || ''}`;
+  }
+
+  function planModalIdentity(msg) {
+    return `${currentPlanSessionIdentity()}\n${msg.id || ''}\n${(msg.label || '').trim()}`;
+  }
+
   function buildPlanModalContent(msg, planData) {
-    if (planData) return buildPlanFullContent(planData);
+    const wrap = document.createElement('div');
+    if (planData) {
+      wrap.appendChild(buildPlanFullContent(planData));
+      return wrap;
+    }
+    if (activePlanModal && activePlanModal.loading) {
+      const loading = document.createElement('div');
+      loading.className = 'plan-modal-status';
+      loading.textContent = 'Loading plan file…';
+      wrap.appendChild(loading);
+    } else if (activePlanModal && activePlanModal.error) {
+      const err = document.createElement('div');
+      err.className = 'plan-modal-status plan-modal-status-error';
+      err.textContent = `${activePlanModal.error}. Showing the available session summary.`;
+      wrap.appendChild(err);
+    } else {
+      const fallback = document.createElement('div');
+      fallback.className = 'plan-modal-status';
+      fallback.textContent = 'Showing the available session summary.';
+      wrap.appendChild(fallback);
+    }
     const modalMsg = {
       ...msg,
       actions: Array.isArray(msg.actions)
         ? msg.actions.filter((action) => action.type !== 'view_plan')
         : msg.actions,
     };
-    const content = buildPlanCard(modalMsg);
+    const content = buildPlanCard(modalMsg, { hideView: true });
     content.classList.add('plan-card-modal');
-    return content;
+    wrap.appendChild(content);
+    return wrap;
   }
 
   function renderPlanModal(msg) {
@@ -2203,22 +2363,43 @@
   }
 
   async function loadFullPlanIntoModal(msg) {
-    if (!msg.label || !activePlanModal || activePlanModal.id !== msg.id) return;
+    const identity = planModalIdentity(msg);
+    if (!looksLikePlanFileLabel(msg.label) || !activePlanModal || activePlanModal.identity !== identity) return;
     activePlanModal.loading = true;
+    activePlanModal.attempted = true;
+    activePlanModal.error = '';
+    renderPlanModal(msg);
     const result = await sendCommandAwaitResult('command:get_plan_full', {
       commandId: newCommandId(),
       type: 'get_plan_full',
-      planLabel: msg.label,
+      planId: msg.id,
     });
-    if (!activePlanModal || activePlanModal.id !== msg.id) return;
+    if (!activePlanModal || activePlanModal.identity !== identity) return;
     activePlanModal.loading = false;
-    if (!result.ok || !result.data) return;
+    if (!result.ok || !result.data) {
+      activePlanModal.attempted = !result.outcomeUnknown;
+      if (looksLikePlanFileLabel(msg.label)) {
+        activePlanModal.error = result.error || 'Plan file not found';
+      }
+      renderPlanModal(msg);
+      return;
+    }
     activePlanModal.fullData = result.data;
+    activePlanModal.error = '';
     renderPlanModal(msg);
   }
 
   function openPlanModal(msg) {
-    activePlanModal = { id: msg.id, label: msg.label || '', fullData: null, loading: false };
+    activePlanModal = {
+      id: msg.id,
+      identity: planModalIdentity(msg),
+      sessionIdentity: currentPlanSessionIdentity(),
+      label: msg.label || '',
+      fullData: null,
+      loading: false,
+      attempted: false,
+      error: '',
+    };
     renderPlanModal(msg);
     $planModalOverlay.classList.remove('hidden');
     loadFullPlanIntoModal(msg);
@@ -2231,12 +2412,33 @@
 
   function syncPlanModalFromState() {
     if (!activePlanModal) return;
+    if (activePlanModal.sessionIdentity !== currentPlanSessionIdentity()) {
+      closePlanModal();
+      return;
+    }
     const current = (state.messages || []).find((msg) => msg.type === 'plan' && msg.id === activePlanModal.id);
-    if (current) {
-      renderPlanModal(current);
-      if (current.label && !activePlanModal.fullData && !activePlanModal.loading) {
-        loadFullPlanIntoModal(current);
-      }
+    if (!current) {
+      closePlanModal();
+      return;
+    }
+
+    const nextIdentity = planModalIdentity(current);
+    if (nextIdentity !== activePlanModal.identity) {
+      activePlanModal.identity = nextIdentity;
+      activePlanModal.label = current.label || '';
+      activePlanModal.fullData = null;
+      activePlanModal.loading = false;
+      activePlanModal.attempted = false;
+      activePlanModal.error = '';
+    }
+    renderPlanModal(current);
+    if (
+      looksLikePlanFileLabel(current.label) &&
+      !activePlanModal.fullData &&
+      !activePlanModal.loading &&
+      !activePlanModal.attempted
+    ) {
+      loadFullPlanIntoModal(current);
     }
   }
 
@@ -2268,7 +2470,8 @@
     openSheet('plan-model');
   }
 
-  function buildPlanCard(msg) {
+  function buildPlanCard(msg, opts) {
+    const hideView = !!(opts && opts.hideView);
     const card = document.createElement('div');
     card.className = 'plan-card plan-card-widget';
 
@@ -2291,6 +2494,11 @@
     title.className = 'plan-title';
     title.textContent = msg.title;
     card.appendChild(title);
+
+    const status = document.createElement('div');
+    status.className = 'plan-state plan-state-' + planDisplayStatus(msg).toLowerCase();
+    status.textContent = planDisplayStatus(msg);
+    card.appendChild(status);
 
     if (msg.descriptionHtml) {
       const desc = document.createElement('div');
@@ -2348,23 +2556,22 @@
       card.appendChild(progress);
     }
 
-    const hasActions = (msg.actions && msg.actions.length > 0) || hasOpaqueActionId(msg.modelActionId) || msg.model;
+    const canBrowsePlan = !hideView && !!(msg.title || msg.label || msg.description || (msg.todos && msg.todos.length));
+    const hasActions = canBrowsePlan || (msg.actions && msg.actions.length > 0) || hasOpaqueActionId(msg.modelActionId) || msg.model;
     if (hasActions) {
       const toolbar = document.createElement('div');
       toolbar.className = 'plan-actions-toolbar';
 
       const left = document.createElement('div');
       left.className = 'plan-actions-left';
-      if (msg.actions) {
-        const viewAct = msg.actions.find((a) => a.type === 'view_plan');
-        if (viewAct) {
-          const btn = document.createElement('button');
-          btn.type = 'button';
-          btn.className = 'plan-btn plan-btn-view';
-          btn.textContent = viewAct.label || 'View Plan';
-          btn.addEventListener('click', () => openPlanModal(msg));
-          left.appendChild(btn);
-        }
+      const viewAct = msg.actions && msg.actions.find((a) => a.type === 'view_plan');
+      if (canBrowsePlan) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'plan-btn plan-btn-view';
+        btn.textContent = (viewAct && viewAct.label) || 'View Plan';
+        btn.addEventListener('click', () => openPlanModal(msg));
+        left.appendChild(btn);
       }
       toolbar.appendChild(left);
 

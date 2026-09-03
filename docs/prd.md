@@ -235,6 +235,12 @@ WSL2 仍然是受支持的部署（中继在 WSL2，Cursor 在 Windows）；macO
 
 以下之一：`idle`、`thinking`、`generating`、`running_tool`、`waiting_approval`、`error`
 
+Web 页头始终展示该状态：空闲为 `Idle`（任务已停止/未在跑），进行中为实时活动文案（Thinking / Running / Generating），需要确认为 `Needs approval`，异常为 `Error`。本轮不提供停止按钮。
+
+Web 工具卡为双层：第一行是工具名和短统计（+/-），可见摘要与文件名放在下方缩进，避免窄屏被同一 nowrap 行挤掉。摘要只来自已显示的标题/header/preview，不抓 thinking 正文。
+
+当前会话中的 plan 卡片和页头下的 Plans 条可打开计划；若 `label` 像计划文件名（`.md`），客户端会通过 `get_plan_full` 发送不透明的 `planId`。中继只从当前 `CursorState.messages` 中匹配该 ID 并取服务端已观察到的 `label`，再读取 `~/.cursor/plans` 下的普通非符号链接文件；不信任客户端文件名，也不做历史计划浏览器。
+
 ### 4.3 ChatElement（带判别的联合）
 
 聊天中的每个元素是八种类型之一，由 `type` 字段标识：`human`、`assistant`、`tool`、`thought`、`plan`、`todo_list`、`run_command`、`loading`。

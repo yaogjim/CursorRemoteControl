@@ -40,9 +40,12 @@
         <span id="connection-text">Connecting...</span>
       </div>
       <div class="header-end">
-        <div class="header-right">
+        <div class="header-right" aria-live="polite">
           <span id="agent-status-icon"></span>
-          <span id="agent-status-text">Idle</span>
+          <span class="agent-status-copy">
+            <span id="agent-status-text">Idle</span>
+            <span id="agent-status-detail" hidden></span>
+          </span>
         </div>
         <label class="theme-control">
           <span class="visually-hidden">Color theme</span>
@@ -73,6 +76,11 @@
       </button>
       <button id="btn-new-chat" class="context-new-btn" aria-label="New Chat">+</button>
     </nav>
+
+    <div id="session-plans-bar" class="session-plans-bar hidden" aria-label="Plans in this session">
+      <span class="session-plans-label">Plans</span>
+      <div id="session-plans-items" class="session-plans-items"></div>
+    </div>
 
     <div id="drawer-overlay" class="drawer-overlay hidden"></div>
     <div id="drawer" class="drawer hidden">

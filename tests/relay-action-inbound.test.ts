@@ -9,13 +9,14 @@ import {
   OPERATION_ID_RE,
   SOCKET_DANGEROUS_RATE_MAX,
   SOCKET_MAX_HTTP_BUFFER_SIZE,
+  currentPlanLabel,
   isValidActionType,
   socketCommandRequiresOperationId,
 } from '../src/server/relay.js';
 import { StateManager } from '../src/server/state-manager.js';
 import type { CommandExecutor } from '../src/server/command-executor.js';
 import type { CDPBridge } from '../src/server/cdp-bridge.js';
-import type { CommandResult, ServerConfig } from '../src/server/types.js';
+import type { CommandResult, CursorState, ServerConfig } from '../src/server/types.js';
 
 const RECORD_SEP = '\x1e';
 
@@ -191,6 +192,39 @@ async function emitCommand(
   return result;
 }
 
+function stateWithPlan(id = 'plan-current', label = 'current_plan.plan.md'): CursorState {
+  return {
+    connected: true,
+    extractorStatus: 'ok',
+    lastExtractionAt: Date.now(),
+    consecutiveExtractionFailures: 0,
+    lastExtractionError: null,
+    agentStatus: 'idle',
+    agentActivityText: null,
+    agentActivityLive: false,
+    agentActivitySource: 'none',
+    messages: [{
+      type: 'plan',
+      id,
+      flatIndex: 0,
+      label,
+      title: 'Current plan',
+      todosCompleted: 0,
+      todosTotal: 0,
+    }],
+    pendingApprovals: [],
+    inputAvailable: true,
+    chatTabs: [],
+    activeComposerId: 'composer-current',
+    mode: { current: 'agent', available: [] },
+    model: { current: 'Auto', currentId: '' },
+    windows: [],
+    activeWindowId: 'target-a',
+    composerQueue: { items: [] },
+    questionnaire: null,
+  };
+}
+
 describe('socket inbound protocol helpers', () => {
   it('validates actionType with the ActionRegistry shape', () => {
     assert.equal(isValidActionType('approve_all'), true);
@@ -215,6 +249,13 @@ describe('socket inbound protocol helpers', () => {
     assert.equal(OPERATION_ID_RE.test('op-click-01'), true);
     assert.equal(OPERATION_ID_RE.test('short'), false);
   });
+
+  it('resolves plan labels only from the current state', () => {
+    const state = stateWithPlan();
+    assert.equal(currentPlanLabel(state, 'plan-current'), 'current_plan.plan.md');
+    assert.equal(currentPlanLabel(state, 'plan-forged'), null);
+    assert.equal(currentPlanLabel(state, '../current_plan.plan.md'), null);
+  });
 });
 
 describe('Relay inbound action protocol', () => {
@@ -233,8 +274,12 @@ describe('Relay inbound action protocol', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  async function startRelay(calls: ExecutorCall[], execOpts?: { gate?: Promise<void> }): Promise<{ relay: Relay; origin: string }> {
-    const relay = new Relay(config(dir), new StateManager(0), mockExecutor(calls, execOpts), fakeBridge());
+  async function startRelay(
+    calls: ExecutorCall[],
+    execOpts?: { gate?: Promise<void> },
+    stateManager: StateManager = new StateManager(0),
+  ): Promise<{ relay: Relay; origin: string }> {
+    const relay = new Relay(config(dir), stateManager, mockExecutor(calls, execOpts), fakeBridge());
     relays.push(relay);
     await relay.start();
     return { relay, origin: `http://127.0.0.1:${relay.port}` };
@@ -278,6 +323,31 @@ describe('Relay inbound action protocol', () => {
     assert.equal(selectorOnly.commandId, 'cmd-selector');
     assert.equal(selectorOnly.ok, false);
     assert.equal(calls.length, 0);
+  });
+
+  it('rejects get_plan_full unless planId exists in current session state', async () => {
+    const calls: ExecutorCall[] = [];
+    const stateManager = new StateManager(0);
+    stateManager.onConnectionChanged(true);
+    stateManager.onExtraction(stateWithPlan('plan-current', 'definitely-missing-current.plan.md'));
+    const { origin } = await startRelay(calls, undefined, stateManager);
+    const { sid } = await connectSocket(origin);
+
+    const forged = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-plan-forged',
+      planId: 'plan-forged',
+      planLabel: 'definitely-missing-current.plan.md',
+    });
+    assert.equal(forged.ok, false);
+    assert.match(forged.error ?? '', /current session/);
+
+    const current = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-plan-current',
+      planId: 'plan-current',
+      planLabel: '../ignored-client-label.md',
+    });
+    assert.equal(current.ok, false);
+    assert.match(current.error ?? '', /not found|could not be read/);
   });
 
   it('forwards click_action with actionId and validated actionType', async () => {

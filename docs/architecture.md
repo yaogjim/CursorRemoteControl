@@ -198,7 +198,7 @@ Cursor IDE  ←──CDP──→  Relay Server  ←──socket.io──→  Ph
 | `set_mode(modeId)` | 对 mode 下拉触发器 JS `.click()`，再对目标 mode 项 `.click()`。 |
 | `set_model(modelId)` | 对 model 下拉触发器 JS `.click()`，再对目标 model 项 `.click()`。选择后验证菜单关闭。选项 ID 来自现场菜单（`getModelOptions`），不是硬编码列表。 |
 | `get_model_options()` | 打开 composer 模型菜单，刮取行，返回 `{ id, label, selected }[]`。 |
-| `get_plan_full` / `get_plan_model_options` / `set_plan_model` | 读取保存的计划文件、刮取计划作用域模型菜单、把所选计划模型应用回 Cursor。 |
+| `get_plan_full(planId)` / `get_plan_model_options` / `set_plan_model` | `get_plan_full` 只接受当前 `CursorState.messages` 中 plan 的不透明 ID，中继从当前状态解析文件名并读取 `~/.cursor/plans` 下有界的普通非符号链接文件；其余命令刮取计划作用域模型菜单并把所选计划模型应用回 Cursor。 |
 | `click_action(selectorPath)` | 通用操作按钮点击。Evaluate 以滚入视图 + JS `.click()`。用于带 `selectorPath` 提取的 Run、Skip、Allow、Build、View Plan 和问卷按钮。 |
 
 **为什么用 CDP Input 域输入文本**：Cursor 的聊天 composer 使用 ProseMirror/TipTap。DOM 级方法（`document.execCommand`、`element.value=`）会绕过 ProseMirror 的内部状态模型。CDP 的 `Input.insertText` 和 `Input.dispatchKeyEvent` 走 Chromium 原生输入管道，ProseMirror 通过 `beforeinput`/`input` 事件处理程序正确处理。
@@ -513,7 +513,7 @@ legacy 计划格式（`.plan-execution-message-content`）有不同的 DOM 结�
 
 所有工具类型 — 包括 Fetch、Edit review、终端命令，以及未来任何 Cursor 工具 widget — 共享同一按钮约定：Skip 用 `.composer-skip-button`，Run/Allow/Accept 用 `.composer-run-button` / `.anysphere-secondary-button`。`dom-extractor.ts` 中的 `extractToolActions(container)` 辅助函数通用地扫描任意工具容器中的这些按钮，并把它们分类为 `skip`、`run` 或 `allow`。这避免了按工具类型编写按钮提取代码，并确保新工具类型自动在 Telegram 和 Web 应用中露出其审批操作。
 
-紧凑工具路径（`.composer-tool-former-message`）针对 `.composer-tool-call-header-content` 取操作/详情文本，以免把按钮标签当成内容。
+紧凑工具路径（`.composer-tool-former-message`）从 header 叶子文本、truncate 预览和 title/aria-label 取操作/详情，不读取 thinking 正文。
 
 ### 6.9 浏览器通知
 

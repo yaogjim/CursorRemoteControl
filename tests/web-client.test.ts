@@ -397,11 +397,13 @@ describe('web: agent status', () => {
     assert.match(text.textContent!, /Idle/i);
   });
 
-  it('shows thinking label when shimmer active', () => {
+  it('shows a running state plus visible activity when shimmer is active', () => {
     const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
     fireFullState(env.mockSocket, fixture[1].state!);
     const text = env.document.getElementById('agent-status-text')!;
-    assert.match(text.textContent!, /Planning next moves/i);
+    const detail = env.document.getElementById('agent-status-detail')!;
+    assert.match(text.textContent!, /Running/i);
+    assert.match(detail.textContent!, /Planning next moves/i);
   });
 
   it('clears activity when shimmer stops', () => {
@@ -410,6 +412,46 @@ describe('web: agent status', () => {
     fireFullState(env.mockSocket, fixture[4].state!);
     const text = env.document.getElementById('agent-status-text')!;
     assert.match(text.textContent!, /Idle/i);
+  });
+
+  it('keeps Idle visible after the agent stops', () => {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    fireFullState(env.mockSocket, fixture[1].state!);
+    fireFullState(env.mockSocket, fixture[4].state!);
+    const headerRight = env.document.querySelector('#header .header-right') as HTMLElement;
+    assert.ok(headerRight);
+    assert.equal(headerRight.classList.contains('header-right-hidden'), false);
+    assert.equal(headerRight.dataset.status, 'idle');
+    assert.equal(headerRight.dataset.live, '0');
+    const text = env.document.getElementById('agent-status-text')!;
+    assert.match(text.textContent!, /Idle/i);
+  });
+
+  it('shows waiting and error states without inventing activity', () => {
+    const base = patchBaseState();
+    fireFullState(env.mockSocket, { ...base, agentStatus: 'waiting_approval' });
+    assert.match(env.document.getElementById('agent-status-text')!.textContent || '', /Needs approval/i);
+    assert.equal(env.document.getElementById('agent-status-detail')!.hidden, true);
+
+    fireFullState(env.mockSocket, { ...base, agentStatus: 'error' });
+    assert.match(env.document.getElementById('agent-status-text')!.textContent || '', /Execution error/i);
+    assert.equal(env.document.getElementById('agent-status-detail')!.hidden, true);
+  });
+
+  it('replaces old running activity with a synchronization warning on disconnect', () => {
+    const fixture = loadFixture('activity-shimmer-lifecycle.jsonl');
+    fireFullState(env.mockSocket, fixture[1].state!);
+    env.mockSocket.connected = false;
+    env.mockSocket.fire('disconnect', 'transport close');
+    assert.match(env.document.getElementById('agent-status-text')!.textContent || '', /Syncing state/i);
+    assert.doesNotMatch(env.document.getElementById('agent-status-detail')!.textContent || '', /Planning next moves/i);
+  });
+
+  it('marks extractor-stale task state as potentially stale', () => {
+    const fixture = loadFixture('connection-states.jsonl');
+    fireFullState(env.mockSocket, fixture[1].state!);
+    assert.match(env.document.getElementById('agent-status-text')!.textContent || '', /Status may be stale/i);
+    assert.equal((env.document.querySelector('#header .header-right') as HTMLElement).dataset.status, 'stale');
   });
 });
 
@@ -518,6 +560,19 @@ describe('web: plan widget', () => {
     const planEl = msgs.querySelector('.el-plan');
     assert.ok(planEl, 'Should render plan block (.el-plan)');
     assert.match(planEl!.textContent!, /Auth System/);
+  });
+
+  it('lists current-session plans for browsing', () => {
+    const fixture = loadFixture('plan-widget.jsonl');
+    fireFullState(env.mockSocket, fixture[1].state!);
+    const bar = env.document.getElementById('session-plans-bar')!;
+    assert.equal(bar.classList.contains('hidden'), false);
+    const chip = env.document.querySelector('.session-plan-chip') as HTMLButtonElement;
+    assert.ok(chip);
+    assert.match(chip.textContent || '', /Auth System/);
+    chip.click();
+    const overlay = env.document.getElementById('plan-modal-overlay')!;
+    assert.equal(overlay.classList.contains('hidden'), false);
   });
 });
 
@@ -1664,6 +1719,7 @@ function patchBaseState(): CursorState {
     pendingApprovals: [],
     inputAvailable: true,
     chatTabs: [],
+    activeComposerId: '',
     mode: { current: 'agent', available: [] },
     model: { current: 'Auto', currentId: '' },
     windows: [],
@@ -1714,6 +1770,7 @@ describe('web: patch field updates', () => {
     );
     const text = env.document.getElementById('connection-text')!;
     assert.match(text.textContent!, /backgrounded|stalled/i);
+    assert.match(env.document.getElementById('agent-status-text')!.textContent || '', /Status may be stale/i);
   });
 
   it('does not rebuild messages on connection:status', () => {
@@ -2687,5 +2744,241 @@ describe('web: thought and tool summaries', () => {
     const el = env.document.querySelector('.el-tool')!;
     assert.match(el.textContent || '', /Read/);
     assert.match(el.textContent || '', /src\/server\/dom-extractor\.ts/);
+  });
+
+  it('puts tool summary on an indented row below the tool name', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [{
+        type: 'tool',
+        id: 'tool1',
+        flatIndex: 0,
+        toolCallId: 'tc1',
+        status: 'completed',
+        action: 'Read',
+        details: 'src/server/dom-extractor.ts',
+      }],
+    });
+    const header = env.document.querySelector('.el-tool .tool-header') as HTMLElement;
+    const summary = env.document.querySelector('.el-tool .tool-summary-row') as HTMLElement;
+    assert.ok(header);
+    assert.ok(summary);
+    assert.match(header.textContent || '', /Read/);
+    assert.equal((header.textContent || '').includes('dom-extractor'), false);
+    assert.match(summary.textContent || '', /src\/server\/dom-extractor\.ts/);
+  });
+
+  it('keeps filename on the header with stats and avoids duplicate summary text', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [{
+        type: 'tool',
+        id: 'tool2',
+        flatIndex: 0,
+        toolCallId: 'tc2',
+        status: 'completed',
+        action: 'Edit',
+        details: 'src/auth/login.ts',
+        filename: 'src/auth/login.ts',
+        additions: 12,
+        deletions: 3,
+      }],
+    });
+    const header = env.document.querySelector('.el-tool .tool-header') as HTMLElement;
+    assert.match(header.textContent || '', /Edit/);
+    assert.match(header.textContent || '', /src\/auth\/login\.ts/);
+    assert.match(header.textContent || '', /\+12/);
+    assert.match(header.textContent || '', /-3/);
+    assert.equal(env.document.querySelector('.el-tool .tool-summary-row'), null);
+  });
+
+  it('adds and removes a tool summary as state changes', () => {
+    const base = patchBaseState();
+    const tool = {
+      type: 'tool' as const,
+      id: 'tool-live',
+      flatIndex: 0,
+      toolCallId: 'tc-live',
+      status: 'loading' as const,
+      action: 'Search',
+      details: '',
+    };
+    fireFullState(env.mockSocket, { ...base, messages: [tool] });
+    assert.equal(env.document.querySelector('.tool-summary-row'), null);
+
+    firePatch(env.mockSocket, { messages: [{ ...tool, details: 'Looking in src/server' }] });
+    const summary = env.document.querySelector('.tool-summary-row') as HTMLElement;
+    assert.match(summary.textContent || '', /Looking in src\/server/);
+    assert.equal(summary.title, 'Looking in src/server');
+
+    firePatch(env.mockSocket, { messages: [tool] });
+    assert.equal(env.document.querySelector('.tool-summary-row'), null);
+  });
+});
+
+describe('web: current-session plan file browsing', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  it('always offers View Plan for a session plan without a view_plan action', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [{
+        type: 'plan',
+        id: 'plan1',
+        flatIndex: 0,
+        label: 'Auth System',
+        title: 'Auth System',
+        todosCompleted: 0,
+        todosTotal: 0,
+      }],
+    });
+    const viewBtn = env.document.querySelector('.plan-btn-view') as HTMLButtonElement;
+    assert.ok(viewBtn);
+    viewBtn.click();
+    assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), false);
+  });
+
+  it('loads the plan file body for a current-session .plan.md label', async () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [{
+        type: 'plan',
+        id: 'plan1',
+        flatIndex: 0,
+        label: 'auth_system_abc.plan.md',
+        title: 'Auth System',
+        todosCompleted: 0,
+        todosTotal: 0,
+      }],
+    });
+    (env.document.querySelector('.plan-btn-view') as HTMLButtonElement).click();
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    assert.equal(payload.planId, 'plan1');
+    assert.equal('planLabel' in payload, false);
+    env.mockSocket.fire('command:result', {
+      commandId: payload.commandId,
+      ok: true,
+      data: {
+        todos: [{ text: 'Add login', status: 'pending' }],
+        body: '# Full plan',
+        bodyHtml: '<h1>Full plan</h1>',
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.match(env.document.getElementById('plan-modal-body')!.textContent || '', /Full plan/);
+    assert.match(env.document.getElementById('plan-modal-body')!.textContent || '', /Add login/);
+  });
+
+  it('deduplicates current-session plans and shows conservative statuses', () => {
+    const base = patchBaseState();
+    fireFullState(env.mockSocket, {
+      ...base,
+      messages: [
+        {
+          type: 'plan', id: 'plan-old', flatIndex: 0,
+          label: 'same.plan.md', title: 'Old copy', todosCompleted: 0, todosTotal: 1,
+        },
+        {
+          type: 'plan', id: 'plan-new', flatIndex: 1,
+          label: 'same.plan.md', title: 'Current copy', todosCompleted: 1, todosTotal: 1,
+          todos: [{ text: 'Done', status: 'completed' }],
+        },
+        {
+          type: 'plan', id: 'plan-running', flatIndex: 2,
+          label: 'other.plan.md', title: 'Other plan', todosCompleted: 0, todosTotal: 1,
+          todos: [{ text: 'Working', status: 'in_progress' }],
+        },
+      ],
+    });
+    const chips = [...env.document.querySelectorAll('.session-plan-chip')];
+    assert.equal(chips.length, 2);
+    assert.match(chips[0].textContent || '', /Current copy.*Completed/);
+    assert.match(chips[1].textContent || '', /Other plan.*Executing/);
+  });
+
+  it('shows loading and read-error fallback without retrying on every patch', async () => {
+    const state = {
+      ...patchBaseState(),
+      messages: [{
+        type: 'plan' as const,
+        id: 'plan-error',
+        flatIndex: 0,
+        label: 'missing.plan.md',
+        title: 'Missing plan',
+        todosCompleted: 0,
+        todosTotal: 1,
+      }],
+    };
+    fireFullState(env.mockSocket, state);
+    (env.document.querySelector('.plan-btn-view') as HTMLButtonElement).click();
+    assert.match(env.document.getElementById('plan-modal-body')!.textContent || '', /Loading plan file/);
+    const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', {
+      commandId: payload.commandId,
+      ok: false,
+      error: 'Plan file not found',
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.match(
+      env.document.getElementById('plan-modal-body')!.textContent || '',
+      /Plan file not found.*available session summary/,
+    );
+    const before = commandEmits(env.mockSocket, 'command:get_plan_full').length;
+    firePatch(env.mockSocket, { messages: state.messages });
+    await Promise.resolve();
+    assert.equal(commandEmits(env.mockSocket, 'command:get_plan_full').length, before);
+  });
+
+  it('closes the plan modal when the plan disappears from current messages', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      activeWindowId: 'window-1',
+      activeComposerId: 'composer-1',
+      messages: [{
+        type: 'plan', id: 'plan1', flatIndex: 0,
+        label: 'Session plan', title: 'Session plan', todosCompleted: 0, todosTotal: 0,
+      }],
+    });
+    (env.document.querySelector('.plan-btn-view') as HTMLButtonElement).click();
+    assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), false);
+
+    firePatch(env.mockSocket, { messages: [] });
+
+    assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), true);
+    assert.equal(env.document.getElementById('session-plans-bar')!.classList.contains('hidden'), true);
+  });
+
+  it('hides old plans when the active session changes before its messages arrive', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      activeWindowId: 'window-1',
+      activeComposerId: 'composer-1',
+      messages: [{
+        type: 'plan', id: 'plan1', flatIndex: 0,
+        label: 'First session plan', title: 'First session plan', todosCompleted: 0, todosTotal: 0,
+      }],
+    });
+    (env.document.querySelector('.plan-btn-view') as HTMLButtonElement).click();
+
+    firePatch(env.mockSocket, { activeComposerId: 'composer-2' });
+
+    assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), true);
+    assert.equal(env.document.getElementById('session-plans-bar')!.classList.contains('hidden'), true);
+
+    firePatch(env.mockSocket, {
+      messages: [{
+        type: 'plan', id: 'plan2', flatIndex: 0,
+        label: 'Second session plan', title: 'Second session plan', todosCompleted: 0, todosTotal: 0,
+      }],
+    });
+    assert.equal(env.document.getElementById('session-plans-bar')!.classList.contains('hidden'), false);
+    assert.match(env.document.querySelector('.session-plan-chip')!.textContent || '', /Second session plan/);
   });
 });

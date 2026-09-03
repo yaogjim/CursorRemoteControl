@@ -351,7 +351,7 @@ export interface CommandPayload {
   composerId?: string;
   modeId?: string;
   modelId?: string;
-  planLabel?: string;
+  planId?: string;
   planModelId?: string;
   tabTitle?: string;
   windowId?: string;

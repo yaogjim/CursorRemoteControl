@@ -308,6 +308,69 @@ describe('extractionFunction', () => {
     assert.equal(tool.details, 'src/server/relay.ts');
   });
 
+  it('splits nested compact header spans into action and details', () => {
+    const state = withDom(`
+      <main id="root">
+        <article data-flat-index="0" data-message-role="ai" data-message-kind="tool" data-message-id="m-tool">
+          <div data-tool-call-id="call-3" data-tool-status="completed">
+            <div class="composer-tool-former-message">
+              <div class="composer-tool-call-header-content">
+                <span>Read<span>src/server/relay.ts</span></span>
+              </div>
+            </div>
+          </div>
+        </article>
+      </main>
+    `);
+    const tool = state.messages.find((message) => message.type === 'tool');
+    assert.ok(tool);
+    assert.equal(tool.action, 'Read');
+    assert.equal(tool.details, 'src/server/relay.ts');
+  });
+
+  it('fills compact tool details from a truncate sibling when header only has the action', () => {
+    const state = withDom(`
+      <main id="root">
+        <article data-flat-index="0" data-message-role="ai" data-message-kind="tool" data-message-id="m-tool">
+          <div data-tool-call-id="call-4" data-tool-status="completed">
+            <div class="composer-tool-former-message">
+              <div class="composer-tool-call-header-content">
+                <span>Grep</span>
+              </div>
+              <span class="truncate-one-line">foo in src/server</span>
+            </div>
+          </div>
+        </article>
+      </main>
+    `);
+    const tool = state.messages.find((message) => message.type === 'tool');
+    assert.ok(tool);
+    assert.equal(tool.action, 'Grep');
+    assert.equal(tool.details, 'foo in src/server');
+  });
+
+  it('does not copy thinking body into a compact tool summary', () => {
+    const state = withDom(`
+      <main id="root">
+        <article data-flat-index="0" data-message-role="ai" data-message-kind="tool" data-message-id="m-tool">
+          <div data-tool-call-id="call-5" data-tool-status="completed">
+            <div class="composer-tool-former-message">
+              <div class="composer-tool-call-header-content">
+                <span>Read</span>
+              </div>
+            </div>
+            <div class="ui-collapsible-content">SECRET_THINKING_BODY should stay hidden</div>
+          </div>
+        </article>
+      </main>
+    `);
+    const tool = state.messages.find((message) => message.type === 'tool');
+    assert.ok(tool);
+    assert.equal(tool.action, 'Read');
+    assert.equal((tool.details || '').includes('SECRET_THINKING_BODY'), false);
+    assert.equal((tool.summaryText || '').includes('SECRET_THINKING_BODY'), false);
+  });
+
   it('uses the local history sidebar when Cursor hides the unified cross-project sidebar', () => {
     const state = withDom(`
       <body class="sidebarvisible unifiedsidebarhidden">

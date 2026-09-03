@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { randomBytes, timingSafeEqual, createHash } from 'crypto';
 import { readFileSync } from 'fs';
-import type { ServerConfig, CursorState, CommandPayload, CommandResult, SanitizedDiscoveryStatus } from './types.js';
+import type { ServerConfig, CursorState, CommandPayload, CommandResult, PlanBlock, SanitizedDiscoveryStatus } from './types.js';
 import { AdapterStore } from './adapter-store.js';
 import { ActionRegistry } from './action-registry.js';
 import { capabilityAllows } from './capability-guard.js';
@@ -20,7 +20,7 @@ import type { CDPBridge } from './cdp-bridge.js';
 import type { CapabilityStateManager } from './capability-state-manager.js';
 import { TargetUiCoordinator } from './target-ui-coordinator.js';
 import { moveHomeWindow, type WindowMonitor } from './window-monitor.js';
-import { markdownToWebHtml, readPlanFile } from './plan-files.js';
+import { markdownToWebHtml, readPlanFileResult, type PlanFileReadError } from './plan-files.js';
 import {
   WEBAPP_SESSION_COOKIE,
   SESSION_COOKIE_MAX_AGE_SEC,
@@ -79,6 +79,20 @@ export function isValidActionType(value: unknown): value is string {
 export function socketCommandRequiresOperationId(command: string, actionType?: string): boolean {
   if (DANGEROUS_SOCKET_COMMANDS.has(command)) return true;
   return command === 'click_action' && typeof actionType === 'string' && DANGEROUS_ACTION_TYPES.has(actionType);
+}
+
+export function currentPlanLabel(state: CursorState, planId: unknown): string | null {
+  if (typeof planId !== 'string' || planId.length === 0) return null;
+  const plan = state.messages.find((message): message is PlanBlock => message.type === 'plan' && message.id === planId);
+  const label = plan && typeof plan.label === 'string' ? plan.label.trim() : '';
+  return label || null;
+}
+
+function planFileErrorMessage(error: PlanFileReadError): string {
+  if (error === 'not_found') return 'Plan file not found';
+  if (error === 'too_large') return 'Plan file is too large';
+  if (error === 'invalid_path' || error === 'not_regular_file') return 'Plan file is not safe to read';
+  return 'Plan file could not be read';
 }
 
 function commandIdOf(payload: { commandId?: unknown } | undefined): string {
@@ -1338,19 +1352,25 @@ export class Relay {
       });
 
       onCommand('get_plan_full', async (payload, commandId) => {
-        console.log(`[relay] Command: get_plan_full for ${payload.planLabel} from ${socket.id}`);
-        const planFile = readPlanFile(payload.planLabel!);
-        if (!planFile) return { commandId, ok: false, error: 'Plan file not found' };
+        const planLabel = currentPlanLabel(this.stateManager.getCurrentState(), payload.planId);
+        if (!planLabel) {
+          return { commandId, ok: false, error: 'Plan is not available in the current session' };
+        }
+        console.log(`[relay] Command: get_plan_full for current plan ${payload.planId} from ${socket.id}`);
+        const result = readPlanFileResult(planLabel);
+        if (!result.ok) {
+          return { commandId, ok: false, error: planFileErrorMessage(result.error) };
+        }
         return {
           commandId,
           ok: true,
           data: {
-            todos: planFile.todos,
-            body: planFile.body,
-            bodyHtml: markdownToWebHtml(planFile.body),
+            todos: result.data.todos,
+            body: result.data.body,
+            bodyHtml: markdownToWebHtml(result.data.body),
           },
         };
-      }, (payload) => (!payload.planLabel ? 'Missing commandId or planLabel' : null));
+      }, (payload) => (!payload.planId ? 'Missing commandId or planId' : null));
 
       onCommand('get_plan_model_options', (payload, commandId) => {
         console.log(`[relay] Command: get_plan_model_options from ${socket.id}`);

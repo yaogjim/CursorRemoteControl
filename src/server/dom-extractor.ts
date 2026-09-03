@@ -235,6 +235,121 @@ export function extractionFunction(
       return t.slice(0, max - 1) + '…';
     }
 
+    function looksLikeCodeDump(text: string): boolean {
+      const t = text.trim();
+      if (!t) return false;
+      if (t.includes('\n') && t.length > 80) return true;
+      if ((t.match(/[{};]/g) || []).length >= 4) return true;
+      if (/\b(function|const|import|let|var|return|class)\s/.test(t) && t.length > 40) return true;
+      return false;
+    }
+
+    function spanOwnText(el: Element): string {
+      let t = '';
+      for (const node of Array.from(el.childNodes)) {
+        if (node.nodeType === Node.TEXT_NODE) t += node.textContent || '';
+      }
+      return t.replace(/\s+/g, ' ').trim();
+    }
+
+    function skipToolHeaderEl(el: Element): boolean {
+      const cls = el.classList.toString();
+      if (cls.includes('codicon') || cls.includes('cursor-icon') || el.classList.contains('ui-icon')) return true;
+      if (el.closest('.composer-tool-call-control-row') || el.closest('.composer-tool-call-status-row')) return true;
+      if (el.closest('.ui-collapsible-content') || el.closest('.markdown-root') || el.closest('pre')) return true;
+      return false;
+    }
+
+    function collectCompactHeaderTexts(root: Element): string[] {
+      const texts: string[] = [];
+      const seen = new Set<string>();
+      const push = (raw: string) => {
+        const txt = raw.replace(/\s+/g, ' ').trim();
+        if (!txt || seen.has(txt) || isDurationOnlyThoughtSpan(txt)) return;
+        seen.add(txt);
+        texts.push(txt);
+      };
+      for (const s of Array.from(root.querySelectorAll('span'))) {
+        if (skipToolHeaderEl(s)) continue;
+        const own = spanOwnText(s);
+        const txt = own || (s.querySelector('span') ? '' : (s.textContent || '').replace(/\s+/g, ' ').trim());
+        if (txt) push(txt);
+      }
+      return texts;
+    }
+
+    function parseCompactToolHeader(compactEl: Element): { action: string; details: string } {
+      const headerContent = compactEl.querySelector('.composer-tool-call-header-content');
+      let texts = collectCompactHeaderTexts(headerContent || compactEl);
+
+      if (texts.length <= 1) {
+        for (const s of Array.from(compactEl.querySelectorAll('span'))) {
+          if (skipToolHeaderEl(s)) continue;
+          const cls = s.classList.toString();
+          if (!(s.classList.contains('truncate-one-line') || cls.includes('truncate'))) continue;
+          const txt = (s.textContent || '').replace(/\s+/g, ' ').trim();
+          if (txt && !texts.includes(txt)) texts.push(txt);
+        }
+      }
+
+      if (texts.length <= 1) {
+        const titled = headerContent || compactEl;
+        const title = (titled.getAttribute('title') || titled.getAttribute('aria-label') || '').trim();
+        if (title && !texts.includes(title)) texts.push(title);
+      }
+
+      const action = texts[0] || '';
+      let details = texts.slice(1).join(' ').trim();
+      if (action && details === action) details = '';
+      if (action && details.startsWith(`${action} `)) details = details.slice(action.length).trim();
+      return { action, details };
+    }
+
+    function extractVisibleToolSummary(el: Element, action: string, details: string): string | undefined {
+      if ((details || '').trim()) return undefined;
+
+      const compact = el.querySelector('.composer-tool-former-message');
+      if (compact) {
+        const parsed = parseCompactToolHeader(compact);
+        const extra = parsed.details.trim()
+          || (parsed.action && parsed.action !== action ? parsed.action : '');
+        if (extra && extra !== action && !looksLikeCodeDump(extra)) {
+          return visibleSummary(extra);
+        }
+      }
+
+      const header =
+        el.querySelector('.composer-tool-call-header-content') ||
+        el.querySelector('.ui-collapsible-header') ||
+        el.querySelector('[class*="tool-call-header"]');
+      const scope = header || el;
+      const parts: string[] = [];
+      for (const s of Array.from(scope.querySelectorAll(':scope > span, .ui-step-group-preview, .truncate-one-line'))) {
+        if (skipToolHeaderEl(s)) continue;
+        const t = (s.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t && t !== action) parts.push(t);
+      }
+      let summary = parts.join(' ').trim();
+      if (!summary) {
+        const titled = header || compact || el;
+        summary = (titled.getAttribute('title') || titled.getAttribute('aria-label') || '').trim();
+      }
+      if (action && summary.startsWith(`${action} `)) summary = summary.slice(action.length).trim();
+      if (action && summary === action) summary = '';
+      summary = visibleSummary(summary);
+      if (!summary || looksLikeCodeDump(summary)) return undefined;
+      return summary;
+    }
+
+    function applyVisibleToolSummary(wrapper: Element, parsed: { element: ChatElement; parsedAs: string }) {
+      if (parsed.element.type !== 'tool') return parsed;
+      const summary = extractVisibleToolSummary(wrapper, parsed.element.action, parsed.element.details);
+      if (!summary) return parsed;
+      if (!(parsed.element.details || '').trim()) parsed.element.details = summary;
+      else if (!parsed.element.summaryText) parsed.element.summaryText = summary;
+      return parsed;
+    }
+
     function parseThoughtSpansFromHeader(headerEl: Element | null): {
       action: string;
       detail: string;
@@ -827,38 +942,10 @@ export function extractionFunction(
 
       const compactEl = toolRoot.querySelector('.composer-tool-former-message');
       if (compactEl) {
-        let actionPart = '';
-        let descPart = '';
-
+        const parsed = parseCompactToolHeader(compactEl);
+        const actionPart = parsed.action;
+        const descPart = parsed.details;
         const headerContent = compactEl.querySelector('.composer-tool-call-header-content');
-        if (headerContent) {
-          const headerSpans = headerContent.querySelectorAll('span');
-          for (const s of Array.from(headerSpans)) {
-            const txt = (s.textContent || '').trim();
-            if (!txt) continue;
-            if (s.classList.toString().includes('codicon') || s.classList.toString().includes('cursor-icon')) continue;
-            if (!actionPart) {
-              actionPart = txt;
-            } else if (!descPart) {
-              descPart = txt;
-            } else {
-              descPart = `${descPart} ${txt}`;
-            }
-          }
-        } else {
-          const spans = compactEl.querySelectorAll('span');
-          for (const s of Array.from(spans)) {
-            if (s.closest('.composer-tool-call-control-row') || s.closest('.composer-tool-call-status-row')) continue;
-            const txt = (s.textContent || '').trim();
-            if (!txt) continue;
-            if (s.classList.toString().includes('codicon') || s.classList.toString().includes('cursor-icon')) continue;
-            if (s.classList.contains('truncate-one-line') || s.classList.toString().includes('truncate')) {
-              descPart = txt;
-            } else if (!actionPart) {
-              actionPart = txt;
-            }
-          }
-        }
 
         const compactActions = extractToolActions(compactEl);
         const joinedSummary = [actionPart, descPart].filter(Boolean).join(' ').trim()
@@ -1033,7 +1120,7 @@ export function extractionFunction(
                 toolHost.getAttribute('data-message-id') || `fi-${flatIndex}-g${seq}`;
               const parsedTool = extractAiTool(toolHost as Element, flatIndex, mid, null);
               if (parsedTool) {
-                elements.push(parsedTool.element);
+                elements.push(applyVisibleToolSummary(toolHost as Element, parsedTool).element);
                 seq++;
               }
             }
@@ -1176,8 +1263,9 @@ export function extractionFunction(
       if (role === 'ai' && kind === 'tool') {
         const parsedTool = extractAiTool(msgEl as Element, flatIndex, messageId, rawEl);
         if (parsedTool) {
-          elements.push(parsedTool.element);
-          rawEl.parsedAs = parsedTool.parsedAs;
+          const filled = applyVisibleToolSummary(wrapper, parsedTool);
+          elements.push(filled.element);
+          rawEl.parsedAs = filled.parsedAs;
         }
         continue;
       }

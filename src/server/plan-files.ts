@@ -1,12 +1,33 @@
-import { readFileSync } from 'fs';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from 'fs';
 import { isAbsolute, relative, resolve, sep } from 'path';
 import { homedir } from 'os';
 import type { PlanTodo } from './types.js';
+
+export const MAX_PLAN_FILE_BYTES = 1024 * 1024;
 
 export interface PlanFileData {
   todos: PlanTodo[];
   body: string;
 }
+
+export type PlanFileReadError =
+  | 'invalid_path'
+  | 'not_found'
+  | 'not_regular_file'
+  | 'too_large'
+  | 'read_failed';
+
+export type PlanFileReadResult =
+  | { ok: true; data: PlanFileData }
+  | { ok: false; error: PlanFileReadError };
 
 function defaultPlansRoot(): string {
   return resolve(homedir(), '.cursor', 'plans');
@@ -32,18 +53,68 @@ export function resolvePlanFilePath(
   return candidate;
 }
 
+function pathIsInside(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return !!rel && !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`);
+}
+
+export function readPlanFileResult(
+  label: string,
+  plansRoot: string = defaultPlansRoot(),
+): PlanFileReadResult {
+  const planPath = resolvePlanFilePath(label, plansRoot);
+  if (!planPath) return { ok: false, error: 'invalid_path' };
+
+  let fd: number | null = null;
+  try {
+    const realRoot = realpathSync(resolve(plansRoot));
+    const pathStat = lstatSync(planPath);
+    if (pathStat.isSymbolicLink()) return { ok: false, error: 'invalid_path' };
+    if (!pathStat.isFile()) return { ok: false, error: 'not_regular_file' };
+    if (pathStat.size > MAX_PLAN_FILE_BYTES) return { ok: false, error: 'too_large' };
+
+    const noFollow = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0;
+    fd = openSync(planPath, constants.O_RDONLY | noFollow);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return { ok: false, error: 'not_regular_file' };
+    if (stat.size > MAX_PLAN_FILE_BYTES) return { ok: false, error: 'too_large' };
+
+    const realFile = realpathSync(planPath);
+    if (!pathIsInside(realRoot, realFile)) return { ok: false, error: 'invalid_path' };
+
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = readSync(fd, bytes, offset, bytes.length - offset, offset);
+      if (count === 0) break;
+      offset += count;
+    }
+    const finalStat = fstatSync(fd);
+    if (finalStat.size > MAX_PLAN_FILE_BYTES) return { ok: false, error: 'too_large' };
+    if (finalStat.size !== stat.size || offset !== stat.size) return { ok: false, error: 'read_failed' };
+
+    return { ok: true, data: parsePlanMd(bytes.toString('utf-8')) };
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error
+      ? String((error as { code?: unknown }).code || '')
+      : '';
+    if (code === 'ENOENT') return { ok: false, error: 'not_found' };
+    if (code === 'ELOOP') return { ok: false, error: 'invalid_path' };
+    if (code === 'EISDIR') return { ok: false, error: 'not_regular_file' };
+    return { ok: false, error: 'read_failed' };
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+  }
+}
+
 export function readPlanFile(
   label: string,
   plansRoot: string = defaultPlansRoot(),
 ): PlanFileData | null {
-  const planPath = resolvePlanFilePath(label, plansRoot);
-  if (!planPath) return null;
-  try {
-    const raw = readFileSync(planPath, 'utf-8');
-    return parsePlanMd(raw);
-  } catch {
-    return null;
-  }
+  const result = readPlanFileResult(label, plansRoot);
+  return result.ok ? result.data : null;
 }
 
 export function parsePlanMd(raw: string): PlanFileData {

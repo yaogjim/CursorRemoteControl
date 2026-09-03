@@ -1,9 +1,14 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'fs';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
-import { readPlanFile, resolvePlanFilePath } from '../src/server/plan-files.js';
+import {
+  MAX_PLAN_FILE_BYTES,
+  readPlanFile,
+  readPlanFileResult,
+  resolvePlanFilePath,
+} from '../src/server/plan-files.js';
 
 const PLAN_MD = `---
 name: Safe Plan
@@ -61,8 +66,12 @@ describe('readPlanFile', () => {
     mkdirSync(plansRoot);
     writeFileSync(join(plansRoot, 'safe_plan_abc123.plan.md'), PLAN_MD);
     writeFileSync(join(plansRoot, '中文计划_deadbeef.plan.md'), PLAN_MD);
+    writeFileSync(join(plansRoot, 'too-large.plan.md'), Buffer.alloc(MAX_PLAN_FILE_BYTES + 1, 65));
+    mkdirSync(join(plansRoot, 'directory.plan.md'));
     secretPath = join(fixtureRoot, 'secret.md');
     writeFileSync(secretPath, SECRET);
+    symlinkSync(secretPath, join(plansRoot, 'outside-link.plan.md'));
+    symlinkSync(join(plansRoot, 'safe_plan_abc123.plan.md'), join(plansRoot, 'inside-link.plan.md'));
   });
 
   after(() => {
@@ -93,5 +102,27 @@ describe('readPlanFile', () => {
     assert.equal(readPlanFile('foo/../../secret.md', plansRoot), null);
     assert.equal(readPlanFile(secretPath, plansRoot), null);
     assert.equal(readPlanFile(resolve(plansRoot, '..', 'secret.md'), plansRoot), null);
+  });
+
+  it('rejects symlinks even when their directory entry and target are inside plans', () => {
+    const outside = readPlanFileResult('outside-link.plan.md', plansRoot);
+    assert.equal(outside.ok, false);
+    if (!outside.ok) assert.equal(outside.error, 'invalid_path');
+    assert.equal(readPlanFile('outside-link.plan.md', plansRoot), null);
+
+    const inside = readPlanFileResult('inside-link.plan.md', plansRoot);
+    assert.equal(inside.ok, false);
+    if (!inside.ok) assert.equal(inside.error, 'invalid_path');
+    assert.equal(readPlanFile('inside-link.plan.md', plansRoot), null);
+  });
+
+  it('rejects non-regular and oversized plan files', () => {
+    const directory = readPlanFileResult('directory.plan.md', plansRoot);
+    assert.equal(directory.ok, false);
+    if (!directory.ok) assert.equal(directory.error, 'not_regular_file');
+
+    const large = readPlanFileResult('too-large.plan.md', plansRoot);
+    assert.equal(large.ok, false);
+    if (!large.ok) assert.equal(large.error, 'too_large');
   });
 });
