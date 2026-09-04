@@ -2,7 +2,7 @@
 <html lang="en" data-theme="system">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="theme-color" content="#f7f8fa">
   <title>CursorRemote</title>
   <script>
@@ -36,6 +36,7 @@
   <div id="app">
     <header id="header">
       <div class="header-left">
+        <span class="header-brand">CursorRemote</span>
         <span id="connection-dot" class="dot reconnecting"></span>
         <span id="connection-text">Connecting...</span>
       </div>
@@ -47,97 +48,151 @@
             <span id="agent-status-detail" hidden></span>
           </span>
         </div>
-        <label class="theme-control">
-          <span class="visually-hidden">Color theme</span>
-          <select id="theme-select" aria-label="Color theme">
-            <option value="system">System</option>
-            <option value="light">Light</option>
-            <option value="dark">Dark</option>
-          </select>
-        </label>
+        <button
+          type="button"
+          id="btn-system"
+          class="header-more-btn"
+          aria-label="More"
+          aria-haspopup="dialog"
+          aria-expanded="false"
+          aria-controls="system-panel"
+        >⋯</button>
       </div>
     </header>
 
-    <div id="composer-queue-bar" class="composer-queue-bar hidden" aria-live="polite">
-      <div class="composer-queue-header">
-        <span class="composer-queue-chevron" aria-hidden="true">&#9660;</span>
-        <span id="composer-queue-label" class="composer-queue-label"></span>
-      </div>
-      <div id="composer-queue-items" class="composer-queue-items"></div>
-    </div>
-
     <nav id="context-bar" class="context-bar hidden">
-      <button id="context-main" class="context-main">
+      <button id="context-main" class="context-main" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="drawer">
         <span id="context-window" class="context-window"></span>
         <span id="context-count" class="context-count"></span>
         <span class="context-sep">›</span>
         <span id="context-session" class="context-session"></span>
         <span class="context-chevron">▾</span>
       </button>
-      <button id="btn-new-chat" class="context-new-btn" aria-label="New Chat">+</button>
+      <button type="button" id="session-plans-toggle" class="context-plans-btn hidden" aria-expanded="false" aria-controls="session-plans-bar">
+        Plans
+      </button>
+      <button id="btn-new-chat" class="context-new-btn" type="button" aria-label="New Chat">+</button>
     </nav>
 
+    <div id="composer-queue-bar" class="composer-queue-bar hidden">
+      <button type="button" id="composer-queue-toggle" class="composer-queue-header" aria-expanded="false" aria-controls="composer-queue-items">
+        <span class="composer-queue-chevron" aria-hidden="true">▸</span>
+        <span id="composer-queue-label" class="composer-queue-label"></span>
+      </button>
+      <div id="composer-queue-items" class="composer-queue-items" hidden></div>
+    </div>
+
     <div id="session-plans-bar" class="session-plans-bar hidden" aria-label="Plans in this session">
-      <span class="session-plans-label">Plans</span>
       <div id="session-plans-items" class="session-plans-items"></div>
     </div>
 
     <div id="drawer-overlay" class="drawer-overlay hidden"></div>
-    <div id="drawer" class="drawer hidden">
+    <div id="drawer" class="drawer hidden" role="dialog" aria-modal="true" aria-labelledby="drawer-title" aria-hidden="true">
       <div class="drawer-header">
         <div>
-          <div class="drawer-title">Windows & Sessions</div>
+          <div id="drawer-title" class="drawer-title">Windows & Sessions</div>
           <div id="drawer-hint" class="drawer-hint"></div>
         </div>
-        <button id="drawer-close" class="drawer-close">×</button>
+        <button id="drawer-close" class="drawer-close" type="button" aria-label="Close windows and sessions">×</button>
       </div>
       <div id="drawer-body" class="drawer-body"></div>
     </div>
 
-    <main id="messages" role="log" aria-live="polite">
+    <div id="system-overlay" class="sheet-overlay hidden"></div>
+    <div
+      id="system-panel"
+      class="bottom-sheet system-panel hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="system-panel-title"
+      aria-hidden="true"
+    >
+      <div class="sheet-header system-panel-header">
+        <h2 id="system-panel-title" class="system-panel-title">System</h2>
+        <button type="button" id="system-panel-close" class="sheet-close-btn" aria-label="Close system panel">×</button>
+      </div>
+      <div class="system-panel-body">
+        <label class="theme-control">
+          <span class="theme-control-label">Color theme</span>
+          <select id="theme-select" aria-label="Color theme">
+            <option value="system">System</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </label>
+        <details id="capability-diagnostics" class="capability-diagnostics">
+          <summary id="capability-diagnostics-summary">Capabilities: waiting for discovery</summary>
+          <div id="capability-diagnostics-body" class="capability-diagnostics-body" aria-live="polite"></div>
+          <div class="capability-diagnostics-actions">
+            <button type="button" id="btn-capability-refresh" class="btn-capability-refresh">Refresh Cursor capabilities</button>
+            <p id="capability-refresh-status" class="capability-refresh-status" hidden></p>
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <main id="messages">
       <div id="empty-state" class="empty-state">
         <p id="empty-state-primary">Connecting to relay...</p>
         <p id="empty-state-hint" class="hint">Checking the CursorRemote server and Cursor IDE state.</p>
       </div>
     </main>
 
-    <div id="approval-bar" class="approval-bar hidden">
-      <div id="approval-desc" class="approval-desc"></div>
-      <div class="approval-actions">
-        <button id="btn-approve" class="btn btn-approve">Accept</button>
-        <button id="btn-reject" class="btn btn-reject">Reject</button>
+    <div id="blocking-layer" class="blocking-layer">
+      <div id="approval-bar" class="approval-bar hidden" role="status">
+        <div id="approval-desc" class="approval-desc"></div>
+        <div class="approval-actions">
+          <button type="button" id="btn-approval-view" class="btn btn-approval-view hidden">View</button>
+          <button type="button" id="btn-approve" class="btn btn-approve">Accept</button>
+          <button type="button" id="btn-reject" class="btn btn-reject">Reject</button>
+        </div>
+      </div>
+
+      <div id="questionnaire-bar" class="questionnaire-bar hidden">
+        <button
+          type="button"
+          id="questionnaire-trigger"
+          class="questionnaire-trigger"
+          aria-haspopup="dialog"
+          aria-expanded="false"
+          aria-controls="questionnaire-sheet"
+        >
+          <span class="questionnaire-icon" aria-hidden="true">&#10067;</span>
+          <span class="questionnaire-title">Questions</span>
+          <span id="questionnaire-trigger-label" class="questionnaire-trigger-label"></span>
+        </button>
       </div>
     </div>
 
-    <div id="questionnaire-bar" class="questionnaire-bar hidden">
-      <div class="questionnaire-header">
-        <span class="questionnaire-icon">&#10067;</span>
-        <span class="questionnaire-title">Questions</span>
+    <div id="questionnaire-sheet-overlay" class="sheet-overlay hidden"></div>
+    <div
+      id="questionnaire-sheet"
+      class="bottom-sheet questionnaire-sheet hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="questionnaire-sheet-title"
+      aria-hidden="true"
+    >
+      <div class="sheet-header questionnaire-sheet-header">
+        <span id="questionnaire-sheet-title" class="questionnaire-title">Questions</span>
         <span id="questionnaire-stepper" class="questionnaire-stepper"></span>
+        <button type="button" id="questionnaire-sheet-close" class="sheet-close-btn" aria-label="Close questions">×</button>
       </div>
       <div id="questionnaire-questions"></div>
       <div class="questionnaire-actions">
-        <button id="btn-q-skip" class="btn btn-q-skip">Skip</button>
-        <button id="btn-q-continue" class="btn btn-q-continue">Continue</button>
+        <button type="button" id="btn-q-skip" class="btn btn-q-skip">Skip</button>
+        <button type="button" id="btn-q-continue" class="btn btn-q-continue">Continue</button>
       </div>
     </div>
 
     <footer id="input-bar">
-      <details id="capability-diagnostics" class="capability-diagnostics">
-        <summary id="capability-diagnostics-summary">Capabilities: waiting for discovery</summary>
-        <div id="capability-diagnostics-body" class="capability-diagnostics-body" aria-live="polite"></div>
-        <div class="capability-diagnostics-actions">
-          <button type="button" id="btn-capability-refresh" class="btn-capability-refresh">Refresh Cursor capabilities</button>
-          <p id="capability-refresh-status" class="capability-refresh-status" hidden></p>
-        </div>
-      </details>
       <div id="mode-model-bar" class="mode-model-bar">
-        <button id="pill-mode" class="pill" aria-label="Select mode" disabled>
+        <button id="pill-mode" class="pill" type="button" aria-label="Select mode" disabled>
           <span id="pill-mode-icon" class="pill-icon"></span>
           <span id="pill-mode-text">Mode unavailable</span>
           <span class="pill-chevron">&#9662;</span>
         </button>
-        <button id="pill-model" class="pill" aria-label="Select model" disabled>
+        <button id="pill-model" class="pill" type="button" aria-label="Select model" disabled>
           <span id="pill-model-text">Model unavailable</span>
           <span class="pill-chevron">&#9662;</span>
         </button>
@@ -153,7 +208,7 @@
           rows="1"
           disabled
         ></textarea>
-        <button id="btn-send" class="btn btn-send" disabled aria-label="Send">
+        <button id="btn-send" class="btn btn-send" type="button" disabled aria-label="Send">
           <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
             <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
           </svg>
@@ -162,15 +217,15 @@
     </footer>
 
     <div id="sheet-overlay" class="sheet-overlay hidden"></div>
-    <div id="sheet-mode" class="bottom-sheet hidden">
+    <div id="sheet-mode" class="bottom-sheet hidden" role="dialog" aria-modal="true" aria-label="Mode" aria-hidden="true">
       <div class="sheet-header">Mode</div>
       <div id="sheet-mode-list" class="sheet-list"></div>
     </div>
-    <div id="sheet-model" class="bottom-sheet hidden">
+    <div id="sheet-model" class="bottom-sheet hidden" role="dialog" aria-modal="true" aria-label="Model" aria-hidden="true">
       <div class="sheet-header">Model</div>
       <div id="sheet-model-list" class="sheet-list"></div>
     </div>
-    <div id="sheet-plan-model" class="bottom-sheet hidden">
+    <div id="sheet-plan-model" class="bottom-sheet hidden" role="dialog" aria-modal="true" aria-labelledby="sheet-plan-model-header" aria-hidden="true">
       <div id="sheet-plan-model-header" class="sheet-header">Plan Model</div>
       <div id="sheet-plan-model-list" class="sheet-list"></div>
     </div>
@@ -183,7 +238,7 @@
           <div id="plan-modal-label" class="plan-modal-label"></div>
           <div id="plan-modal-title" class="plan-modal-title"></div>
         </div>
-        <button id="plan-modal-close" class="plan-modal-close" aria-label="Close plan">×</button>
+        <button id="plan-modal-close" class="plan-modal-close" type="button" aria-label="Close plan">×</button>
       </div>
       <div id="plan-modal-body" class="plan-modal-body"></div>
     </div>

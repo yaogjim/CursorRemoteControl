@@ -1051,9 +1051,10 @@ export class Relay {
       options?: Array<{ id?: string; label?: string; selected?: boolean }>;
       completeness?: 'complete' | 'partial' | 'unknown';
       filterActive?: boolean;
+      source?: 'live_menu' | 'capability_snapshot';
     } | undefined;
     const target = this.capabilityStateManager?.getSnapshot();
-    if (!target || !data || !Array.isArray(data.options)) return;
+    if (!target || !data || !Array.isArray(data.options) || data.source === 'capability_snapshot') return;
     const items = data.options.map((item) => normalizeModel({ id:item.id, label:item.label, selected:item.selected, scope:'composer', source:'menu', confidence:1, selectable:true, observedAt:Date.now() })).filter((item): item is NonNullable<ReturnType<typeof normalizeModel>> => !!item);
     const completeness = data.completeness === 'complete'
       ? 'complete'

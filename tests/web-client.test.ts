@@ -39,6 +39,7 @@ function createTestEnv(opts: {
   storage?: Record<string, string>;
   prefersDark?: boolean;
   healthHangs?: boolean;
+  discoveryData?: unknown;
 } = {}) {
   const html = readFileSync(HTML_PATH, 'utf-8');
   const appJs = readFileSync(APP_JS_PATH, 'utf-8');
@@ -131,6 +132,30 @@ function createTestEnv(opts: {
         if (typeof darkQuery.onchange === 'function') darkQuery.onchange(ev);
       };
 
+      const vvListeners: Record<string, Array<() => void>> = {};
+      const visualViewportMock = {
+        height: 844,
+        width: 390,
+        offsetTop: 0,
+        offsetLeft: 0,
+        scale: 1,
+        addEventListener(type: string, fn: () => void) {
+          (vvListeners[type] ||= []).push(fn);
+        },
+        removeEventListener(type: string, fn: () => void) {
+          const list = vvListeners[type] || [];
+          const i = list.indexOf(fn);
+          if (i >= 0) list.splice(i, 1);
+        },
+      };
+      Object.defineProperty(window, 'visualViewport', {
+        configurable: true,
+        value: visualViewportMock,
+      });
+      (window as any).__dispatchVisualViewport = (type: string) => {
+        for (const fn of [...(vvListeners[type] || [])]) fn();
+      };
+
       (window as any).requestAnimationFrame = (cb: () => void) => {
         setTimeout(cb, 0);
         return 0;
@@ -184,7 +209,11 @@ function createTestEnv(opts: {
           return { ok: true, status: 200, json: async () => ({ revision: 0, activeBindings: [], adapters: [], history: [] }) };
         }
         if (url.includes('/api/discovery/run')) {
-          return { ok: true, status: 200, json: async () => ({ ok: true, data: { revision: 1 } }) };
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ ok: true, data: opts.discoveryData ?? { revision: 1 } }),
+          };
         }
         return { ok: false, status: 404, json: async () => ({ error: 'not found' }) };
       };
@@ -427,6 +456,50 @@ describe('web: agent status', () => {
     assert.match(text.textContent!, /Idle/i);
   });
 
+  it('shows queued instead of idle when prompts are waiting and no live activity remains', () => {
+    const base = patchBaseState();
+    fireFullState(env.mockSocket, {
+      ...base,
+      agentStatus: 'idle',
+      composerQueue: {
+        queueLabel: '2 Queued',
+        items: [
+          { id: 'q1', text: 'First task' },
+          { id: 'q2', text: 'Second task' },
+        ],
+      },
+    });
+    assert.match(env.document.getElementById('agent-status-text')!.textContent || '', /Queued/i);
+    assert.match(env.document.getElementById('agent-status-detail')!.textContent || '', /2 Queued/i);
+    assert.equal((env.document.querySelector('#header .header-right') as HTMLElement).dataset.status, 'queued');
+    assert.equal(env.document.getElementById('composer-queue-bar')!.classList.contains('hidden'), true);
+
+    (env.document.querySelector('#header .header-right') as HTMLElement).click();
+    assert.equal(env.document.getElementById('composer-queue-bar')!.classList.contains('hidden'), false);
+    assert.match(env.document.getElementById('composer-queue-items')!.textContent || '', /First task/);
+    const queueTrigger = env.document.querySelector('#header .header-right') as HTMLElement;
+    assert.equal(queueTrigger.getAttribute('role'), 'button');
+    assert.equal(queueTrigger.getAttribute('aria-expanded'), 'true');
+    queueTrigger.dispatchEvent(new env.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    assert.equal(env.document.getElementById('composer-queue-bar')!.classList.contains('hidden'), true);
+
+    firePatch(env.mockSocket, { composerQueue: { items: [] } });
+    assert.match(env.document.getElementById('agent-status-text')!.textContent || '', /Idle/i);
+  });
+
+  it('keeps live running activity ahead of queued prompts', () => {
+    const base = patchBaseState();
+    fireFullState(env.mockSocket, {
+      ...base,
+      agentStatus: 'thinking',
+      agentActivityText: 'Working now',
+      agentActivityLive: true,
+      composerQueue: { items: [{ id: 'q1', text: 'Next task' }] },
+    });
+    assert.match(env.document.getElementById('agent-status-text')!.textContent || '', /Running/i);
+    assert.match(env.document.getElementById('agent-status-detail')!.textContent || '', /Working now/i);
+  });
+
   it('shows waiting and error states without inventing activity', () => {
     const base = patchBaseState();
     fireFullState(env.mockSocket, { ...base, agentStatus: 'waiting_approval' });
@@ -565,7 +638,11 @@ describe('web: plan widget', () => {
   it('lists current-session plans for browsing', () => {
     const fixture = loadFixture('plan-widget.jsonl');
     fireFullState(env.mockSocket, fixture[1].state!);
+    const toggle = env.document.getElementById('session-plans-toggle') as HTMLButtonElement;
+    assert.equal(toggle.classList.contains('hidden'), false);
     const bar = env.document.getElementById('session-plans-bar')!;
+    assert.equal(bar.classList.contains('hidden'), true);
+    toggle.click();
     assert.equal(bar.classList.contains('hidden'), false);
     const chip = env.document.querySelector('.session-plan-chip') as HTMLButtonElement;
     assert.ok(chip);
@@ -1071,6 +1148,47 @@ describe('web: mode/model pills', () => {
     assert.match(env.document.getElementById('capability-refresh-status')!.textContent!, /finished|Refreshing|failed/i);
   });
 
+  it('reports the verified selectable composer model count after refresh', async () => {
+    env = createTestEnv({
+      discoveryData: {
+        models: {
+          completeness: 'complete',
+          items: [
+            { id: 'auto', label: 'Auto', scope: 'composer', selectable: true },
+            { id: 'opus', label: 'Opus', scope: 'composer', selectable: true },
+            { id: 'plan', label: 'Plan', scope: 'plan', selectable: true },
+            { id: 'off', label: 'Off', scope: 'composer', selectable: false },
+          ],
+        },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    fireCapabilities(capabilitySnapshot());
+    (env.document.getElementById('btn-capability-refresh') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const status = env.document.getElementById('capability-refresh-status')!;
+    assert.match(status.textContent || '', /2 selectable composer models/i);
+    assert.equal(status.classList.contains('error'), false);
+  });
+
+  it('warns when refresh finds no verified selectable composer model', async () => {
+    env = createTestEnv({
+      discoveryData: {
+        models: {
+          completeness: 'complete',
+          items: [{ id: 'plan', label: 'Plan', scope: 'plan', selectable: true }],
+        },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    fireCapabilities(capabilitySnapshot());
+    (env.document.getElementById('btn-capability-refresh') as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const status = env.document.getElementById('capability-refresh-status')!;
+    assert.match(status.textContent || '', /warning.*no verified selectable composer models/i);
+    assert.equal(status.classList.contains('error'), true);
+  });
+
   it('offers an explicit inline recovery action when capabilities are stale', async () => {
     const calls = (env.window as unknown as { __fetchCalls: Array<{ url: string; init?: RequestInit }> }).__fetchCalls;
     fireCapabilities(capabilitySnapshot({
@@ -1441,9 +1559,10 @@ describe('web: questionnaire widget', () => {
     assert.ok(!bar.classList.contains('hidden'), 'Questionnaire bar should be visible');
     const stepper = env.document.getElementById('questionnaire-stepper')!;
     assert.equal(stepper.textContent, '1 of 1');
-    const questions = bar.querySelectorAll('.questionnaire-question');
+    const sheet = env.document.getElementById('questionnaire-sheet')!;
+    const questions = sheet.querySelectorAll('.questionnaire-question');
     assert.equal(questions.length, 1);
-    const options = bar.querySelectorAll('.questionnaire-option');
+    const options = sheet.querySelectorAll('.questionnaire-option');
     assert.equal(options.length, 2);
     assert.match(options[0].textContent!, /A.*Red/);
     assert.match(options[1].textContent!, /B.*Blue/);
@@ -2792,6 +2911,26 @@ describe('web: thought and tool summaries', () => {
     assert.equal(env.document.querySelector('.el-tool .tool-summary-row'), null);
   });
 
+  it('collapses duplicated cancellation text from extracted tool fields', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [{
+        type: 'tool',
+        id: 'tool-cancelled',
+        flatIndex: 0,
+        toolCallId: 'tc-cancelled',
+        status: 'completed',
+        action: 'CancelledCancelled',
+        details: 'Cancelled Cancelled',
+        summaryText: 'CancelledCancelled',
+      }],
+    });
+    const tool = env.document.querySelector('.el-tool') as HTMLElement;
+    assert.ok(tool);
+    assert.equal((tool.textContent || '').trim(), '✓Cancelled');
+    assert.equal(env.document.querySelector('.tool-summary-row'), null);
+  });
+
   it('adds and removes a tool summary as state changes', () => {
     const base = patchBaseState();
     const tool = {
@@ -2971,6 +3110,7 @@ describe('web: current-session plan file browsing', () => {
 
     assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), true);
     assert.equal(env.document.getElementById('session-plans-bar')!.classList.contains('hidden'), true);
+    assert.equal(env.document.getElementById('session-plans-toggle')!.classList.contains('hidden'), true);
 
     firePatch(env.mockSocket, {
       messages: [{
@@ -2978,7 +3118,636 @@ describe('web: current-session plan file browsing', () => {
         label: 'Second session plan', title: 'Second session plan', todosCompleted: 0, todosTotal: 0,
       }],
     });
-    assert.equal(env.document.getElementById('session-plans-bar')!.classList.contains('hidden'), false);
+    assert.equal(env.document.getElementById('session-plans-toggle')!.classList.contains('hidden'), false);
+    assert.equal(env.document.getElementById('session-plans-bar')!.classList.contains('hidden'), true);
     assert.match(env.document.querySelector('.session-plan-chip')!.textContent || '', /Second session plan/);
+  });
+});
+
+function dispatchKey(env: ReturnType<typeof createTestEnv>, key: string, shift = false) {
+  env.document.dispatchEvent(new env.window.KeyboardEvent('keydown', {
+    key,
+    bubbles: true,
+    cancelable: true,
+    shiftKey: shift,
+  }));
+}
+
+function layoutState(overrides: Partial<CursorState> = {}): CursorState {
+  return {
+    ...patchBaseState(),
+    windows: [{ id: 'win-1', title: 'CursorRemote', url: 'http://localhost' }],
+    activeWindowId: 'win-1',
+    chatTabs: [{ composerId: 'c1', title: 'Main chat', isActive: true, status: 'completed', selectorPath: '' }],
+    ...overrides,
+  };
+}
+
+describe('web: task-oriented layout contract', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  it('keeps diagnostics and theme out of the input bar while mode/model stay there', () => {
+    const inputBar = env.document.getElementById('input-bar')!;
+    const systemPanel = env.document.getElementById('system-panel')!;
+    assert.equal(inputBar.contains(env.document.getElementById('capability-diagnostics')), false);
+    assert.equal(inputBar.contains(env.document.getElementById('theme-select')), false);
+    assert.ok(inputBar.contains(env.document.getElementById('pill-mode')));
+    assert.ok(inputBar.contains(env.document.getElementById('pill-model')));
+    assert.ok(inputBar.contains(env.document.getElementById('mode-model-status')));
+    assert.ok(inputBar.contains(env.document.getElementById('message-input')));
+    assert.ok(systemPanel.contains(env.document.getElementById('theme-select')));
+    assert.ok(systemPanel.contains(env.document.getElementById('capability-diagnostics')));
+    assert.ok(systemPanel.contains(env.document.getElementById('btn-capability-refresh')));
+  });
+
+  it('uses a two-layer header plus context bar and has no bottom navigation', () => {
+    fireFullState(env.mockSocket, layoutState());
+    assert.ok(env.document.querySelector('.header-brand')?.textContent?.includes('CursorRemote'));
+    assert.ok(env.document.getElementById('btn-system'));
+    assert.equal(env.document.getElementById('context-bar')!.classList.contains('hidden'), false);
+    assert.equal(env.document.getElementById('window-bar'), null);
+    assert.equal(env.document.getElementById('tab-bar'), null);
+    assert.equal(env.document.querySelector('nav.bottom-nav, #bottom-nav, .app-tab-bar'), null);
+    assert.equal(env.document.getElementById('composer-queue-bar')!.classList.contains('hidden'), true);
+    assert.equal(env.document.getElementById('session-plans-bar')!.classList.contains('hidden'), true);
+  });
+
+  it('hides the window count badge for a single window', () => {
+    fireFullState(env.mockSocket, layoutState());
+    const count = env.document.getElementById('context-count') as HTMLElement;
+    assert.equal(count.style.display, 'none');
+    fireFullState(env.mockSocket, layoutState({
+      windows: [
+        { id: 'win-1', title: 'One', url: 'http://localhost' },
+        { id: 'win-2', title: 'Two', url: 'http://localhost' },
+      ],
+    }));
+    assert.equal((env.document.getElementById('context-count') as HTMLElement).style.display, '');
+    assert.equal(env.document.getElementById('context-count')!.textContent, '2');
+  });
+});
+
+describe('web: system panel and drawer accessibility', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  it('opens the system panel with dialog semantics, Escape, and focus restore', () => {
+    const trigger = env.document.getElementById('btn-system') as HTMLButtonElement;
+    const panel = env.document.getElementById('system-panel')!;
+    trigger.focus();
+    trigger.click();
+    assert.equal(panel.classList.contains('hidden'), false);
+    assert.equal(panel.getAttribute('role'), 'dialog');
+    assert.equal(panel.getAttribute('aria-modal'), 'true');
+    assert.equal(panel.getAttribute('aria-hidden'), 'false');
+    assert.equal(trigger.getAttribute('aria-expanded'), 'true');
+    assert.equal(env.document.activeElement, env.document.getElementById('theme-select'));
+    dispatchKey(env, 'Escape');
+    assert.equal(panel.classList.contains('hidden'), true);
+    assert.equal(panel.getAttribute('aria-hidden'), 'true');
+    assert.equal(trigger.getAttribute('aria-expanded'), 'false');
+    assert.equal(env.document.activeElement, trigger);
+  });
+
+  it('opens the windows/sessions drawer, uses semantic buttons, Escape, and live-patches while open', () => {
+    fireFullState(env.mockSocket, layoutState());
+    const trigger = env.document.getElementById('context-main') as HTMLButtonElement;
+    const drawer = env.document.getElementById('drawer')!;
+    trigger.focus();
+    trigger.click();
+    assert.equal(drawer.classList.contains('hidden'), false);
+    assert.equal(drawer.getAttribute('role'), 'dialog');
+    assert.equal(drawer.getAttribute('aria-hidden'), 'false');
+    assert.equal(trigger.getAttribute('aria-expanded'), 'true');
+    const windowBtn = env.document.querySelector('.window-head') as HTMLButtonElement;
+    const sessionBtn = env.document.querySelector('.session-row') as HTMLButtonElement;
+    assert.equal(windowBtn?.tagName, 'BUTTON');
+    assert.equal(sessionBtn?.tagName, 'BUTTON');
+    assert.match(sessionBtn.textContent || '', /Main chat/);
+
+    firePatch(env.mockSocket, {
+      chatTabs: [
+        { composerId: 'c1', title: 'Main chat', isActive: true, status: 'completed', selectorPath: '' },
+        { composerId: 'c2', title: 'Patched session', isActive: false, isOpen: true, status: 'idle', selectorPath: '' },
+      ],
+    });
+    assert.match(env.document.getElementById('drawer-body')!.textContent || '', /Patched session/);
+    assert.equal(drawer.classList.contains('hidden'), false);
+
+    dispatchKey(env, 'Escape');
+    assert.equal(drawer.classList.contains('hidden'), true);
+    assert.equal(trigger.getAttribute('aria-expanded'), 'false');
+    assert.equal(env.document.activeElement, trigger);
+  });
+
+  function fireCapabilities() {
+    env.mockSocket.fire('capabilities:full', {
+      activeTargetId: 'target-1234567890',
+      snapshots: [{
+        targetId: 'target-1234567890',
+        targetGeneration: 4,
+        revision: 8,
+        status: { state: 'ok', completeness: 'complete' },
+        modes: [
+          { id: 'agent', label: 'Agent', current: true, selectable: true },
+          { id: 'plan', label: 'Plan', current: false, selectable: true },
+        ],
+        models: {
+          completeness: 'complete',
+          items: [{ id: 'auto', label: 'Auto', selected: true, scope: 'composer', selectable: true }],
+        },
+        tools: [],
+      }],
+    });
+  }
+
+  it('applies inert, focus trap, Escape, and restore to the mode sheet', () => {
+    fireFullState(env.mockSocket, layoutState({ activeWindowId: 'target-1234567890' }));
+    fireCapabilities();
+    const pill = env.document.getElementById('pill-mode') as HTMLButtonElement;
+    const sheet = env.document.getElementById('sheet-mode')!;
+    const header = env.document.getElementById('header')!;
+    pill.focus();
+    pill.click();
+    assert.equal(sheet.classList.contains('hidden'), false);
+    assert.equal(sheet.getAttribute('aria-hidden'), 'false');
+    assert.equal(header.hasAttribute('inert'), true);
+    assert.equal(sheet.hasAttribute('inert'), false);
+    const nodes = [...sheet.querySelectorAll('button:not([disabled])')] as HTMLButtonElement[];
+    assert.ok(nodes.length >= 2);
+    nodes[nodes.length - 1].focus();
+    dispatchKey(env, 'Tab');
+    assert.equal(env.document.activeElement, nodes[0]);
+    dispatchKey(env, 'Escape');
+    assert.equal(sheet.classList.contains('hidden'), true);
+    assert.equal(header.hasAttribute('inert'), false);
+    assert.equal(env.document.activeElement, pill);
+  });
+
+  it('applies inert, Escape, and restore to the model sheet', () => {
+    fireFullState(env.mockSocket, layoutState({ activeWindowId: 'target-1234567890' }));
+    fireCapabilities();
+    const pill = env.document.getElementById('pill-model') as HTMLButtonElement;
+    const sheet = env.document.getElementById('sheet-model')!;
+    const header = env.document.getElementById('header')!;
+    pill.focus();
+    pill.click();
+    assert.equal(sheet.classList.contains('hidden'), false);
+    assert.equal(header.hasAttribute('inert'), true);
+    dispatchKey(env, 'Escape');
+    assert.equal(sheet.classList.contains('hidden'), true);
+    assert.equal(header.hasAttribute('inert'), false);
+    assert.equal(env.document.activeElement, pill);
+  });
+
+  it('applies inert, Escape, and restore to the plan modal', () => {
+    fireFullState(env.mockSocket, layoutState({
+      messages: [{
+        type: 'plan',
+        id: 'plan1',
+        flatIndex: 0,
+        label: 'Auth System',
+        title: 'Auth System',
+        todosCompleted: 0,
+        todosTotal: 0,
+      }],
+    }));
+    const view = env.document.querySelector('.plan-btn-view') as HTMLButtonElement;
+    const overlay = env.document.getElementById('plan-modal-overlay')!;
+    const header = env.document.getElementById('header')!;
+    view.focus();
+    view.click();
+    assert.equal(overlay.classList.contains('hidden'), false);
+    assert.equal(header.hasAttribute('inert'), true);
+    assert.equal(env.document.getElementById('plan-modal')!.hasAttribute('inert'), false);
+    dispatchKey(env, 'Escape');
+    assert.equal(overlay.classList.contains('hidden'), true);
+    assert.equal(header.hasAttribute('inert'), false);
+    assert.equal(env.document.activeElement, view);
+  });
+});
+
+describe('web: approval reminder mapping', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  it('shows a locate-only reminder for a mapped run_command card and does not duplicate submit buttons', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [{
+        type: 'run_command',
+        id: 'rc1',
+        flatIndex: 0,
+        toolCallId: 'tc-run',
+        description: 'Run outside sandbox',
+        candidates: 'npm',
+        command: 'npm test',
+        actions: [
+          { label: 'Skip', type: 'skip', actionId: 'act_skip' },
+          { label: 'Run', type: 'run', actionId: 'act_run' },
+        ],
+      }],
+      pendingApprovals: [{
+        id: 'tool:tc-run',
+        description: 'Run npm test',
+        actions: [
+          { label: 'Accept', type: 'approve', actionId: 'act_approve' },
+          { label: 'Reject', type: 'reject', actionId: 'act_reject' },
+        ],
+      }],
+    });
+    const bar = env.document.getElementById('approval-bar')!;
+    const view = env.document.getElementById('btn-approval-view') as HTMLButtonElement;
+    const approve = env.document.getElementById('btn-approve') as HTMLButtonElement;
+    const reject = env.document.getElementById('btn-reject') as HTMLButtonElement;
+    assert.equal(bar.classList.contains('hidden'), false);
+    assert.equal(bar.getAttribute('data-mode'), 'reminder');
+    assert.equal(bar.getAttribute('role'), 'status');
+    assert.equal(view.classList.contains('hidden'), false);
+    assert.equal(approve.classList.contains('hidden'), true);
+    assert.equal(reject.classList.contains('hidden'), true);
+    assert.match(env.document.getElementById('approval-desc')!.textContent || '', /Run npm test/);
+
+    const card = env.document.querySelector('.chat-el[data-id="rc1"]') as HTMLElement;
+    let scrolled = false;
+    card.scrollIntoView = () => { scrolled = true; };
+    view.click();
+    assert.equal(scrolled, true);
+    assert.ok(card.classList.contains('approval-target-highlight'));
+    assert.equal(commandEmits(env.mockSocket, 'command:approve').length, 0);
+    assert.equal(commandEmits(env.mockSocket, 'command:reject').length, 0);
+  });
+
+  it('keeps Accept/Reject fallback for unmatched, approve_all, and global approvals', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      pendingApprovals: [{
+        id: 'legacy-1',
+        description: 'Allow network',
+        actions: [
+          { label: 'Accept', type: 'approve', actionId: 'act_approve' },
+          { label: 'Reject', type: 'reject', actionId: 'act_reject' },
+        ],
+      }],
+    });
+    const view = env.document.getElementById('btn-approval-view') as HTMLButtonElement;
+    const approve = env.document.getElementById('btn-approve') as HTMLButtonElement;
+    const reject = env.document.getElementById('btn-reject') as HTMLButtonElement;
+    assert.equal(env.document.getElementById('approval-bar')!.getAttribute('data-mode'), 'fallback');
+    assert.equal(view.classList.contains('hidden'), true);
+    assert.equal(approve.classList.contains('hidden'), false);
+    assert.equal(reject.classList.contains('hidden'), false);
+    assert.equal(approve.disabled, false);
+    approve.click();
+    assert.equal(lastCommandPayload(env.mockSocket, 'command:approve').actionId, 'act_approve');
+
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [{
+        type: 'run_command',
+        id: 'rc1',
+        flatIndex: 0,
+        toolCallId: 'tc-run',
+        description: 'Run',
+        candidates: '',
+        command: 'ls',
+        actions: [{ label: 'Run', type: 'run', actionId: 'act_run' }],
+      }],
+      pendingApprovals: [{
+        id: 'tool:tc-run',
+        description: 'Accept all',
+        actions: [{ label: 'Accept All', type: 'approve_all', actionId: 'act_all' }],
+      }],
+    });
+    assert.equal(env.document.getElementById('approval-bar')!.getAttribute('data-mode'), 'fallback');
+    assert.equal((env.document.getElementById('btn-approve') as HTMLButtonElement).classList.contains('hidden'), false);
+  });
+
+  it('falls back to Accept/Reject when a mapped card disappears', () => {
+    const run = {
+      type: 'run_command' as const,
+      id: 'rc1',
+      flatIndex: 0,
+      toolCallId: 'tc-run',
+      description: 'Run',
+      candidates: '',
+      command: 'ls',
+      actions: [{ label: 'Run', type: 'run' as const, actionId: 'act_run' }],
+    };
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [run],
+      pendingApprovals: [{
+        id: 'tool:tc-run',
+        description: 'Run ls',
+        actions: [
+          { label: 'Accept', type: 'approve', actionId: 'act_approve' },
+          { label: 'Reject', type: 'reject', actionId: 'act_reject' },
+        ],
+      }],
+    });
+    assert.equal(env.document.getElementById('approval-bar')!.getAttribute('data-mode'), 'reminder');
+    firePatch(env.mockSocket, { messages: [] });
+    assert.equal(env.document.getElementById('approval-bar')!.getAttribute('data-mode'), 'fallback');
+    assert.equal((env.document.getElementById('btn-approve') as HTMLButtonElement).classList.contains('hidden'), false);
+    assert.equal((env.document.getElementById('btn-approval-view') as HTMLButtonElement).classList.contains('hidden'), true);
+  });
+
+  it('falls back to Accept/Reject when a mapped run_command card has no clickable actions', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [{
+        type: 'run_command',
+        id: 'rc1',
+        flatIndex: 0,
+        toolCallId: 'tc-run',
+        description: 'Run',
+        candidates: '',
+        command: 'ls',
+        actions: [],
+      }],
+      pendingApprovals: [{
+        id: 'tool:tc-run',
+        description: 'Run ls',
+        actions: [
+          { label: 'Accept', type: 'approve', actionId: 'act_approve' },
+          { label: 'Reject', type: 'reject', actionId: 'act_reject' },
+        ],
+      }],
+    });
+    const bar = env.document.getElementById('approval-bar')!;
+    const approve = env.document.getElementById('btn-approve') as HTMLButtonElement;
+    const reject = env.document.getElementById('btn-reject') as HTMLButtonElement;
+    assert.equal(bar.getAttribute('data-mode'), 'fallback');
+    assert.equal(approve.classList.contains('hidden'), false);
+    assert.equal(reject.classList.contains('hidden'), false);
+    assert.equal((env.document.getElementById('btn-approval-view') as HTMLButtonElement).classList.contains('hidden'), true);
+    approve.click();
+    assert.equal(lastCommandPayload(env.mockSocket, 'command:approve').actionId, 'act_approve');
+  });
+
+  it('does not submit hidden Accept/Reject while a mapped card owns the actions', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [{
+        type: 'run_command',
+        id: 'rc1',
+        flatIndex: 0,
+        toolCallId: 'tc-run',
+        description: 'Run outside sandbox',
+        candidates: 'npm',
+        command: 'npm test',
+        actions: [
+          { label: 'Skip', type: 'skip', actionId: 'act_skip' },
+          { label: 'Run', type: 'run', actionId: 'act_run' },
+        ],
+      }],
+      pendingApprovals: [{
+        id: 'tool:tc-run',
+        description: 'Run npm test',
+        actions: [
+          { label: 'Accept', type: 'approve', actionId: 'act_approve' },
+          { label: 'Reject', type: 'reject', actionId: 'act_reject' },
+        ],
+      }],
+    });
+    const bar = env.document.getElementById('approval-bar')!;
+    const approve = env.document.getElementById('btn-approve') as HTMLButtonElement;
+    assert.equal(bar.getAttribute('data-mode'), 'reminder');
+    assert.equal(approve.classList.contains('hidden'), true);
+    env.mockSocket.emitted.length = 0;
+    approve.click();
+    (env.document.getElementById('btn-reject') as HTMLButtonElement).click();
+    assert.equal(commandEmits(env.mockSocket, 'command:approve').length, 0);
+    assert.equal(commandEmits(env.mockSocket, 'command:reject').length, 0);
+  });
+
+  it('maps a tool card with clickable actions to a locate-only reminder', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [{
+        type: 'tool',
+        id: 'fetch1',
+        flatIndex: 0,
+        toolCallId: 'tc-fetch',
+        status: 'loading',
+        action: 'Fetch',
+        details: 'https://example.com',
+        actions: [
+          { label: 'Skip', type: 'skip', actionId: 'act_skip' },
+          { label: 'Run', type: 'run', actionId: 'act_run' },
+        ],
+      }],
+      pendingApprovals: [{
+        id: 'tool:tc-fetch',
+        description: 'Fetch example.com',
+        actions: [
+          { label: 'Accept', type: 'approve', actionId: 'act_approve' },
+          { label: 'Reject', type: 'reject', actionId: 'act_reject' },
+        ],
+      }],
+    });
+    const bar = env.document.getElementById('approval-bar')!;
+    const view = env.document.getElementById('btn-approval-view') as HTMLButtonElement;
+    const approve = env.document.getElementById('btn-approve') as HTMLButtonElement;
+    assert.equal(bar.getAttribute('data-mode'), 'reminder');
+    assert.equal(view.classList.contains('hidden'), false);
+    assert.equal(approve.classList.contains('hidden'), true);
+    const card = env.document.querySelector('.chat-el[data-tool-call-id="tc-fetch"]') as HTMLElement;
+    assert.ok(card);
+    let scrolled = false;
+    card.scrollIntoView = () => { scrolled = true; };
+    view.click();
+    assert.equal(scrolled, true);
+    assert.equal(commandEmits(env.mockSocket, 'command:approve').length, 0);
+  });
+});
+
+describe('web: questionnaire sheet', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  it('keeps a compact trigger, opens a half-sheet with radiogroup ARIA, and preserves click_action payload', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      questionnaire: {
+        questions: [{
+          number: '1.',
+          text: 'Pick a color?',
+          isActive: true,
+          options: [
+            { letter: 'A', label: 'Red', isFreeform: false, selectorPath: 'sp-red', actionId: 'act_red' },
+            { letter: 'B', label: 'Blue', isFreeform: false, selectorPath: 'sp-blue', actionId: 'act_b' },
+          ],
+        }],
+        activeIndex: 0,
+        totalLabel: '1 of 1',
+        skipSelectorPath: 'sp-skip',
+        skipActionId: 'act_skip',
+        continueSelectorPath: 'sp-continue',
+        continueActionId: 'act_continue',
+        continueDisabled: true,
+      },
+    });
+    const trigger = env.document.getElementById('questionnaire-trigger') as HTMLButtonElement;
+    const sheet = env.document.getElementById('questionnaire-sheet')!;
+    assert.equal(env.document.getElementById('questionnaire-bar')!.classList.contains('hidden'), false);
+    assert.equal(sheet.classList.contains('hidden'), true);
+    assert.equal(trigger.getAttribute('aria-expanded'), 'false');
+    trigger.focus();
+    trigger.click();
+    assert.equal(sheet.classList.contains('hidden'), false);
+    assert.equal(sheet.getAttribute('role'), 'dialog');
+    assert.equal(sheet.getAttribute('aria-hidden'), 'false');
+    assert.equal(trigger.getAttribute('aria-expanded'), 'true');
+    const group = sheet.querySelector('[role="radiogroup"]');
+    assert.ok(group);
+    const options = [...sheet.querySelectorAll('[role="radio"]')] as HTMLButtonElement[];
+    assert.equal(options.length, 2);
+    assert.equal(options[0].getAttribute('aria-checked'), 'false');
+    options[0].click();
+    const payload = lastCommandPayload(env.mockSocket, 'command:click_action');
+    assert.equal(payload.actionId, 'act_red');
+    assert.equal(payload.actionType, 'questionnaire_option');
+    assert.equal('selectorPath' in payload, false);
+    dispatchKey(env, 'Escape');
+    assert.equal(sheet.classList.contains('hidden'), true);
+    assert.equal(trigger.getAttribute('aria-expanded'), 'false');
+    assert.equal(env.document.activeElement, trigger);
+  });
+
+  it('does not stack a large questionnaire panel beside a mapped approval reminder', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      messages: [{
+        type: 'tool',
+        id: 'fetch1',
+        flatIndex: 0,
+        toolCallId: 'tc-fetch',
+        status: 'loading',
+        action: 'Fetch',
+        details: 'https://example.com',
+        actions: [{ label: 'Run', type: 'run', actionId: 'act_run' }],
+      }],
+      pendingApprovals: [{
+        id: 'tool:tc-fetch',
+        description: 'Fetch example.com',
+        actions: [
+          { label: 'Accept', type: 'approve', actionId: 'act_approve' },
+          { label: 'Reject', type: 'reject', actionId: 'act_reject' },
+        ],
+      }],
+      questionnaire: {
+        questions: [{
+          number: '1.', text: 'Continue?', isActive: true,
+          options: [{ letter: 'A', label: 'Yes', isFreeform: false, selectorPath: 'sp-a', actionId: 'act_a' }],
+        }],
+        activeIndex: 0,
+        totalLabel: '1 of 1',
+        skipSelectorPath: '',
+        continueSelectorPath: '',
+        continueDisabled: true,
+      },
+    });
+    assert.equal(env.document.getElementById('approval-bar')!.getAttribute('data-mode'), 'reminder');
+    assert.equal(env.document.getElementById('questionnaire-bar')!.classList.contains('hidden'), false);
+    assert.equal(env.document.getElementById('questionnaire-sheet')!.classList.contains('hidden'), true);
+    assert.equal((env.document.getElementById('btn-approve') as HTMLButtonElement).classList.contains('hidden'), true);
+  });
+
+  it('closes the questionnaire sheet on authoritative null and restores focus to a visible control', () => {
+    fireFullState(env.mockSocket, {
+      ...patchBaseState(),
+      questionnaire: {
+        questions: [{
+          number: '1.',
+          text: 'Pick a color?',
+          isActive: true,
+          options: [
+            { letter: 'A', label: 'Red', isFreeform: false, selectorPath: 'sp-red', actionId: 'act_red' },
+          ],
+        }],
+        activeIndex: 0,
+        totalLabel: '1 of 1',
+        skipSelectorPath: 'sp-skip',
+        skipActionId: 'act_skip',
+        continueSelectorPath: 'sp-continue',
+        continueActionId: 'act_continue',
+        continueDisabled: true,
+      },
+    });
+    const trigger = env.document.getElementById('questionnaire-trigger') as HTMLButtonElement;
+    const sheet = env.document.getElementById('questionnaire-sheet')!;
+    trigger.focus();
+    trigger.click();
+    assert.equal(sheet.classList.contains('hidden'), false);
+    fireFullState(env.mockSocket, { ...patchBaseState(), questionnaire: null });
+    assert.equal(sheet.classList.contains('hidden'), true);
+    assert.equal(env.document.getElementById('questionnaire-bar')!.classList.contains('hidden'), true);
+    const active = env.document.activeElement as HTMLElement | null;
+    assert.ok(active);
+    assert.notEqual(active, trigger);
+    assert.equal(active!.closest('.hidden'), null);
+    assert.equal(active!.closest('[hidden]'), null);
+  });
+});
+
+describe('web: viewport and CSS contracts', () => {
+  it('allows zoom, uses dynamic viewport units, and keeps 44px touch targets', () => {
+    const html = readFileSync(HTML_PATH, 'utf-8');
+    const css = readFileSync(STYLES_PATH, 'utf-8');
+    assert.match(html, /viewport-fit=cover/);
+    assert.doesNotMatch(html, /user-scalable\s*=\s*no/i);
+    assert.doesNotMatch(html, /maximum-scale\s*=\s*1/);
+    assert.doesNotMatch(html, /role="log"/);
+    assert.doesNotMatch(html, /id="messages"[^>]*aria-live/);
+    assert.match(css, /#message-input[\s\S]*?font-size:\s*16px/);
+    assert.match(css, /100dvh/);
+    assert.match(css, /:focus-visible/);
+    assert.match(css, /prefers-reduced-motion/);
+    assert.match(css, /safe-area-inset/);
+    assert.match(css, /#messages[\s\S]*?min-height:\s*120px/);
+    assert.match(css, /\.header-more-btn[\s\S]*?min-height:\s*44px/);
+    assert.match(css, /\.btn-approval-view[\s\S]*?min-height:\s*44px/);
+    assert.match(css, /\.btn-approve[\s\S]*?min-height:\s*48px/);
+    assert.match(css, /\.questionnaire-option[\s\S]*?min-height:\s*44px/);
+    assert.match(css, /--app-offset/);
+    assert.match(css, /#agent-status-text[\s\S]*?text-overflow:\s*ellipsis/);
+    const toastZ = Number((css.match(/#toast-container\s*\{[^}]*z-index:\s*(\d+)/) || [])[1]);
+    const sheetZ = Number((css.match(/\.sheet-overlay\s*\{[^}]*z-index:\s*(\d+)/) || [])[1]);
+    assert.ok(toastZ > sheetZ, `toast z-index ${toastZ} should be above sheet overlay ${sheetZ}`);
+  });
+
+  it('syncs visualViewport height and offset without compensating for pinch-zoom', async () => {
+    const env = createTestEnv();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const vv = env.window.visualViewport as unknown as {
+      height: number; offsetTop: number; scale: number;
+    };
+    vv.height = 420;
+    vv.offsetTop = 88;
+    vv.scale = 2;
+    (env.window as any).__dispatchVisualViewport('resize');
+    env.window.dispatchEvent(new env.window.Event('resize'));
+    const root = env.document.documentElement;
+    assert.equal(root.style.getPropertyValue('--app-height'), '420px');
+    assert.equal(root.style.getPropertyValue('--app-offset'), '88px');
+    assert.notEqual(root.style.getPropertyValue('--app-height'), '210px');
+    const html = readFileSync(HTML_PATH, 'utf-8');
+    assert.doesNotMatch(html, /user-scalable\s*=\s*no/i);
+    assert.doesNotMatch(html, /maximum-scale\s*=\s*1/);
   });
 });

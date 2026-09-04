@@ -15,3 +15,8 @@ openvsx_token
 # marketing/
 .specstory/
 .DS_Store
+.cursor/
+.vscode/
+.history/
+.specstory/
+

@@ -1,45 +1,93 @@
 # CursorRemote
 
-远程控制你本地的 Cursor AI 智能体——在 Cursor 运行在你的机器上时，通过手机、平板或其他电脑的浏览器，或通过 Telegram 监控会话、批准步骤、检查完整计划并发送任务。
+在手机、平板或其他电脑上远程查看和控制本机 Cursor AI 智能体。CursorRemote 通过 Chrome DevTools Protocol（CDP）读取 Cursor 会话状态，再通过移动端 Web 客户端或 Telegram 提供消息查看、任务发送、审批、问卷回答、计划审阅以及窗口、会话、模式和模型切换。
+
+> CursorRemote 在你的机器上运行，不上传代码或会话数据。除可选的 Telegram Bot API 外，不依赖云端中继服务。
 
 <div align="center">
 
-| 移动端 Web 应用 | Telegram |
+| 移动端 Web 客户端 | Telegram |
 |:-:|:-:|
-| <img src="media/web-app.gif" alt="移动端 Web 应用" width="300"> | <img src="media/telegram.gif" alt="Telegram 集成" width="300"> |
+| <img src="media/web-app.gif" alt="CursorRemote 移动端 Web 客户端" width="300"> | <img src="media/telegram.gif" alt="CursorRemote Telegram 集成" width="300"> |
 
-<p><b>扩展 UI</b> — CursorRemote 侧边栏：服务器状态、CDP 连接、智能体状态和启动/停止控制</p>
-<img src="media/extension_tab.png" alt="CursorRemote 扩展侧边栏，显示服务器控制和状态" width="380">
+<p><b>Cursor 扩展侧栏</b>：查看服务器、CDP、智能体和客户端状态，并控制服务器启停。</p>
+<img src="media/extension_tab.png" alt="CursorRemote 扩展侧栏" width="380">
 
 </div>
 
-## 功能特性
+## 核心功能
 
-- **移动端 Web 客户端** -- 实时聊天视图，采用 Cursor 暗色主题，批准/拒绝按钮，完整计划模态框，计划模型选择器，运行命令卡片，模式/模型切换
-- **上下文栏 + 抽屉导航** -- 顶部面包屑显示「窗口 › 会话」，点击弹出抽屉面板统一列出所有窗口及其会话，点按即可切换窗口/会话（0.1.54 新增）
-- **Telegram 集成** -- 自动同步对话到论坛主题，通过内联按钮批准，从任何设备发送提示
-- **多窗口监控** -- 主窗口保持持久 CDP 连接；其他窗口每 10 秒并行轮询一次（无需切换 Cursor UI）
-- **自动创建主题** -- 新的聊天标签页自动创建对应的 Telegram 主题
-- **VS Code 扩展** -- 集成侧边栏，显示服务器状态、启动/停止控制、设置向导和配置
-- **持久化状态** -- 消息、主题、同步和认证在服务器重启后全部保留
+### 远程查看与操作
+
+- 实时显示用户消息、助手回复、思考步骤、工具调用、待办列表和运行状态。
+- 远程发送新任务、创建新会话、切换 Cursor 窗口和聊天会话。
+- 处理全局审批和工具卡操作，包括接受、拒绝、运行、跳过、允许、继续和构建计划。
+- 查看终端命令的完整内容后再决定是否执行。
+- 回答智能体选择题问卷，支持选中态、自由输入、跳过和继续。
+- 查看 Composer 中排队的提示。
+
+### 计划、代码与差异内容
+
+- 显示计划标题、说明、任务进度和逐项状态。
+- 从当前会话的 Plans 栏或计划卡打开完整计划；服务端仅允许读取 `~/.cursor/plans` 下当前会话已观察到的安全普通文件。
+- 获取 Cursor 当前可用的计划模型并远程切换，或直接触发 Build。
+- 原生渲染代码块和文件差异，不复制易损的 Monaco/Shiki 页面结构。
+- 长代码和差异默认显示约 7 行可滚动视图，可展开为全屏阅读器。
+- 工具卡显示文件名、增删行统计和可见摘要，便于在窄屏上快速判断操作内容。
+
+### 多窗口与多会话
+
+- Web 顶部上下文栏显示“窗口 › 会话”，抽屉统一列出所有已发现的 Cursor 窗口和会话。
+- 当前主窗口保持持久 CDP 连接并连续更新。
+- 其他 Cursor 窗口每 10 秒使用临时 CDP 连接并行轮询，不切换桌面端 Cursor 的可见焦点。
+- 扩展采用单例服务器模式：一个窗口拥有服务器进程，其他窗口作为观察者；所有者关闭后，观察者可自动接管。
+
+### 运行时能力发现
+
+Cursor 的内部界面会随版本变化。CursorRemote 不再只依赖固定的模式、模型和工具列表，而是维护独立的运行时能力状态：
+
+- 校验 CDP 端点是否属于 Cursor，并验证目标页面是否为 Cursor Workbench。
+- 被动探测当前 Composer、模式、模型和工具能力，区分“不可用”“未知”“部分发现”“已过期”和“正常”。
+- 在 Web 客户端的 **Capabilities** 区域显示发现状态、完整性和诊断信息。
+- 点击 **Refresh Cursor capabilities** 时执行受控的交互式探测，重新读取 Cursor 当前菜单。
+- 模式和模型切换只允许使用当前目标、当前版本且已验证的能力项。
+- 探测可以生成待确认适配候选；**当前版本不会自动激活候选适配器**，现有内置选择器仍是活动路径。
+
+### Telegram
+
+- 将每个项目/智能体会话映射到 Telegram 超级群组的论坛话题。
+- 新会话自动创建话题，并持续新增或更新消息。
+- 通过内联按钮处理审批、工具操作、计划和问卷。
+- 在话题中发送普通文本即可把任务转发给对应的 Cursor 智能体。
+- 支持话题清理、去重、重新绑定和状态恢复。
+- 默认使用 grammY，也提供基于 Node.js `fetch` 的 `raw` 传输实现作为网络兼容回退。
+
+### 连接与通知
+
+- Socket.IO 自动重连，重连后获取完整状态。
+- 分别展示浏览器到中继、CDP 到 Cursor、DOM 提取和能力发现状态，避免把后台节流误报为普通断网。
+- 页面在后台时，对待审批、运行命令、工具操作和问卷等事件发送去重的浏览器通知。
+- Web 客户端支持浅色、深色和跟随系统主题。
 
 ## 工作原理
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Cursor 扩展（可选）                                              │
-│  启动服务器，提供 UI，管理生命周期                                  │
-│                                                                 │
-│  Cursor IDE  ──CDP──>  中继服务器  ──socket.io──>  浏览器         │
-│  (Windows/Mac)          (Node.js)     ──Bot API───>  Telegram   │
-└─────────────────────────────────────────────────────────────────┘
+```text
+Cursor IDE
+  │  CDP：读取 DOM、输入文本、点击已验证操作
+  ▼
+CursorRemote 中继服务器（Node.js + TypeScript）
+  ├─ 状态提取与差异广播
+  ├─ 目标和能力发现
+  ├─ 命令执行与操作授权
+  ├─ Socket.IO ──────────────► Web 客户端
+  └─ Bot API ────────────────► Telegram
 ```
 
-1. **Cursor IDE** 启用 Chrome DevTools 协议运行 (`--remote-debugging-port=9222`)
-2. **中继服务器** 通过 CDP 连接，从 DOM 提取智能体聊天状态
-3. **窗口监控器** 在主窗口保持长连接的 CDP 连接，每 10 秒并行轮询其他窗口
-4. **浏览器客户端** 在任何设备上实时显示对话
-5. **Telegram 机器人**（可选）将数据镜像到自动创建的论坛主题
+1. **Cursor IDE** 启用 Chrome DevTools 协议运行（`--remote-debugging-port=9222`）。
+2. **中继服务器** 通过 CDP 连接，从 DOM 提取智能体聊天状态，经能力发现校验后广播差异。
+3. **窗口监控器** 在主窗口保持长连接的 CDP 连接，每 10 秒并行轮询其他窗口。
+4. **浏览器客户端** 在任何设备上实时显示对话，并可发送命令。
+5. **Telegram 机器人**（可选）将数据镜像到自动创建的论坛话题。
 
 ## 我应该使用哪种设置方式？
 
@@ -63,7 +111,7 @@
 
 ```bash
 # 从命令行安装
-cursor --install-extension cursor-remote-0.1.58.vsix
+cursor --install-extension cursor-remote-0.1.59.vsix
 ```
 
 或在 Cursor 中：打开命令面板（`Ctrl+Shift+P`），运行 **Extensions: Install from VSIX...**，然后选择文件。
@@ -183,6 +231,7 @@ npm run dev
 | `TELEGRAM_ENABLED` | `false` | 启用 Telegram 机器人 |
 | `TELEGRAM_BOT_TOKEN` | -- | 来自 @BotFather 的机器人令牌 |
 | `TELEGRAM_ALLOWED_USERS` | -- | 逗号分隔的允许用户 ID |
+| `TELEGRAM_TRANSPORT` | `grammy` | `grammy` 或 `raw`（fetch 兼容回退） |
 | `DATA_DIR` | `./data` | 持久化状态的数据目录 |
 | `LOG_FORMAT` | `text` | 设置为 `json` 以获得结构化日志行 |
 
@@ -197,13 +246,17 @@ npm start
 
 ---
 
-## 安全性
+## 安全性与隐私
 
-CursorRemote 开箱即用提供安全默认设置：
+CursorRemote 是 **100% 自托管**的，并开箱即用提供安全默认设置：
 
 - **仅本地主机** -- 服务器默认绑定到 `127.0.0.1`，因此在你明确选择之前永远不会暴露到网络。
-- **自动生成密码**（扩展）-- 首次安装时创建加密随机密码（`crypto.randomBytes(16)` 作为 base64url），并存储在 VS Code 设置中作为 `cursorRemote.webappPassword`。它**不**存储在 SecretStorage 中。
-- **Telegram 机器人令牌**（扩展）-- 通过设置面板存储在 VS Code 的加密 SecretStorage 中。旧版 `cursorRemote.telegram.botToken` 设置会在激活时自动迁移然后清除。
+- **自动生成密码**（扩展）-- 首次安装时创建加密随机密码（`crypto.randomBytes(16)` 作为 base64url），并存储在 VS Code 设置中作为 `cursorRemote.webappPassword`。
+- **Telegram 机器人令牌**（扩展）-- 通过设置面板存储在 VS Code 的加密 SecretStorage 中。
+- **没有回传、没有遥测** -- 软件不会连接到供应商服务器进行许可或激活。你的代码、对话和智能体活动都保留在你的机器和网络上。
+- **不建立完整聊天历史数据库** -- 中继只维护同步所需的最近状态，不是持久对话存档。
+- **计划文件读取受限** -- 服务端仅允许读取 `~/.cursor/plans` 下当前会话已观察到的安全普通文件。
+- **适配器激活暂不开放** -- 探测生成的候选适配器处于待确认状态；`POST /api/adapters/:id/apply` 当前稳定返回 `503 ADAPTER_ACTIVATION_UNAVAILABLE`，现有内置选择器仍是活动路径。
 
 ### 从其他设备访问
 
@@ -212,10 +265,6 @@ CursorRemote 开箱即用提供安全默认设置：
 **选项 B：LAN 访问** -- 打开 **Setup Panel**（扩展）或设置 `SERVER_HOST=0.0.0.0`（独立）。服务器绑定到所有接口并需要密码。
 
 两个选项可以结合使用以实现深度防御。
-
-## 隐私
-
-CursorRemote 是 **100% 自托管**的。没有回传、没有遥测、没有分析、没有使用跟踪。软件永远不会连接到供应商服务器进行许可或激活——启动时不会，使用期间也不会。你的代码、对话和智能体活动都保留在你的机器和网络上。
 
 ## Telegram 设置
 
@@ -259,6 +308,7 @@ CursorRemote 是 **100% 自托管**的。没有回传、没有遥测、没有分
 | `npm run package` | 碰撞补丁版本号并将 .vsix 打包到 `releases/` |
 | `npm run release -- patch\|minor\|major` | 碰撞版本号，更新变更日志，创建 git 标签 |
 | `npm start` | 运行编译后的服务器 |
+| `npm test` | 运行测试套件 |
 | `npm run discover` | DOM 发现工具 |
 
 ## 文档

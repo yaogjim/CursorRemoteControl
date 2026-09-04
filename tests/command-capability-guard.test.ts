@@ -206,6 +206,77 @@ function guardedExecutor(
   return executor;
 }
 
+describe('CommandExecutor model option fallback', () => {
+  it('uses the verified complete composer catalog when the live menu returns no rows', async () => {
+    const snap = snapshot({
+      models: {
+        items: [
+          model('model-opus', { label: 'Opus', selected: true }),
+          model('plan-only', { label: 'Plan only', scope: 'plan' }),
+          model('disabled', { label: 'Disabled', selectable: false }),
+        ],
+        completeness: 'complete',
+        filterActive: false,
+        observedAt: 1,
+      },
+    });
+    const executor = guardedExecutor(snap);
+    (executor as unknown as {
+      openModelMenuAndReadOptions: () => Promise<unknown>;
+    }).openModelMenuAndReadOptions = async () => ({
+      options: [], completeness: 'complete', filterActive: false,
+    });
+
+    const result = await executor.getModelOptions('cmd-model-fallback');
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.data, {
+      options: [{ id: 'model-opus', label: 'Opus', selected: true }],
+      completeness: 'complete',
+      filterActive: false,
+      source: 'capability_snapshot',
+    });
+  });
+
+  it('also falls back when the live model menu read fails', async () => {
+    const executor = guardedExecutor(snapshot());
+    (executor as unknown as {
+      withRetryValue: () => Promise<unknown>;
+    }).withRetryValue = async () => ({
+      commandId: 'cmd-model-error', ok: false, error: 'Model picker did not open',
+    });
+
+    const result = await executor.getModelOptions('cmd-model-error');
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.data, {
+      options: [{ id: 'model-opus', label: 'model-opus', selected: true }],
+      completeness: 'complete',
+      filterActive: false,
+      source: 'capability_snapshot',
+      liveError: 'Model picker did not open',
+    });
+  });
+
+  it('does not use stale, incomplete, or wrong-generation capability catalogs', async () => {
+    const cases = [
+      snapshot({ status: { ...snapshot().status, state: 'stale' } }),
+      snapshot({ models: { ...snapshot().models, completeness: 'partial' } }),
+      snapshot({ targetGeneration: 2 }),
+    ];
+    for (const [index, snap] of cases.entries()) {
+      const executor = guardedExecutor(snap, [], index === 2 ? { generation: 3 } : {});
+      (executor as unknown as {
+        openModelMenuAndReadOptions: () => Promise<unknown>;
+      }).openModelMenuAndReadOptions = async () => ({
+        options: [], completeness: 'complete', filterActive: false,
+      });
+      const result = await executor.getModelOptions(`cmd-no-fallback-${index}`);
+      assert.equal(result.ok, true);
+      assert.deepEqual((result.data as { options: unknown[] }).options, []);
+      assert.equal((result.data as { source: string }).source, 'live_menu');
+    }
+  });
+});
+
 describe('CommandExecutor setMode/setModel allowlist', () => {
   it('fail-closes when no capability guard is wired and never evaluates', async () => {
     const evals: string[] = [];

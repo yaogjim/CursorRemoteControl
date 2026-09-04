@@ -512,13 +512,19 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 
 ### 6.1 布局
 
-移动优先、单列布局，匹配 Cursor 的深色主题。五个固定区域：
+移动优先、单列布局。保留现有明暗主题与消息卡片视觉语言。不增加底部导航，也不引入客户端路由。正常状态下顶部最多两层常驻区域：
 
-1. **页头**（顶部固定）：连接指示器 + agent 状态
-2. **窗口栏**（页头下方）：项目级窗口选择器（仅 1 个窗口时隐藏）。点一个窗口会把主（长生命周期）CDP 连接移到该 target；其他窗口继续并行轮询。
-3. **Tab 栏**（窗口栏下方）：活动/主窗口内的聊天 tab 选择器（≤ 1 个 tab 时隐藏）
-4. **消息**（可滚动中间）：带按类型渲染的带类型聊天元素
-5. **页脚**（底部固定）：审批栏（条件显示）+ 问卷栏（条件显示）+ mode/model 药丸 + 消息输入
+1. **品牌状态层**（`#header`）：`CursorRemote` 品牌、连接指示器、Agent 状态（含 `Queued`）。主题与能力诊断不常驻页头；由 44px「更多」按钮打开独立系统面板。
+2. **项目会话层**（`#context-bar`）：当前窗口、会话和新建会话。单窗口时仍可进入会话抽屉，但不显示无意义的窗口数量徽章。点一个窗口会把主（长生命周期）CDP 连接移到该 target；其他窗口继续并行轮询。
+3. **消息主区**（`#messages`）：唯一主滚动区，按类型渲染聊天元素、计划卡片、命令和工具卡片。
+4. **条件式阻塞层**（消息与输入之间）：仅在 agent 被阻塞时出现。可映射审批显示紧凑定位提醒；不可映射 / `approve_all` / legacy 全局审批保留 Accept/Reject 兜底。问卷显示紧凑入口，打开后为半屏面板。审批与问卷共存时不得同时叠加两块大型固定区。
+5. **输入区**（`#input-bar`）：mode/model 药丸、能力状态提示和消息输入。主题选择与完整能力诊断不在输入区。
+
+队列明细与 Plans 条不是常驻导航层。`Queued` 显示在 Agent 状态中；队列条目按需展开。Plans 对话卡保留在消息区；会话层最多提供一个简洁数量／状态入口。
+
+**系统面板**：页头「更多」打开独立 bottom sheet / dialog（`role="dialog"`、`aria-modal`、标题、关闭按钮）。承载 `#theme-select` 与完整 `#capability-diagnostics`（DOM ID 不变），以及显式能力刷新。Windows & Sessions 抽屉只负责窗口和会话。
+
+**协议不变**：本次只改变 Web 客户端投影。`CursorState`、socket.io 命令、CDP 提取、Telegram 和动作授权模型不变；继续只使用服务端颁发的 `actionId`。不得转换 action type，也不得复用 `actionId`。
 
 ### 6.2 聊天元素
 
@@ -535,16 +541,30 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 
 ### 6.3 审批栏
 
+审批显示所有权在消息卡片。`#approval-bar` 只负责提醒或无法映射时的兜底，不复制卡片内已有的 Run/Skip/Allow。
+
 - 当 `pendingApprovals.length > 0` 时出现在消息和输入之间
-- 两个大按钮：Approve（绿）和 Reject（红）
-- 最小 48px 按钮高度，便于可靠的移动端点按
+- **可映射审批**：pending approval 能通过消息 `id`、`toolCallId` 或 approval `id` 对应到 `run_command` 或带 `actions` 的 tool 卡时，吸底栏只显示动作摘要和「View」定位按钮。实际动作只在卡内发送。点击「View」滚动到该卡并短暂高亮。映射失效（卡片消失或无法匹配）时安全回退到可操作兜底栏。
+- **不可映射 / `approve_all` / global/legacy**：保留现有 Accept（绿）和 Reject（红）按钮，最小 48px 高度，继续走 `submitApproval()` 链路。
+- 客户端映射仅控制展示和定位，严禁转换 action type 或复用 `actionId`
 - 没有剩余审批时消失
 
 ### 6.4 消息输入
 
-- 全宽文本区域 + 圆形发送按钮
-- Enter 发送（桌面上 Shift+Enter 换行）
+- 全宽文本区域 + 圆形发送按钮；输入字号至少 16px，避免 iOS 聚焦自动放大
+- Enter 发送（桌面上 Shift+Enter 换行；触摸主输入上 Enter 换行）
 - 文本通过 CDP 的 `Input.insertText` + Enter 的 `Input.dispatchKeyEvent` 提交
+- viewport 允许缩放并使用 `viewport-fit=cover`；布局使用 `100dvh` / `visualViewport`，软键盘出现时输入框保持在可视区域
+- 关键触控目标最小 44×44px；尊重 safe-area、`:focus-visible` 和 `prefers-reduced-motion`
+
+### 6.4.1 问卷面板
+
+Agent 问卷不直接占用最高 55vh 的主文档流。底部显示紧凑入口；打开后为可滚动半屏 bottom sheet。
+
+- 保留 Skip / Continue、`questionnaireOptimistic`、null-hold、同步 watchdog 和现有 `command:click_action` 载荷
+- 选项使用 `radiogroup` / `aria-checked`；状态 patch 后尽量保留当前问题、滚动位置和焦点
+- 面板有标题、关闭按钮、Escape、焦点约束和关闭后焦点恢复
+- 与可操作审批提醒共存时，问卷只保留计数／入口，不叠加第二块大型固定区
 
 ### 6.5 窗口选择器
 
@@ -553,19 +573,23 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 - **主（home）** 窗口持有长生命周期 CDP 连接，并以 `POLL_INTERVAL_MS` 持续轮询
 - 其他窗口由 `WindowMonitor` 每 10s 并行轮询（临时 CDP 连接；不改变 Cursor 的焦点窗口）
 - 活动/主窗口高亮；点按发出 `command:switch_window`，把主连接移到该 target（`cdp-bridge.switchWindow`）
-- 只打开一个 Cursor 窗口时隐藏
+- 项目／会话入口始终在 `#context-bar`；单窗口时不显示窗口数量徽章，但仍可打开抽屉
 - 窗口列表每 10 秒刷新
+- 抽屉内窗口行是语义化按钮；打开中的抽屉在 `windows` / `chatTabs` patch 后同步刷新
 
 ### 6.6 聊天 Tab 栏
 
+- 当前会话显示在 `#context-bar`；完整列表在 Windows & Sessions 抽屉中
 - 显示从 `.agent-sidebar-cell` 元素（较新构建为 glass sidebar 行）提取的所有打开聊天 tab
 - 活动 tab 高亮，点按通过基于标题的匹配切换
-- 1 个或更少 tab 时隐藏
+- 会话行是语义化按钮，支持键盘激活；抽屉提供 Escape、焦点约束、背景不可交互和关闭后焦点恢复
+- 0 个或 1 个 tab 时 context 层仍保留，以便新建会话
 
 ### 6.7 状态指示器
 
 - **连接圆点**：绿（已连接）、黄（重连中）、红（已断开）。若 CDP 已连接但提取停滞，标签会反映 `extractorStatus`（`waiting` / `stale`），而不是笼统的浏览器断开。
-- **Agent 状态**：带活动描述的文本标签（Idle、Thinking、Running tool、Needs approval、Error）
+- **Agent 状态**：带活动描述的文本标签（Idle、Thinking、Running tool、Needs approval、Queued、Error）。有等待中的 composer 队列且无 live activity 时显示 Queued。
+- `#messages` 不作为持续朗读的 live region；待审批提醒使用独立、明确的状态区域。
 
 ### 6.8 视觉设计
 

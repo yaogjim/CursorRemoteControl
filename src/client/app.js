@@ -207,6 +207,9 @@
   let awaitingCapabilityFull = false;
   let csrfTokenCache = '';
   const CSRF_COOKIE_NAME = 'cursor_remote_csrf';
+  let queueDetailsOpen = false;
+  let sessionPlansOpen = false;
+  let approvalHighlightTimer = 0;
 
   let userScrolledUp = false;
   let autoScrollJob = 0;
@@ -298,6 +301,173 @@
   const $planModalTitle = document.getElementById('plan-modal-title');
   const $planModalBody = document.getElementById('plan-modal-body');
   const $planModalClose = document.getElementById('plan-modal-close');
+  const $btnSystem = document.getElementById('btn-system');
+  const $systemPanel = document.getElementById('system-panel');
+  const $systemOverlay = document.getElementById('system-overlay');
+  const $systemPanelClose = document.getElementById('system-panel-close');
+  const $btnApprovalView = document.getElementById('btn-approval-view');
+  const $questionnaireTrigger = document.getElementById('questionnaire-trigger');
+  const $questionnaireTriggerLabel = document.getElementById('questionnaire-trigger-label');
+  const $questionnaireSheet = document.getElementById('questionnaire-sheet');
+  const $questionnaireSheetOverlay = document.getElementById('questionnaire-sheet-overlay');
+  const $questionnaireSheetClose = document.getElementById('questionnaire-sheet-close');
+  const $queueToggle = document.getElementById('composer-queue-toggle');
+  const $sessionPlansToggle = document.getElementById('session-plans-toggle');
+  const $app = document.getElementById('app');
+
+  function syncAppViewport() {
+    const viewport = window.visualViewport;
+    const height = viewport && typeof viewport.height === 'number'
+      ? viewport.height
+      : window.innerHeight;
+    const offset = viewport && typeof viewport.offsetTop === 'number'
+      ? viewport.offsetTop
+      : 0;
+    document.documentElement.style.setProperty('--app-height', height + 'px');
+    document.documentElement.style.setProperty('--app-offset', offset + 'px');
+  }
+  syncAppViewport();
+  window.addEventListener('resize', syncAppViewport);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', syncAppViewport);
+    window.visualViewport.addEventListener('scroll', syncAppViewport);
+  }
+
+  function layerFocusable(root) {
+    if (!root) return [];
+    return Array.prototype.slice.call(root.querySelectorAll(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    ));
+  }
+
+  function isUsableFocusTarget(el) {
+    if (!el || el === document.body || el === document.documentElement) return false;
+    if (typeof el.focus !== 'function') return false;
+    if (el.disabled === true) return false;
+    if (el.hasAttribute && el.hasAttribute('disabled')) return false;
+    if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') return false;
+    if (typeof el.closest === 'function' && el.closest('.hidden, [hidden], [aria-hidden="true"]')) return false;
+    return true;
+  }
+
+  function bindLayer(panel, overlay, options) {
+    const opts = options || {};
+    let open = false;
+    let trigger = null;
+    function setOpenAttr(isOpen) {
+      panel.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
+      if (overlay) overlay.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
+      if (opts.triggerEl) opts.triggerEl.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+    }
+    function onKeydown(e) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const nodes = layerFocusable(panel);
+      if (nodes.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      const first = nodes[0];
+      const last = nodes[nodes.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+    function setBackgroundInert(isOpen) {
+      if (!$app) return;
+      Array.prototype.forEach.call($app.children, function (child) {
+        if (child === panel || child === overlay) {
+          child.removeAttribute('inert');
+          return;
+        }
+        if (isOpen) child.setAttribute('inert', '');
+        else child.removeAttribute('inert');
+      });
+    }
+    function restoreFocus() {
+      const fallback = typeof opts.restoreFallback === 'function' ? opts.restoreFallback() : null;
+      const target = isUsableFocusTarget(trigger)
+        ? trigger
+        : (isUsableFocusTarget(fallback) ? fallback : null);
+      if (target) {
+        try { target.focus(); } catch { /* ignore */ }
+      }
+    }
+    function openFrom(fromEl) {
+      trigger = fromEl || document.activeElement;
+      panel.classList.remove('hidden');
+      if (overlay) overlay.classList.remove('hidden');
+      setOpenAttr(true);
+      setBackgroundInert(true);
+      document.removeEventListener('keydown', onKeydown);
+      document.addEventListener('keydown', onKeydown);
+      const focusEl = (opts.initialFocus && opts.initialFocus()) || layerFocusable(panel)[0];
+      if (focusEl && typeof focusEl.focus === 'function') focusEl.focus();
+      open = true;
+      if (opts.onOpen) opts.onOpen();
+    }
+    function close() {
+      if (!open && panel.classList.contains('hidden')) return;
+      panel.classList.add('hidden');
+      if (overlay) overlay.classList.add('hidden');
+      setOpenAttr(false);
+      setBackgroundInert(false);
+      document.removeEventListener('keydown', onKeydown);
+      open = false;
+      restoreFocus();
+      trigger = null;
+      if (opts.onClose) opts.onClose();
+    }
+    if (overlay) {
+      overlay.addEventListener('click', function (e) {
+        if (e.target === overlay) close();
+      });
+    }
+    return {
+      open: openFrom,
+      close,
+      isOpen: function () { return open; },
+    };
+  }
+
+  const $themeSelect = document.getElementById('theme-select');
+  const $planModal = document.getElementById('plan-modal');
+  const systemLayer = bindLayer($systemPanel, $systemOverlay, {
+    triggerEl: $btnSystem,
+    initialFocus: function () { return $themeSelect || $systemPanelClose; },
+  });
+  const drawerLayer = bindLayer($drawer, $drawerOverlay, {
+    triggerEl: $contextMain,
+    initialFocus: function () { return $drawerClose; },
+  });
+  const questionnaireLayer = bindLayer($questionnaireSheet, $questionnaireSheetOverlay, {
+    triggerEl: $questionnaireTrigger,
+    initialFocus: function () { return $questionnaireSheetClose; },
+    restoreFallback: function () { return $input; },
+  });
+  const modeLayer = bindLayer($sheetMode, $sheetOverlay, {
+    triggerEl: $pillMode,
+    onClose: function () { if (activeSheet === 'mode') activeSheet = null; },
+  });
+  const modelLayer = bindLayer($sheetModel, $sheetOverlay, {
+    triggerEl: $pillModel,
+    onClose: function () { if (activeSheet === 'model') activeSheet = null; },
+  });
+  const planModelLayer = bindLayer($sheetPlanModel, $sheetOverlay, {
+    onClose: function () { if (activeSheet === 'plan-model') activeSheet = null; },
+  });
+  const planLayer = bindLayer($planModal, $planModalOverlay, {
+    initialFocus: function () { return $planModalClose; },
+    onClose: function () { activePlanModal = null; },
+  });
 
   const socket = io({
     reconnection: true,
@@ -647,7 +817,24 @@
       const res = await apiWrite('/api/discovery/run', {});
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.ok !== false) {
-        setCapabilityRefreshStatus('Capability refresh finished.');
+        const models = Array.isArray(data.data?.models?.items) ? data.data.models.items : [];
+        const selectableComposerModels = models.filter((model) =>
+          model && model.scope === 'composer' && model.selectable === true
+        );
+        const complete = data.data?.models?.completeness === 'complete';
+        if (selectableComposerModels.length > 0 && complete) {
+          setCapabilityRefreshStatus(
+            `Capability refresh finished: ${selectableComposerModels.length} selectable composer model${selectableComposerModels.length === 1 ? '' : 's'}.`
+          );
+        } else {
+          const detail = selectableComposerModels.length === 0
+            ? 'no verified selectable composer models'
+            : `${selectableComposerModels.length} composer models, but the list is not complete`;
+          setCapabilityRefreshStatus(
+            `Capability refresh finished with a warning: ${detail}. Open the model menu in Cursor and retry.`,
+            true,
+          );
+        }
         void refreshCapabilityDiagnostics();
       } else {
         setCapabilityRefreshStatus(data.error || `Capability refresh failed (${res.status})`, true);
@@ -1102,9 +1289,30 @@
     showToast('Creating new chat...', 'success');
   });
 
+  if ($btnSystem) $btnSystem.addEventListener('click', openSystemPanel);
+  if ($systemPanelClose) $systemPanelClose.addEventListener('click', closeSystemPanel);
   $contextMain.addEventListener('click', openDrawer);
   $drawerClose.addEventListener('click', closeDrawer);
   $drawerOverlay.addEventListener('click', closeDrawer);
+  if ($questionnaireTrigger) $questionnaireTrigger.addEventListener('click', openQuestionnaireSheet);
+  if ($questionnaireSheetClose) $questionnaireSheetClose.addEventListener('click', closeQuestionnaireSheet);
+  if ($queueToggle) $queueToggle.addEventListener('click', toggleQueueDetails);
+  if ($sessionPlansToggle) $sessionPlansToggle.addEventListener('click', toggleSessionPlans);
+  if ($headerRight) {
+    $headerRight.addEventListener('click', toggleQueueDetails);
+    $headerRight.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      e.preventDefault();
+      toggleQueueDetails();
+    });
+  }
+  if ($btnApprovalView) {
+    $btnApprovalView.addEventListener('click', () => {
+      const approval = state.pendingApprovals[0];
+      const card = findApprovalCard(approval);
+      if (!scrollToApprovalCard(card)) renderApprovals();
+    });
+  }
 
   $pillMode.addEventListener('click', () => {
     if (!isModeMutationEnabled()) return;
@@ -1116,9 +1324,6 @@
   });
   $sheetOverlay.addEventListener('click', closeSheet);
   $planModalClose.addEventListener('click', closePlanModal);
-  $planModalOverlay.addEventListener('click', (e) => {
-    if (e.target === $planModalOverlay) closePlanModal();
-  });
 
   function sendMessage() {
     void submitSendMessage();
@@ -1151,6 +1356,7 @@
   async function submitApproval(kind) {
     const approval = state.pendingApprovals[0];
     if (!approval) return;
+    if ($approvalBar && $approvalBar.dataset.mode !== 'fallback') return;
     if (!isSocketLive()) {
       showToast('Relay disconnected', 'error');
       return;
@@ -1279,12 +1485,16 @@
       has('agentStatus') ||
       has('agentActivityText') ||
       has('agentActivityLive') ||
-      has('agentActivitySource')
+      has('agentActivitySource') ||
+      has('composerQueue')
     ) {
       renderAgentStatus();
     }
     if (has('composerQueue')) renderComposerQueue();
-    if (has('windows') || has('activeWindowId') || has('chatTabs')) renderWindowsAndSessions();
+    if (has('windows') || has('activeWindowId') || has('chatTabs')) {
+      renderWindowsAndSessions();
+      if (drawerLayer && drawerLayer.isOpen()) renderDrawer();
+    }
     if (has('activeWindowId') && state.activeWindowId && capabilityState && capabilityState.targetId !== state.activeWindowId) {
       resetCapabilityCaches();
       capabilityState = null;
@@ -1297,7 +1507,7 @@
       if (has('messages')) renderMessages();
       renderSessionPlans();
     }
-    if (has('pendingApprovals')) renderApprovals();
+    if (has('pendingApprovals') || has('messages')) renderApprovals();
     if (has('questionnaire')) renderQuestionnaire();
     if (has('mode') || has('model')) renderModeModel();
     if (
@@ -1550,6 +1760,9 @@
     const statusFresh = connectionUi.layer === 'ok';
     const activity = (state.agentActivityText || '').trim();
     const activityLive = !!state.agentActivityLive;
+    const queue = state.composerQueue && Array.isArray(state.composerQueue.items)
+      ? state.composerQueue
+      : { items: [] };
     let primary = 'Idle';
     let detail = '';
     let tone = '';
@@ -1579,6 +1792,10 @@
             ? 'Generating'
             : 'Thinking'
       );
+    } else if (state.agentStatus === 'idle' && queue.items.length > 0) {
+      primary = 'Queued';
+      detail = queue.queueLabel || `${queue.items.length} queued`;
+      tone = 'var(--accent-yellow)';
     } else if (state.agentStatus !== 'idle') {
       primary = state.agentStatus === 'running_tool'
         ? 'Running'
@@ -1590,6 +1807,7 @@
     $statusIcon.textContent = icon;
     $statusText.textContent = primary;
     $statusText.style.color = tone;
+    $statusText.title = primary;
     $statusText.classList.toggle('agent-status-shimmer', statusFresh && activityLive);
     if ($statusDetail) {
       const max = 56;
@@ -1599,8 +1817,44 @@
     }
     if ($headerRight) {
       $headerRight.classList.remove('header-right-hidden');
-      $headerRight.dataset.status = statusFresh ? (state.agentStatus || 'idle') : 'stale';
+      $headerRight.dataset.status = statusFresh
+        ? (primary === 'Queued' ? 'queued' : (state.agentStatus || 'idle'))
+        : 'stale';
       $headerRight.dataset.live = statusFresh && activityLive ? '1' : '0';
+    }
+  }
+
+  function queueItems() {
+    return state.composerQueue && Array.isArray(state.composerQueue.items)
+      ? state.composerQueue
+      : { items: [] };
+  }
+
+  function toggleQueueDetails() {
+    const q = queueItems();
+    if (q.items.length === 0) return;
+    queueDetailsOpen = !queueDetailsOpen;
+    renderComposerQueue();
+  }
+
+  function toggleSessionPlans() {
+    if (sessionPlanMessages().length === 0) return;
+    sessionPlansOpen = !sessionPlansOpen;
+    renderSessionPlans();
+  }
+
+  function syncQueueTrigger(hasItems) {
+    if (!$headerRight) return;
+    if (hasItems) {
+      $headerRight.setAttribute('role', 'button');
+      $headerRight.setAttribute('aria-controls', 'composer-queue-bar');
+      $headerRight.setAttribute('aria-expanded', queueDetailsOpen ? 'true' : 'false');
+      $headerRight.tabIndex = 0;
+    } else {
+      $headerRight.removeAttribute('role');
+      $headerRight.removeAttribute('aria-controls');
+      $headerRight.removeAttribute('aria-expanded');
+      $headerRight.removeAttribute('tabindex');
     }
   }
 
@@ -1609,15 +1863,18 @@
     const labelEl = document.getElementById('composer-queue-label');
     const itemsEl = document.getElementById('composer-queue-items');
     if (!bar || !labelEl || !itemsEl) return;
-    const q = state.composerQueue && Array.isArray(state.composerQueue.items)
-      ? state.composerQueue
-      : { items: [] };
+    const q = queueItems();
     if (q.items.length === 0) {
       bar.classList.add('hidden');
       itemsEl.innerHTML = '';
+      queueDetailsOpen = false;
+      if ($queueToggle) $queueToggle.setAttribute('aria-expanded', 'false');
+      itemsEl.hidden = true;
+      syncQueueTrigger(false);
       return;
     }
-    bar.classList.remove('hidden');
+    if (queueDetailsOpen) bar.classList.remove('hidden');
+    else bar.classList.add('hidden');
     labelEl.textContent = q.queueLabel || `${q.items.length} queued`;
     itemsEl.innerHTML = '';
     q.items.forEach((it) => {
@@ -1632,6 +1889,9 @@
       row.appendChild(tx);
       itemsEl.appendChild(row);
     });
+    itemsEl.hidden = !queueDetailsOpen;
+    if ($queueToggle) $queueToggle.setAttribute('aria-expanded', queueDetailsOpen ? 'true' : 'false');
+    syncQueueTrigger(true);
   }
 
   function planDisplayStatus(plan) {
@@ -1671,9 +1931,27 @@
     if (plans.length === 0) {
       bar.classList.add('hidden');
       itemsEl.innerHTML = '';
+      sessionPlansOpen = false;
+      if ($sessionPlansToggle) {
+        $sessionPlansToggle.classList.add('hidden');
+        $sessionPlansToggle.setAttribute('aria-expanded', 'false');
+        $sessionPlansToggle.textContent = 'Plans';
+      }
       return;
     }
-    bar.classList.remove('hidden');
+    if ($sessionPlansToggle) {
+      $sessionPlansToggle.classList.remove('hidden');
+      const executing = plans.some((plan) => planDisplayStatus(plan) === 'Executing');
+      $sessionPlansToggle.textContent = executing
+        ? `Plans · ${plans.length} · Executing`
+        : `Plans · ${plans.length}`;
+      $sessionPlansToggle.setAttribute('aria-expanded', sessionPlansOpen ? 'true' : 'false');
+    }
+    if (!sessionPlansOpen) {
+      bar.classList.add('hidden');
+    } else {
+      bar.classList.remove('hidden');
+    }
     itemsEl.innerHTML = '';
     plans.forEach((plan) => {
       const btn = document.createElement('button');
@@ -2028,11 +2306,22 @@
 
   // --- Tool call ---
 
+  function normalizeRepeatedStatusText(value) {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    const compact = text.replace(/\s+/g, '').toLowerCase();
+    for (const status of ['cancelled', 'canceled', 'completed', 'failed', 'stopped']) {
+      if (compact === status + status) {
+        return text.slice(0, status.length);
+      }
+    }
+    return text;
+  }
+
   function toolDistinctSummary(msg) {
-    const action = (msg.action || '').trim();
+    const action = normalizeRepeatedStatusText(msg.action);
     const filename = (msg.filename || '').trim();
-    const details = (msg.details || '').trim();
-    const summary = (msg.summaryText || '').trim();
+    const details = normalizeRepeatedStatusText(msg.details);
+    const summary = normalizeRepeatedStatusText(msg.summaryText);
     const texts = [];
     if (details) texts.push(details);
     if (summary && summary !== details) texts.push(summary);
@@ -2052,6 +2341,7 @@
     const el = document.createElement('div');
     el.className = 'chat-el el-tool';
     el.dataset.id = msg.id;
+    if (msg.toolCallId) el.dataset.toolCallId = msg.toolCallId;
 
     const line = document.createElement('div');
     line.className = 'tool-line ' + msg.status;
@@ -2066,7 +2356,7 @@
 
     const action = document.createElement('span');
     action.className = 'tool-action';
-    action.textContent = msg.action || 'Tool';
+    action.textContent = normalizeRepeatedStatusText(msg.action) || 'Tool';
     header.appendChild(action);
 
     const filename = (msg.filename || '').trim();
@@ -2390,6 +2680,7 @@
   }
 
   function openPlanModal(msg) {
+    closeTransientUi('plan');
     activePlanModal = {
       id: msg.id,
       identity: planModalIdentity(msg),
@@ -2401,13 +2692,12 @@
       error: '',
     };
     renderPlanModal(msg);
-    $planModalOverlay.classList.remove('hidden');
+    planLayer.open(document.activeElement);
     loadFullPlanIntoModal(msg);
   }
 
   function closePlanModal() {
-    activePlanModal = null;
-    $planModalOverlay.classList.add('hidden');
+    planLayer.close();
   }
 
   function syncPlanModalFromState() {
@@ -2707,6 +2997,7 @@
     const el = document.createElement('div');
     el.className = 'chat-el el-run-command';
     el.dataset.id = msg.id;
+    if (msg.toolCallId) el.dataset.toolCallId = msg.toolCallId;
 
     const card = document.createElement('div');
     card.className = 'run-card';
@@ -2918,6 +3209,75 @@
 
   // --- Approvals ---
 
+  function isActionCardMessage(msg) {
+    if (!msg) return false;
+    if (msg.type !== 'run_command' && msg.type !== 'tool') return false;
+    const actions = Array.isArray(msg.actions) ? msg.actions : [];
+    return actions.some((action) =>
+      action
+      && typeof action.type === 'string'
+      && action.type
+      && hasOpaqueActionId(action.actionId)
+    );
+  }
+
+  function findApprovalCard(approval) {
+    if (!approval) return null;
+    const messages = Array.isArray(state.messages) ? state.messages : [];
+    const approvalId = String(approval.id || '');
+    const toolCallId = approvalId.indexOf('tool:') === 0 ? approvalId.slice(5) : '';
+    let msg = null;
+    if (toolCallId) {
+      msg = messages.find((item) => item && item.toolCallId === toolCallId && isActionCardMessage(item));
+    }
+    if (!msg && approvalId) {
+      msg = messages.find((item) => item && item.id === approvalId && isActionCardMessage(item));
+    }
+    if (!msg && toolCallId) {
+      msg = messages.find((item) => item && item.id === toolCallId && isActionCardMessage(item));
+    }
+    if (!msg) return null;
+    const el = Array.prototype.find.call(
+      $messages.querySelectorAll('.chat-el'),
+      (node) => {
+        if (node.getAttribute('data-id') === String(msg.id)) return true;
+        if (msg.toolCallId && node.getAttribute('data-tool-call-id') === String(msg.toolCallId)) return true;
+        return false;
+      }
+    ) || null;
+    if (!el) return null;
+    return { msg, el };
+  }
+
+  function approvalNeedsFallback(approval, card) {
+    if (!approval) return true;
+    const actions = Array.isArray(approval.actions) ? approval.actions : [];
+    if (actions.some((action) => action && action.type === 'approve_all')) return true;
+    if (!card || !card.el || !card.msg) return true;
+    if (!isActionCardMessage(card.msg)) return true;
+    const operable = card.el.querySelector(
+      '.run-btn:not([disabled]), .run-actions-row button:not([disabled]), .tool-actions-row button:not([disabled])'
+    );
+    if (!operable) return true;
+    return false;
+  }
+
+  function scrollToApprovalCard(card) {
+    if (!card || !card.el) return false;
+    if (!card.el.isConnected) return false;
+    userScrolledUp = true;
+    if (typeof card.el.scrollIntoView === 'function') {
+      card.el.scrollIntoView({ block: 'center' });
+    }
+    card.el.classList.add('approval-target-highlight');
+    if (approvalHighlightTimer) clearTimeout(approvalHighlightTimer);
+    approvalHighlightTimer = setTimeout(function () {
+      card.el.classList.remove('approval-target-highlight');
+      approvalHighlightTimer = 0;
+    }, 1600);
+    return true;
+  }
+
   function renderApprovals() {
     if (state.pendingApprovals.length > 0) {
       $approvalBar.classList.remove('hidden');
@@ -2927,9 +3287,19 @@
       const approveAction = approval.actions.find(a => (a.type === 'approve' || a.type === 'approve_all') && hasOpaqueActionId(a.actionId));
       const rejectAction = approval.actions.find(a => a.type === 'reject' && hasOpaqueActionId(a.actionId));
       const live = isSocketLive();
+      const card = findApprovalCard(approval);
+      const fallback = approvalNeedsFallback(approval, card);
 
-      $btnApprove.disabled = !live || approvalInFlight || rejectInFlight || !approveAction;
-      $btnReject.disabled = !live || approvalInFlight || rejectInFlight || !rejectAction;
+      if ($btnApprovalView) {
+        $btnApprovalView.classList.toggle('hidden', fallback);
+        $btnApprovalView.disabled = fallback;
+      }
+      $approvalBar.dataset.mode = fallback ? 'fallback' : 'reminder';
+      $btnApprove.classList.toggle('hidden', !fallback);
+      $btnReject.classList.toggle('hidden', !fallback);
+
+      $btnApprove.disabled = !live || approvalInFlight || rejectInFlight || !approveAction || !fallback;
+      $btnReject.disabled = !live || approvalInFlight || rejectInFlight || !rejectAction || !fallback;
       if (approveAction) $btnApprove.textContent = approveAction.label || 'Accept';
       if (rejectAction) $btnReject.textContent = rejectAction.label || 'Reject';
 
@@ -2939,6 +3309,10 @@
       );
     } else {
       $approvalBar.classList.add('hidden');
+      $approvalBar.dataset.mode = '';
+      if ($btnApprovalView) $btnApprovalView.classList.add('hidden');
+      $btnApprove.classList.remove('hidden');
+      $btnReject.classList.remove('hidden');
       forgetNotificationKeys('cursor-approval:');
     }
   }
@@ -2946,20 +3320,36 @@
   function renderQuestionnaire() {
     var q = state.questionnaire;
     if (!q || !q.questions || q.questions.length === 0) {
+      var sheetWasOpen = questionnaireLayer && questionnaireLayer.isOpen();
+      if (sheetWasOpen) questionnaireLayer.close();
       $questionnaireBar.classList.add('hidden');
       questionnaireOptimistic = {};
       forgetNotificationKeys('cursor-questionnaire');
+      if (!isUsableFocusTarget(document.activeElement)) {
+        if (isUsableFocusTarget($input)) $input.focus();
+        else if (isUsableFocusTarget($btnSystem)) $btnSystem.focus();
+      }
       return;
     }
     $questionnaireBar.classList.remove('hidden');
     var refreshing = !!questionnaireNullHoldTimer || questionnaireAwaitingSnapshot;
-    $questionnaireStepper.textContent = refreshing
+    var stepperText = refreshing
       ? ((q.totalLabel ? q.totalLabel + ' · ' : '') + 'Syncing…')
       : (q.totalLabel || '');
+    $questionnaireStepper.textContent = stepperText;
+    if ($questionnaireTriggerLabel) $questionnaireTriggerLabel.textContent = stepperText;
     var live = isSocketLive();
     var qBusy = qActionInFlight || !live || refreshing;
     $btnQSkip.disabled = qBusy || !hasOpaqueActionId(q.skipActionId);
     $btnQContinue.disabled = qBusy || q.continueDisabled || !hasOpaqueActionId(q.continueActionId);
+
+    var activeQuestionNumber = '';
+    var focusedLetter = '';
+    var scrollTop = $questionnaireQuestions.scrollTop;
+    if (document.activeElement && $questionnaireQuestions.contains(document.activeElement)) {
+      focusedLetter = document.activeElement.dataset.letter || '';
+      activeQuestionNumber = document.activeElement.dataset.questionNumber || '';
+    }
 
     $questionnaireQuestions.innerHTML = '';
     for (var i = 0; i < q.questions.length; i++) {
@@ -2980,6 +3370,8 @@
 
       var optionsDiv = document.createElement('div');
       optionsDiv.className = 'questionnaire-options';
+      optionsDiv.setAttribute('role', 'radiogroup');
+      optionsDiv.setAttribute('aria-label', question.text || ('Question ' + question.number));
       var serverSelectedLetter = '';
       for (var s = 0; s < question.options.length; s++) {
         if (question.options[s].selected === true) {
@@ -2993,6 +3385,9 @@
         var optBtn = document.createElement('button');
         var isSelected = opt.selected === true
           || (!serverSelectedLetter && questionnaireOptimistic[question.number] === opt.letter);
+        optBtn.type = 'button';
+        optBtn.setAttribute('role', 'radio');
+        optBtn.setAttribute('aria-checked', isSelected ? 'true' : 'false');
         optBtn.className = 'questionnaire-option' + (isSelected ? ' questionnaire-option-selected' : '');
         var letterSpan = document.createElement('span');
         letterSpan.className = 'questionnaire-option-letter';
@@ -3016,14 +3411,26 @@
           if (!isSocketLive() || qActionInFlight || questionnaireNullHoldTimer || questionnaireAwaitingSnapshot) return;
           questionnaireOptimistic[this.dataset.questionNumber] = this.dataset.letter;
           var siblings = this.parentNode.querySelectorAll('.questionnaire-option');
-          for (var sib = 0; sib < siblings.length; sib++) siblings[sib].classList.remove('questionnaire-option-selected');
+          for (var sib = 0; sib < siblings.length; sib++) {
+            siblings[sib].classList.remove('questionnaire-option-selected');
+            siblings[sib].setAttribute('aria-checked', 'false');
+          }
           this.classList.add('questionnaire-option-selected');
+          this.setAttribute('aria-checked', 'true');
           void submitQuestionnaireAction('questionnaire_option', this.dataset.actionId, this.dataset.questionNumber);
         });
         optionsDiv.appendChild(optBtn);
       }
       qDiv.appendChild(optionsDiv);
       $questionnaireQuestions.appendChild(qDiv);
+    }
+
+    $questionnaireQuestions.scrollTop = scrollTop;
+    if (activeQuestionNumber && focusedLetter) {
+      var restore = $questionnaireQuestions.querySelector(
+        '.questionnaire-option[data-question-number="' + activeQuestionNumber + '"][data-letter="' + focusedLetter + '"]'
+      );
+      if (restore && typeof restore.focus === 'function') restore.focus();
     }
 
     fireNotification('Agent has questions for you', 'cursor-questionnaire');
@@ -3156,8 +3563,10 @@
       card.className = 'window-card' + (isActive ? ' is-active' : '');
 
       // Window header
-      const head = document.createElement('div');
+      const head = document.createElement('button');
+      head.type = 'button';
       head.className = 'window-head';
+      head.setAttribute('aria-label', (isActive ? 'Current window: ' : 'Switch to ') + (win.title || 'Cursor'));
       head.innerHTML = `
         <span class="window-icon">${isActive ? '▣' : '▢'}</span>
         <div class="window-meta">
@@ -3191,7 +3600,8 @@
         sessList.className = 'sessions-list';
 
         tabs.forEach((tab) => {
-          const row = document.createElement('div');
+          const row = document.createElement('button');
+          row.type = 'button';
           const isOpen = tab.isOpen === true || tab.isActive;
           row.className = 'session-row'
             + (isOpen ? ' is-open' : ' is-closed')
@@ -3202,6 +3612,7 @@
           const statusDot = getStatusDot(tab.status);
           const statusText = getStatusText(tab.status);
           const availabilityLabel = tab.isActive ? 'Current' : (isOpen ? 'Open' : 'History');
+          row.setAttribute('aria-label', `${tab.title || 'Untitled Chat'}, ${availabilityLabel}`);
           
           row.innerHTML = `
             ${statusDot}
@@ -3275,15 +3686,41 @@
     return path;
   }
 
+  function closeTransientUi(except) {
+    if (except !== 'system' && systemLayer && systemLayer.isOpen()) systemLayer.close();
+    if (except !== 'drawer' && drawerLayer && drawerLayer.isOpen()) drawerLayer.close();
+    if (except !== 'questionnaire' && questionnaireLayer && questionnaireLayer.isOpen()) questionnaireLayer.close();
+    if (except !== 'sheet') closeSheet();
+    if (except !== 'plan') closePlanModal();
+  }
+
+  function openSystemPanel() {
+    closeTransientUi('system');
+    systemLayer.open($btnSystem);
+  }
+
+  function closeSystemPanel() {
+    systemLayer.close();
+  }
+
   function openDrawer() {
     renderDrawer();
-    $drawer.classList.remove('hidden');
-    $drawerOverlay.classList.remove('hidden');
+    closeTransientUi('drawer');
+    drawerLayer.open($contextMain);
   }
 
   function closeDrawer() {
-    $drawer.classList.add('hidden');
-    $drawerOverlay.classList.add('hidden');
+    drawerLayer.close();
+  }
+
+  function openQuestionnaireSheet() {
+    if ($questionnaireBar.classList.contains('hidden')) return;
+    closeTransientUi('questionnaire');
+    questionnaireLayer.open($questionnaireTrigger);
+  }
+
+  function closeQuestionnaireSheet() {
+    questionnaireLayer.close();
   }
 
   // Unified render function (replaces renderWindows + renderTabs)
@@ -3398,20 +3835,20 @@
   function openSheet(type) {
     if (type === 'mode' && !isModeMutationEnabled()) return;
     if (type === 'model' && !isModelMutationEnabled()) return;
+    closeTransientUi('sheet');
     closeSheet();
     activeSheet = type;
-    $sheetOverlay.classList.remove('hidden');
 
     if (type === 'mode') {
-      $sheetMode.classList.remove('hidden');
       renderModeSheet();
+      modeLayer.open($pillMode);
     } else if (type === 'model') {
-      $sheetModel.classList.remove('hidden');
       if (cachedModelOptions) {
         renderModelSheet(cachedModelOptions);
       } else {
         renderModelSheetLoading();
       }
+      modelLayer.open($pillModel);
       fetchModelOptions().then(options => {
         if (activeSheet !== 'model') return;
         if (options) {
@@ -3421,16 +3858,15 @@
         }
       });
     } else if (type === 'plan-model') {
-      $sheetPlanModel.classList.remove('hidden');
       renderPlanModelSheet();
+      planModelLayer.open();
     }
   }
 
   function closeSheet() {
-    $sheetOverlay.classList.add('hidden');
-    $sheetMode.classList.add('hidden');
-    $sheetModel.classList.add('hidden');
-    $sheetPlanModel.classList.add('hidden');
+    if (modeLayer && modeLayer.isOpen()) modeLayer.close();
+    if (modelLayer && modelLayer.isOpen()) modelLayer.close();
+    if (planModelLayer && planModelLayer.isOpen()) planModelLayer.close();
     activeSheet = null;
   }
 
@@ -3449,6 +3885,7 @@
 
     modes.forEach(m => {
       const btn = document.createElement('button');
+      btn.type = 'button';
       btn.className = 'sheet-item' + (m.id === current ? ' selected' : '');
       btn.setAttribute('aria-selected', String(m.id === current));
 
@@ -3523,6 +3960,7 @@
       const isSelected = (currentId && opt.id === currentId) || opt.selected ||
         currentName === opt.label.toLowerCase();
       const btn = document.createElement('button');
+      btn.type = 'button';
       btn.className = 'sheet-item' + (isSelected ? ' selected' : '');
 
       let inner = '<span class="sheet-item-label">' + escapeHtml(opt.label) + '</span>';
@@ -3557,6 +3995,7 @@
 
     ctx.options.forEach((opt) => {
       const btn = document.createElement('button');
+      btn.type = 'button';
       btn.className = 'sheet-item' + (opt.selected ? ' selected' : '');
       btn.innerHTML =
         `<span class="sheet-item-label">${escapeHtml(opt.label)}</span>` +

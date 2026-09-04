@@ -247,8 +247,11 @@ Cursor IDE  ←──CDP──→  Relay Server  ←──socket.io──→  Ph
 - 把 `command:switch_window` 路由到 CDP Bridge（`switchWindow` 移动主连接）
 - 把状态管理器事件转发给所有已连接 socket
 
-**Web 客户端**（`src/client/app.js`、`src/client/styles.css`）：
+**Web 客户端**（`src/client/app.js`、`src/client/styles.css`、`src/client/index.html`）：
 
+- 这是对 `CursorState` 的客户端投影。布局重构不改变 `CursorState`、socket.io 命令事件、CDP 提取、Telegram 传输或动作授权；继续只使用服务端颁发的 `actionId`。
+- 信息架构：两层顶部（品牌状态层 + 项目会话层）、唯一 `#messages` 主滚动区、条件式阻塞层（审批提醒或问卷入口）、输入区（mode/model + 发送）。主题和能力诊断在系统面板中；Windows & Sessions 抽屉只负责窗口和会话。
+- 可映射审批只在消息卡片内提交 Run/Skip/Allow；`#approval-bar` 显示摘要和定位。不可映射 / `approve_all` / legacy 审批保留 Accept/Reject 和 `submitApproval()`。问卷使用紧凑入口 + 半屏面板，命令载荷不变。
 - 把 `ChatElement` 类型渲染进 `#messages`；助手 HTML 经过 `sanitizeHtml`（剥离脚本、事件处理程序，以及嵌入的 composer/Shiki 根）。
 - **原生代码/diff**：`createNativeBlockFromItem()` 构建带工具栏（标题 + 全屏）的 `.code-block.native-code-block`，**`.code-block-viewport`** 限制约 7 行（`--cb-font`、`--cb-lh`、`--cb-lines`）并可滚动，结构化 diff 使用绿/红行样式。助手 **`codeBlocks`** 追加在散文之后；工具 **`diffBlock`** 挂在 **`.tool-diff-host`** 下（`syncToolDiffHost` / `updateToolEl`）。纯 patch 文本也会在服务端分类为 `diffLines`，因此非 Monaco diff 仍以增/删颜色渲染。
 - **全屏阅读器**：Expand 打开 **`.code-block-fs-overlay`**（模态、safe-area 内边距、背景 + Escape 关闭、44px+ 控件）。打开时锁定 body 滚动。

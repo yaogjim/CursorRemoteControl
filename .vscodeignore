@@ -1,6 +1,9 @@
 .vscode/
 .cursor/
 .claude/
+.history/
+.specstory/
+.cursorindexingignore
 .github/
 task/
 tests/

@@ -1327,12 +1327,59 @@ export class CommandExecutor {
     });
   }
 
+  private verifiedComposerModelOptions(): PlanModelOption[] {
+    const snapshot = this.capabilityGuard?.getSnapshot() ?? null;
+    if (!snapshot) return [];
+    const activeTargetId = this.capabilityGuard?.getActiveTargetId() ?? this.targetIdProvider?.() ?? '';
+    const liveGeneration = this.capabilityGuard?.getTargetGeneration(snapshot.targetId)
+      ?? this.targetGenerationProvider?.()
+      ?? 0;
+    if (snapshot.targetId !== activeTargetId || snapshot.targetGeneration !== liveGeneration) return [];
+    if (snapshot.status.state !== 'ok' && snapshot.status.state !== 'changed') return [];
+    if (snapshot.models.completeness !== 'complete') return [];
+    return snapshot.models.items
+      .filter((item) =>
+        item.scope === 'composer'
+        && item.selectable
+        && this.capabilityError('model', item.id) === null
+      )
+      .map((item) => ({ id: item.id, label: item.label, selected: item.selected }));
+  }
+
   async getModelOptions(commandId: string): Promise<CommandResult> {
     const result = await this.withRetryValue(commandId, async (client) => {
       return await this.openModelMenuAndReadOptions(client);
     });
+    const liveData = result.data as {
+      options?: PlanModelOption[];
+      completeness?: 'complete' | 'partial' | 'unknown';
+      filterActive?: boolean;
+    } | undefined;
+    if (result.ok && Array.isArray(liveData?.options) && liveData.options.length > 0) {
+      return {
+        commandId,
+        ok: true,
+        data: { ...liveData, source: 'live_menu' },
+      };
+    }
+
+    const fallback = this.verifiedComposerModelOptions();
+    if (fallback.length > 0) {
+      return {
+        commandId,
+        ok: true,
+        data: {
+          options: fallback,
+          completeness: 'complete',
+          filterActive: false,
+          source: 'capability_snapshot',
+          ...(result.ok ? {} : { liveError: result.error || 'Live model menu read failed' }),
+        },
+      };
+    }
+
     if (!result.ok) return result;
-    return { commandId, ok: true, data: result.data };
+    return { commandId, ok: true, data: { ...liveData, source: 'live_menu' } };
   }
 
   async getPlanModelOptions(commandId: string, selectorPath: string): Promise<CommandResult> {
