@@ -78,5 +78,30 @@
       ".ui-model-picker__trigger",
       ".composer-unified-dropdown-model"
     ]
+  },
+  "planDocumentTab": {
+    "strategies": [
+      ".tabs-container [role='tab'][data-resource-name]"
+    ]
+  },
+  "planDocumentBreadcrumbIcon": {
+    "strategies": [
+      ".breadcrumbs-control .plan-file-icon[aria-label]"
+    ]
+  },
+  "planDocumentEditor": {
+    "strategies": [
+      ".plan-editor__richtext"
+    ]
+  },
+  "planDocumentEditorGroup": {
+    "strategies": [
+      ".editor-group-container"
+    ]
+  },
+  "composerMessagesScroll": {
+    "strategies": [
+      ".virtualized-composer-messages-scroll-container"
+    ]
   }
 }

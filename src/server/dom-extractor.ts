@@ -784,7 +784,9 @@ export function extractionFunction(
             type: 'plan' as const,
             id: messageId,
             flatIndex,
+            toolCallId,
             label,
+            fileName: /\.md$/i.test(label) ? label : undefined,
             title,
             description,
             descriptionHtml: descriptionHtml || undefined,
@@ -795,6 +797,59 @@ export function extractionFunction(
             model,
             modelDropdownSelectorPath,
             actions: actions.length > 0 ? actions : undefined,
+          },
+          parsedAs: 'plan',
+        };
+      }
+
+      // Cursor 3.15+ CreatePlan card: the dedicated `composer-plan-filename` marker inside
+      // the root tool-call card is the only reliable signal. The card exposes just the
+      // overview summary (no todos, filename, href or path in the DOM), so description is
+      // a summary and never claimed to be the full plan document. Only View Plan is
+      // extracted; opening it is what reveals the real plan path.
+      const planCard = toolRoot.querySelector('.ui-tool-call-card[data-tool-call-card-marker="root"]');
+      const planFilenameEl = planCard?.querySelector('[data-testid="composer-plan-filename"]');
+      if (planCard && planFilenameEl) {
+        const headerEl = planCard.querySelector('.ui-tool-call-card__header');
+        const title =
+          (planFilenameEl.textContent || '').trim() ||
+          (headerEl?.getAttribute('title') || '').trim();
+        let label = '';
+        if (headerEl) {
+          for (const s of Array.from(headerEl.querySelectorAll('span'))) {
+            if (s === planFilenameEl || s.contains(planFilenameEl)) continue;
+            const t = (s.textContent || '').trim();
+            if (t) {
+              label = t;
+              break;
+            }
+          }
+        }
+
+        const summaryRoot = planCard.querySelector('.markdown-root');
+        const description = summaryRoot ? (summaryRoot.textContent || '').trim() : undefined;
+        const descriptionHtml = summaryRoot ? (summaryRoot.innerHTML || '').trim() : undefined;
+
+        const planActions: { label: string; type: 'view_plan'; selectorPath: string }[] = [];
+        const viewButtons = Array.from(planCard.querySelectorAll('button')).filter((btn) =>
+          (btn.textContent || '').replace(/\s+/g, ' ').trim() === 'View Plan');
+        if (viewButtons.length === 1) {
+          planActions.push({ label: 'View Plan', type: 'view_plan', selectorPath: buildSelectorPath(viewButtons[0]) });
+        }
+
+        return {
+          element: {
+            type: 'plan' as const,
+            id: messageId,
+            flatIndex,
+            toolCallId,
+            label,
+            title,
+            description,
+            descriptionHtml: descriptionHtml || undefined,
+            todosCompleted: 0,
+            todosTotal: 0,
+            actions: planActions.length > 0 ? planActions : undefined,
           },
           parsedAs: 'plan',
         };
@@ -1196,6 +1251,7 @@ export function extractionFunction(
             id: messageId,
             flatIndex,
             label,
+            fileName: /\.md$/i.test(label) ? label : undefined,
             title,
             todosCompleted,
             todosTotal,

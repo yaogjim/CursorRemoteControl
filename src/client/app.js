@@ -209,6 +209,17 @@
   const CSRF_COOKIE_NAME = 'cursor_remote_csrf';
   let queueDetailsOpen = false;
   let sessionPlansOpen = false;
+  // Short-lived, session-scoped reading references returned by discover_plans.
+  // Simple holder + one expiry timer; no framework, never persisted.
+  let discoveredPlanRefs = null;
+  let discoveredPlanSessionIdentity = '';
+  let discoveredPlanNonceSession = '';
+  let discoveredPlanNonce = '';
+  let discoveredPlanSeq = 0;
+  let discoveredPlanExpiryTimer = 0;
+  let discoveredPlanScanInFlight = false;
+  let discoveredPlanError = '';
+  let discoveredPlanNotice = '';
   let approvalHighlightTimer = 0;
 
   let userScrolledUp = false;
@@ -220,6 +231,7 @@
   const notifiedMessageIds = new Set();
   const notifiedKeys = new Set();
   let activePlanModal = null;
+  let planModalInstanceCounter = 0;
   let messagesSessionIdentity = '';
   let activePlanModelContext = null;
   const pendingCommandResults = new Map();
@@ -466,7 +478,10 @@
   });
   const planLayer = bindLayer($planModal, $planModalOverlay, {
     initialFocus: function () { return $planModalClose; },
-    onClose: function () { activePlanModal = null; },
+    onClose: function () {
+      activePlanModal = null;
+      if ($planModalBody) $planModalBody.innerHTML = '';
+    },
   });
 
   const socket = io({
@@ -952,6 +967,7 @@
     renderModeModel();
     renderCapabilityDiagnostics();
     refreshInteractiveUi();
+    renderSessionPlans();
     void refreshCapabilityDiagnostics();
   });
   socket.on('disconnect', (reason) => {
@@ -966,10 +982,13 @@
       capabilityState = { ...capabilityState, status: { ...(capabilityState.status || {}), state: 'stale' } };
     }
     cachedModelOptions = null;
+    clearPlanDiscovery();
+    closePlanModal();
     if (activeSheet === 'mode' || activeSheet === 'model') closeSheet();
     renderModeModel();
     renderCapabilityDiagnostics();
     refreshInteractiveUi();
+    renderSessionPlans();
   });
 
   if (socket.io && typeof socket.io.on === 'function') {
@@ -1838,9 +1857,266 @@
   }
 
   function toggleSessionPlans() {
-    if (sessionPlanMessages().length === 0) return;
+    if (sessionPlanMessages().length === 0 && !plansEntryAvailable()) return;
     sessionPlansOpen = !sessionPlansOpen;
     renderSessionPlans();
+  }
+
+  /** Reuse this page's own draft notion so a history scan never steals Cursor while we type. */
+  function hasComposerDraft() {
+    return $input.value.trim().length > 0;
+  }
+
+  function newPlanDiscoveryNonce() {
+    discoveredPlanSeq += 1;
+    return `plan-discovery-${discoveredPlanSeq}`;
+  }
+
+  /** A discover/read target is only usable with a live relay and a confirmable window+session. */
+  function planSessionTarget() {
+    if (!isSocketLive()) return null;
+    const windowId = typeof state.activeWindowId === 'string' ? state.activeWindowId : '';
+    const composerId = typeof state.activeComposerId === 'string' ? state.activeComposerId : '';
+    if (!windowId || !composerId) return null;
+    return { windowId, composerId };
+  }
+
+  /** The Plans entry stays discoverable even with zero plan cards, as long as the target is known. */
+  function plansEntryAvailable() {
+    return !!planSessionTarget();
+  }
+
+  function isPlanReferenceLive(refs) {
+    return !!refs
+      && isValidPlanTime(refs.expiresAt)
+      && refs.expiresAt > Date.now();
+  }
+
+  /** Refs are only ever valid for the exact session that produced them. */
+  function activePlanReferences() {
+    const target = planSessionTarget();
+    if (!target || !discoveredPlanRefs) return [];
+    if (discoveredPlanSessionIdentity !== currentPlanSessionIdentity()) return [];
+    if (discoveredPlanRefs.windowId !== target.windowId || discoveredPlanRefs.composerId !== target.composerId) return [];
+    if (!isPlanReferenceLive(discoveredPlanRefs)) return [];
+    return discoveredPlanRefs.plans;
+  }
+
+  function clearPlanDiscovery() {
+    if (discoveredPlanExpiryTimer) {
+      clearTimeout(discoveredPlanExpiryTimer);
+      discoveredPlanExpiryTimer = 0;
+    }
+    discoveredPlanRefs = null;
+    discoveredPlanSessionIdentity = '';
+    discoveredPlanNonceSession = '';
+    discoveredPlanScanInFlight = false;
+    discoveredPlanError = '';
+    // Bump the nonce so a late response for the abandoned session can never land.
+    discoveredPlanNonce = newPlanDiscoveryNonce();
+    if (activePlanModal && activePlanModal.fromReference) closePlanModal();
+  }
+
+  /**
+   * Drop refs — and any scan still in flight — whose session is gone, whose
+   * relay dropped, or whose TTL lapsed.
+   */
+  function prunePlanDiscovery() {
+    const sessionNow = currentPlanSessionIdentity();
+    const knownSession = discoveredPlanNonceSession || discoveredPlanSessionIdentity;
+    if (!knownSession) return;
+    const target = planSessionTarget();
+    if (!target || knownSession !== sessionNow) { clearPlanDiscovery(); return; }
+    if (discoveredPlanRefs && !isPlanReferenceLive(discoveredPlanRefs)) {
+      clearPlanDiscovery();
+      discoveredPlanNotice = '历史计划引用已过期，请重新查找';
+    }
+  }
+
+  function armPlanDiscoveryExpiry(refs) {
+    if (discoveredPlanExpiryTimer) clearTimeout(discoveredPlanExpiryTimer);
+    const delay = Math.max(0, Math.min(refs.expiresAt - Date.now(), 2147483647)) + 200;
+    const timer = setTimeout(() => {
+      discoveredPlanExpiryTimer = 0;
+      if (discoveredPlanRefs && !isPlanReferenceLive(discoveredPlanRefs)) {
+        clearPlanDiscovery();
+        discoveredPlanNotice = '历史计划引用已过期，请重新查找';
+        renderSessionPlans();
+        syncPlanModalFromState();
+      }
+    }, delay);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+    discoveredPlanExpiryTimer = timer;
+  }
+
+  /**
+   * Accept only a bounded, partial scan for the requested session whose plans
+   * carry server-issued reading references ('plan-ref:' ids) plus the real
+   * toolCallId. The client never invents ids or lists anything off-disk.
+   */
+  function validatePlanDiscoveryResult(data, target) {
+    if (!data || typeof data !== 'object') return { ok: false, error: '历史计划查找结果无效' };
+    if (data.windowId !== target.windowId || data.composerId !== target.composerId) {
+      return { ok: false, error: '历史计划查找结果与当前窗口/会话不一致' };
+    }
+    if (data.completeness !== 'partial') return { ok: false, error: '历史计划查找范围标识非法' };
+    if (typeof data.reachedStart !== 'boolean') return { ok: false, error: '历史计划查找范围标识非法' };
+    if (!isValidPlanTime(data.observedAt) || !isValidPlanTime(data.expiresAt)) {
+      return { ok: false, error: '历史计划引用有效期非法' };
+    }
+    if (data.expiresAt <= Date.now()) return { ok: false, error: '历史计划引用已过期，请重新查找' };
+    if (!Array.isArray(data.plans)) return { ok: false, error: '历史计划列表格式非法' };
+    const plans = [];
+    for (const plan of data.plans) {
+      if (!plan || typeof plan !== 'object') return { ok: false, error: '历史计划引用格式非法' };
+      if (typeof plan.id !== 'string' || !plan.id.startsWith('plan-ref:')) {
+        return { ok: false, error: '历史计划引用标识非法' };
+      }
+      if (typeof plan.toolCallId !== 'string' || !plan.toolCallId) {
+        return { ok: false, error: '历史计划引用缺少真实工具调用标识' };
+      }
+      plans.push({
+        type: 'plan',
+        id: plan.id,
+        toolCallId: plan.toolCallId,
+        label: typeof plan.label === 'string' && plan.label ? plan.label : '历史计划',
+        title: typeof plan.title === 'string' && plan.title ? plan.title : '历史计划',
+        description: typeof plan.description === 'string' ? plan.description : '',
+        flatIndex: typeof plan.flatIndex === 'number' ? plan.flatIndex : -1,
+        todosTotal: 0,
+        todosCompleted: 0,
+        reference: true,
+      });
+    }
+    return {
+      ok: true,
+      data: {
+        windowId: data.windowId,
+        composerId: data.composerId,
+        observedAt: data.observedAt,
+        expiresAt: data.expiresAt,
+        completeness: 'partial',
+        reachedStart: data.reachedStart,
+        plans,
+      },
+    };
+  }
+
+  async function startPlanDiscovery() {
+    if (discoveredPlanScanInFlight) return;
+    const target = planSessionTarget();
+    if (!target) {
+      showToast('无法确认当前窗口或会话，未执行历史计划查找', 'error');
+      return;
+    }
+    if (hasComposerDraft()) {
+      showToast('请先处理输入框中的草稿，再查找历史计划', 'error');
+      return;
+    }
+    // 新发现使服务端上一批引用失效，前端同步清除，失败时也不恢复旧引用。
+    clearPlanDiscoveryRefs();
+    syncPlanModalFromState();
+    const nonce = newPlanDiscoveryNonce();
+    const sessionIdentity = currentPlanSessionIdentity();
+    discoveredPlanNonce = nonce;
+    discoveredPlanNonceSession = sessionIdentity;
+    discoveredPlanScanInFlight = true;
+    discoveredPlanError = '';
+    discoveredPlanNotice = '';
+    renderSessionPlans();
+    const result = await sendCommandAwaitResult('command:discover_plans', {
+      commandId: newCommandId(),
+      type: 'discover_plans',
+      windowId: target.windowId,
+      composerId: target.composerId,
+    });
+    // A session switch, disconnect, revert, or newer scan invalidates this response.
+    if (discoveredPlanNonce !== nonce) return;
+    if (sessionIdentity !== currentPlanSessionIdentity()) { clearPlanDiscovery(); renderSessionPlans(); return; }
+    if (!planSessionTarget()) {
+      discoveredPlanScanInFlight = false;
+      clearPlanDiscovery();
+      renderSessionPlans();
+      return;
+    }
+    discoveredPlanScanInFlight = false;
+    if (!result.ok || !result.data) {
+      const rawError = typeof result.error === 'string' && result.error.trim() ? result.error.trim() : '';
+      discoveredPlanError = rawError || '历史计划查找失败';
+      renderSessionPlans();
+      return;
+    }
+    const parsed = validatePlanDiscoveryResult(result.data, target);
+    if (!parsed.ok) {
+      clearPlanDiscoveryRefs();
+      discoveredPlanError = parsed.error;
+      renderSessionPlans();
+      return;
+    }
+    discoveredPlanRefs = parsed.data;
+    discoveredPlanSessionIdentity = sessionIdentity;
+    discoveredPlanNonceSession = sessionIdentity;
+    discoveredPlanError = '';
+    armPlanDiscoveryExpiry(parsed.data);
+    renderSessionPlans();
+  }
+
+  function clearPlanDiscoveryRefs() {
+    if (discoveredPlanExpiryTimer) {
+      clearTimeout(discoveredPlanExpiryTimer);
+      discoveredPlanExpiryTimer = 0;
+    }
+    discoveredPlanRefs = null;
+    discoveredPlanSessionIdentity = '';
+    discoveredPlanNonceSession = '';
+    if (activePlanModal && activePlanModal.fromReference) closePlanModal();
+  }
+
+  function buildPlanDiscoverySection() {
+    const wrap = document.createElement('div');
+    wrap.className = 'session-plans-discovery';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'plan-discovery-btn';
+    btn.className = 'context-plans-btn';
+    btn.textContent = discoveredPlanScanInFlight ? '正在查找当前会话历史计划…' : '查找当前会话历史计划';
+    btn.disabled = discoveredPlanScanInFlight;
+    btn.addEventListener('click', () => { void startPlanDiscovery(); });
+    wrap.appendChild(btn);
+
+    const hint = document.createElement('div');
+    hint.className = 'session-plan-chip-status';
+    hint.id = 'plan-discovery-hint';
+    hint.textContent = '将在 Cursor 内临时滚动当前会话；历史扫描有界，可能不完整。';
+    wrap.appendChild(hint);
+
+    if (discoveredPlanRefs) {
+      const meta = document.createElement('div');
+      meta.className = 'session-plan-chip-status';
+      meta.id = 'plan-discovery-meta';
+      meta.textContent = `发现时间：${formatPlanTime(discoveredPlanRefs.observedAt)}；范围：partial`
+        + `${discoveredPlanRefs.reachedStart ? '（已到会话起点）' : '（未到会话起点）'}`;
+      wrap.appendChild(meta);
+      if (discoveredPlanRefs.plans.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'session-plan-chip-status';
+        empty.id = 'plan-discovery-empty';
+        empty.textContent = '本次有界扫描未发现计划，这不代表当前会话没有计划。';
+        wrap.appendChild(empty);
+      }
+    }
+    if (discoveredPlanError) {
+      const err = document.createElement('div');
+      err.className = 'session-plan-chip-status plan-modal-status-error';
+      err.textContent = discoveredPlanError;
+      wrap.appendChild(err);
+    } else if (discoveredPlanNotice) {
+      const notice = document.createElement('div');
+      notice.className = 'session-plan-chip-status';
+      notice.textContent = discoveredPlanNotice;
+      wrap.appendChild(notice);
+    }
+    return wrap;
   }
 
   function syncQueueTrigger(hasItems) {
@@ -1906,19 +2182,31 @@
   }
 
   function sessionPlanMessages() {
+    prunePlanDiscovery();
     if (messagesSessionIdentity !== currentPlanSessionIdentity()) return [];
     const plans = [];
     const indices = new Map();
-    for (const msg of state.messages || []) {
-      if (!msg || msg.type !== 'plan') continue;
-      const label = (msg.label || '').trim();
-      const key = label || msg.id;
+    const seenToolCalls = new Set();
+    const put = (msg) => {
+      const key = msg.fileName ? `file:${msg.fileName}` : `tool:${msg.toolCallId || msg.id}`;
       if (indices.has(key)) {
         plans[indices.get(key)] = msg;
       } else {
         indices.set(key, plans.length);
         plans.push(msg);
       }
+    };
+    for (const msg of state.messages || []) {
+      if (!msg || msg.type !== 'plan') continue;
+      if (msg.toolCallId) seenToolCalls.add(msg.toolCallId);
+      put(msg);
+    }
+    // Discovered references fill in history the DOM no longer mounts. A real
+    // card for the same tool call always wins, so refs never duplicate it.
+    for (const ref of activePlanReferences()) {
+      if (ref.toolCallId && seenToolCalls.has(ref.toolCallId)) continue;
+      if (ref.toolCallId) seenToolCalls.add(ref.toolCallId);
+      put(ref);
     }
     return plans;
   }
@@ -1927,8 +2215,10 @@
     const bar = document.getElementById('session-plans-bar');
     const itemsEl = document.getElementById('session-plans-items');
     if (!bar || !itemsEl) return;
+    prunePlanDiscovery();
+    const discoverable = plansEntryAvailable();
     const plans = sessionPlanMessages();
-    if (plans.length === 0) {
+    if (!discoverable && plans.length === 0) {
       bar.classList.add('hidden');
       itemsEl.innerHTML = '';
       sessionPlansOpen = false;
@@ -1942,9 +2232,11 @@
     if ($sessionPlansToggle) {
       $sessionPlansToggle.classList.remove('hidden');
       const executing = plans.some((plan) => planDisplayStatus(plan) === 'Executing');
-      $sessionPlansToggle.textContent = executing
-        ? `Plans · ${plans.length} · Executing`
-        : `Plans · ${plans.length}`;
+      $sessionPlansToggle.textContent = plans.length === 0
+        ? 'Plans'
+        : executing
+          ? `Plans · ${plans.length} · Executing`
+          : `Plans · ${plans.length}`;
       $sessionPlansToggle.setAttribute('aria-expanded', sessionPlansOpen ? 'true' : 'false');
     }
     if (!sessionPlansOpen) {
@@ -1953,6 +2245,7 @@
       bar.classList.remove('hidden');
     }
     itemsEl.innerHTML = '';
+    if (discoverable) itemsEl.appendChild(buildPlanDiscoverySection());
     plans.forEach((plan) => {
       const btn = document.createElement('button');
       btn.type = 'button';
@@ -2597,10 +2890,6 @@
     return content;
   }
 
-  function looksLikePlanFileLabel(label) {
-    return typeof label === 'string' && /\.md$/i.test(label.trim());
-  }
-
   function currentPlanSessionIdentity() {
     return `${state.activeWindowId || ''}\n${state.activeComposerId || ''}`;
   }
@@ -2609,37 +2898,219 @@
     return `${currentPlanSessionIdentity()}\n${msg.id || ''}\n${(msg.label || '').trim()}`;
   }
 
-  function buildPlanModalContent(msg, planData) {
+  /**
+   * Fingerprint of the plan summary shown in the widget. Any change means the
+   * visible summary no longer matches the loaded file snapshot, so the old
+   * body must be dropped and re-read explicitly.
+   */
+  function planBodyIdentity(msg) {
+    return JSON.stringify({
+      id: msg.id || '',
+      label: (msg.label || '').trim(),
+      title: msg.title || '',
+      toolCallId: msg.toolCallId || '',
+      fileName: msg.fileName || '',
+      description: msg.description || '',
+      model: msg.model || '',
+      todosCompleted: msg.todosCompleted ?? null,
+      todosTotal: msg.todosTotal ?? null,
+      todos: Array.isArray(msg.todos) ? msg.todos.map((todo) => [todo.text || '', todo.status || '']) : null,
+    });
+  }
+
+  /** The exact plan file target. A request is only sent when all three are known. */
+  function planFileTarget(msg) {
+    const planId = typeof msg.id === 'string' ? msg.id : '';
+    const windowId = typeof state.activeWindowId === 'string' ? state.activeWindowId : '';
+    const composerId = typeof state.activeComposerId === 'string' ? state.activeComposerId : '';
+    if (!planId || !windowId || !composerId) return null;
+    return { planId, windowId, composerId };
+  }
+
+  function newPlanModalInstanceId() {
+    planModalInstanceCounter += 1;
+    return `plan-modal-${planModalInstanceCounter}-${Date.now()}`;
+  }
+
+  const SHA256_HEX_RE = /^[0-9a-f]{64}$/i;
+  const PLAN_TODO_STATUSES = new Set(['pending', 'completed', 'in_progress']);
+
+  /** A finite number that still maps to a real Date (beyond the JS range it would not). */
+  function isValidPlanTime(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return false;
+    return !Number.isNaN(new Date(value).getTime());
+  }
+
+  function formatPlanTime(value) {
+    if (!isValidPlanTime(value)) return '未知';
+    try {
+      return new Date(value).toLocaleString();
+    } catch {
+      return String(value);
+    }
+  }
+
+  /** Reject absolute paths, traversal, and separators — only a plain file name is accepted. */
+  function isSafePlanFileName(value) {
+    if (typeof value !== 'string') return false;
+    const name = value.trim();
+    if (!name || name !== value) return false;
+    if (name.startsWith('/') || name.startsWith('\\')) return false;
+    if (/^[A-Za-z]:/.test(name)) return false;
+    if (name.includes('/') || name.includes('\\')) return false;
+    if (name.includes('\0')) return false;
+    return true;
+  }
+
+  function isPlanTodoList(value) {
+    if (!Array.isArray(value)) return false;
+    return value.every((todo) => (
+      todo
+      && typeof todo === 'object'
+      && typeof todo.text === 'string'
+      && todo.text.trim().length > 0
+      && PLAN_TODO_STATUSES.has(todo.status)
+    ));
+  }
+
+  /**
+   * Only accept a full plan result whose metadata proves it is the exact
+   * snapshot for the requested plan/window/session, and whose body is a real
+   * non-empty document. Missing, malformed, or mismatched data is a failure
+   * and the body must never be shown.
+   */
+  function validatePlanFullResult(data, target) {
+    const metadata = data && data.metadata;
+    if (!metadata || typeof metadata !== 'object') {
+      return { ok: false, error: '计划文件元信息缺失，无法显示全文' };
+    }
+    if (metadata.source !== 'cursor_plan_file') {
+      return { ok: false, error: '计划文件来源未通过校验，无法显示全文' };
+    }
+    if (metadata.completeness !== 'complete') {
+      return { ok: false, error: '计划文件快照不完整，无法显示全文' };
+    }
+    if (
+      metadata.windowId !== target.windowId
+      || metadata.composerId !== target.composerId
+      || metadata.planId !== target.planId
+    ) {
+      return { ok: false, error: '计划文件身份与请求的窗口/会话/计划不一致，无法显示全文' };
+    }
+    if (
+      !isSafePlanFileName(metadata.fileName)
+      || typeof metadata.version !== 'string' || !SHA256_HEX_RE.test(metadata.version)
+      || !isValidPlanTime(metadata.observedAt) || !isValidPlanTime(metadata.updatedAt)
+    ) {
+      return { ok: false, error: '计划文件元信息格式非法，无法显示全文' };
+    }
+    if (!isPlanTodoList(data.todos)) {
+      return { ok: false, error: '计划文件待办列表缺失或格式非法，无法显示全文' };
+    }
+    if (typeof data.body !== 'string' || data.body.trim().length === 0) {
+      return { ok: false, error: '计划文件正文为空，无法显示全文' };
+    }
+    if (typeof data.bodyHtml !== 'string' || data.bodyHtml.trim().length === 0) {
+      return { ok: false, error: '计划文件正文为空，无法显示全文' };
+    }
+    return {
+      ok: true,
+      data: {
+        todos: data.todos.map((todo) => ({ text: todo.text, status: todo.status })),
+        body: data.body,
+        bodyHtml: data.bodyHtml,
+        metadata: {
+          windowId: metadata.windowId,
+          composerId: metadata.composerId,
+          planId: metadata.planId,
+          version: metadata.version,
+          source: metadata.source,
+          fileName: metadata.fileName,
+          observedAt: metadata.observedAt,
+          updatedAt: metadata.updatedAt,
+          completeness: metadata.completeness,
+        },
+      },
+    };
+  }
+
+  function buildPlanMetadataSection(metadata) {
+    const box = document.createElement('div');
+    box.className = 'plan-modal-status';
+    const rows = [
+      ['来源文件', metadata.fileName],
+      ['窗口', metadata.windowId],
+      ['会话', metadata.composerId],
+      ['计划', metadata.planId],
+      ['内容版本', metadata.version],
+      ['读取时间', formatPlanTime(metadata.observedAt)],
+      ['文件修改时间（非批准时间）', formatPlanTime(metadata.updatedAt)],
+      ['完整性', '读取时完整快照，非持续实时，也不代表完整会话或用户授权'],
+    ];
+    rows.forEach(([label, value]) => {
+      const row = document.createElement('div');
+      row.textContent = `${label}：${String(value)}`;
+      box.appendChild(row);
+    });
+    return box;
+  }
+
+  function buildPlanReReadButton() {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'plan-btn plan-btn-view';
+    btn.textContent = '重新读取';
+    btn.addEventListener('click', () => { void reReadFullPlan(); });
+    return btn;
+  }
+
+  function buildPlanSummaryContent(msg, noteText) {
     const wrap = document.createElement('div');
-    if (planData) {
-      wrap.appendChild(buildPlanFullContent(planData));
-      return wrap;
-    }
-    if (activePlanModal && activePlanModal.loading) {
-      const loading = document.createElement('div');
-      loading.className = 'plan-modal-status';
-      loading.textContent = 'Loading plan file…';
-      wrap.appendChild(loading);
-    } else if (activePlanModal && activePlanModal.error) {
-      const err = document.createElement('div');
-      err.className = 'plan-modal-status plan-modal-status-error';
-      err.textContent = `${activePlanModal.error}. Showing the available session summary.`;
-      wrap.appendChild(err);
-    } else {
-      const fallback = document.createElement('div');
-      fallback.className = 'plan-modal-status';
-      fallback.textContent = 'Showing the available session summary.';
-      wrap.appendChild(fallback);
-    }
-    const modalMsg = {
+    const note = document.createElement('div');
+    note.className = 'plan-modal-status';
+    note.textContent = noteText;
+    wrap.appendChild(note);
+    const summaryMsg = {
       ...msg,
       actions: Array.isArray(msg.actions)
-        ? msg.actions.filter((action) => action.type !== 'view_plan')
+        ? msg.actions.filter((action) => action.type !== 'view_plan' && action.type !== 'build')
         : msg.actions,
+      modelActionId: undefined,
+      model: '',
     };
-    const content = buildPlanCard(modalMsg, { hideView: true });
+    const content = buildPlanCard(summaryMsg, { hideView: true });
     content.classList.add('plan-card-modal');
     wrap.appendChild(content);
+    return wrap;
+  }
+
+  function buildPlanModalContent(msg) {
+    const modal = activePlanModal;
+    const wrap = document.createElement('div');
+    if (modal && modal.fullData) {
+      wrap.appendChild(buildPlanMetadataSection(modal.fullData.metadata));
+      wrap.appendChild(buildPlanReReadButton());
+      wrap.appendChild(buildPlanFullContent(modal.fullData));
+      return wrap;
+    }
+    if (modal && modal.loading) {
+      const loading = document.createElement('div');
+      loading.className = 'plan-modal-status';
+      loading.textContent = '正在读取计划文件…';
+      wrap.appendChild(loading);
+    } else if (modal && modal.error) {
+      const err = document.createElement('div');
+      err.className = 'plan-modal-status plan-modal-status-error';
+      err.textContent = `${modal.error}。以下仅为会话摘要。`;
+      wrap.appendChild(err);
+    } else if (modal && modal.requireReRead) {
+      const stale = document.createElement('div');
+      stale.className = 'plan-modal-status';
+      stale.textContent = '计划摘要已变化，旧全文已清除。请重新读取以载入当前快照。';
+      wrap.appendChild(stale);
+    }
+    if (modal && !modal.loading) wrap.appendChild(buildPlanReReadButton());
+    wrap.appendChild(buildPlanSummaryContent(msg, '会话摘要（并非计划文件全文）。'));
     return wrap;
   }
 
@@ -2649,46 +3120,102 @@
     $planModalLabel.style.display = msg.label ? '' : 'none';
     $planModalTitle.textContent = msg.title || 'Plan';
     $planModalBody.innerHTML = '';
-    $planModalBody.appendChild(buildPlanModalContent(msg, activePlanModal && activePlanModal.fullData));
+    $planModalBody.appendChild(buildPlanModalContent(msg));
   }
 
   async function loadFullPlanIntoModal(msg) {
-    const identity = planModalIdentity(msg);
-    if (!looksLikePlanFileLabel(msg.label) || !activePlanModal || activePlanModal.identity !== identity) return;
-    activePlanModal.loading = true;
-    activePlanModal.attempted = true;
-    activePlanModal.error = '';
-    renderPlanModal(msg);
-    const result = await sendCommandAwaitResult('command:get_plan_full', {
-      commandId: newCommandId(),
-      type: 'get_plan_full',
-      planId: msg.id,
-    });
-    if (!activePlanModal || activePlanModal.identity !== identity) return;
-    activePlanModal.loading = false;
-    if (!result.ok || !result.data) {
-      activePlanModal.attempted = !result.outcomeUnknown;
-      if (looksLikePlanFileLabel(msg.label)) {
-        activePlanModal.error = result.error || 'Plan file not found';
-      }
+    const modal = activePlanModal;
+    if (!modal) return;
+    const target = planFileTarget(msg);
+    if (!target) {
+      modal.loading = false;
+      modal.attempted = false;
+      modal.fullData = null;
+      modal.requireReRead = false;
+      modal.error = '无法确认计划目标（缺少计划、窗口或会话标识），未发送读取请求';
       renderPlanModal(msg);
       return;
     }
-    activePlanModal.fullData = result.data;
-    activePlanModal.error = '';
+    modal.target = target;
+    modal.loading = true;
+    modal.attempted = true;
+    modal.requireReRead = false;
+    modal.fullData = null;
+    modal.error = '';
     renderPlanModal(msg);
+    const instanceId = modal.instanceId;
+    const requestSeq = ++modal.requestSeq;
+    const result = await sendCommandAwaitResult('command:get_plan_full', {
+      commandId: newCommandId(),
+      type: 'get_plan_full',
+      planId: target.planId,
+      windowId: target.windowId,
+      composerId: target.composerId,
+    });
+    if (!activePlanModal || activePlanModal.instanceId !== instanceId || activePlanModal.requestSeq !== requestSeq) {
+      return;
+    }
+    modal.loading = false;
+    if (!result.ok || !result.data) {
+      modal.attempted = !result.outcomeUnknown;
+      const rawError = typeof result.error === 'string' && result.error.trim() ? result.error.trim() : '';
+      modal.error = rawError || '读取计划文件失败';
+      renderPlanModal(msg);
+      return;
+    }
+    const validated = validatePlanFullResult(result.data, target);
+    if (!validated.ok) {
+      modal.attempted = !result.outcomeUnknown;
+      modal.error = validated.error;
+      modal.fullData = null;
+      renderPlanModal(msg);
+      return;
+    }
+    modal.fullData = validated.data;
+    modal.error = '';
+    renderPlanModal(msg);
+  }
+
+  /**
+   * A plan modal may be backed by a live DOM card or by a short-lived reading
+   * reference whose card is no longer mounted. Both are readable; neither may
+   * be confused with a fabricated id.
+   */
+  function resolvePlanMessage(id) {
+    const inState = (state.messages || []).find((msg) => msg.type === 'plan' && msg.id === id);
+    if (inState) return inState;
+    return activePlanReferences().find((ref) => ref.id === id) || null;
+  }
+
+  function reReadFullPlan() {
+    const modal = activePlanModal;
+    if (!modal) return;
+    const current = resolvePlanMessage(modal.id);
+    if (!current) {
+      closePlanModal();
+      return;
+    }
+    modal.fullData = null;
+    modal.error = '';
+    void loadFullPlanIntoModal(current);
   }
 
   function openPlanModal(msg) {
     closeTransientUi('plan');
     activePlanModal = {
       id: msg.id,
+      fromReference: !!msg.reference,
+      instanceId: newPlanModalInstanceId(),
+      requestSeq: 0,
       identity: planModalIdentity(msg),
+      bodyIdentity: planBodyIdentity(msg),
       sessionIdentity: currentPlanSessionIdentity(),
       label: msg.label || '',
+      target: null,
       fullData: null,
       loading: false,
       attempted: false,
+      requireReRead: false,
       error: '',
     };
     renderPlanModal(msg);
@@ -2706,30 +3233,27 @@
       closePlanModal();
       return;
     }
-    const current = (state.messages || []).find((msg) => msg.type === 'plan' && msg.id === activePlanModal.id);
+    // Falls back to valid references so a reference-backed modal stays readable
+    // after its source card leaves the DOM; expiry/target change still closes it.
+    const current = resolvePlanMessage(activePlanModal.id);
     if (!current) {
       closePlanModal();
       return;
     }
 
-    const nextIdentity = planModalIdentity(current);
-    if (nextIdentity !== activePlanModal.identity) {
-      activePlanModal.identity = nextIdentity;
+    const nextBodyIdentity = planBodyIdentity(current);
+    if (nextBodyIdentity !== activePlanModal.bodyIdentity) {
+      activePlanModal.requestSeq += 1;
+      activePlanModal.bodyIdentity = nextBodyIdentity;
+      activePlanModal.identity = planModalIdentity(current);
       activePlanModal.label = current.label || '';
       activePlanModal.fullData = null;
       activePlanModal.loading = false;
       activePlanModal.attempted = false;
+      activePlanModal.requireReRead = true;
       activePlanModal.error = '';
     }
     renderPlanModal(current);
-    if (
-      looksLikePlanFileLabel(current.label) &&
-      !activePlanModal.fullData &&
-      !activePlanModal.loading &&
-      !activePlanModal.attempted
-    ) {
-      loadFullPlanIntoModal(current);
-    }
   }
 
   async function openPlanModelPicker(msg) {

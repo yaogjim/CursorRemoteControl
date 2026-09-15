@@ -9,6 +9,7 @@ import {
 } from 'fs';
 import { isAbsolute, relative, resolve, sep } from 'path';
 import { homedir } from 'os';
+import { createHash } from 'crypto';
 import type { PlanTodo } from './types.js';
 
 export const MAX_PLAN_FILE_BYTES = 1024 * 1024;
@@ -26,7 +27,7 @@ export type PlanFileReadError =
   | 'read_failed';
 
 export type PlanFileReadResult =
-  | { ok: true; data: PlanFileData }
+  | { ok: true; data: PlanFileData; version: string; updatedAt: number; observedAt: number }
   | { ok: false; error: PlanFileReadError };
 
 function defaultPlansRoot(): string {
@@ -43,7 +44,8 @@ export function resolvePlanFilePath(
   plansRoot: string = defaultPlansRoot(),
 ): string | null {
   if (typeof label !== 'string' || label.length === 0) return null;
-  if (label.includes('\0') || isAbsolute(label)) return null;
+  if (label.includes('\0') || label.includes('\\') || isAbsolute(label)) return null;
+  if (!/\.md$/i.test(label) || label.split('/').includes('..')) return null;
 
   const root = resolve(plansRoot);
   const candidate = resolve(root, label);
@@ -91,9 +93,24 @@ export function readPlanFileResult(
     }
     const finalStat = fstatSync(fd);
     if (finalStat.size > MAX_PLAN_FILE_BYTES) return { ok: false, error: 'too_large' };
-    if (finalStat.size !== stat.size || offset !== stat.size) return { ok: false, error: 'read_failed' };
+    const finalPathStat = lstatSync(planPath);
+    if (
+      finalStat.size !== stat.size || offset !== stat.size
+      || stat.dev !== pathStat.dev || stat.ino !== pathStat.ino
+      || finalStat.mtimeMs !== stat.mtimeMs || finalStat.ctimeMs !== stat.ctimeMs
+      || finalPathStat.isSymbolicLink() || !finalPathStat.isFile()
+      || finalPathStat.dev !== stat.dev || finalPathStat.ino !== stat.ino
+      || finalPathStat.mtimeMs !== stat.mtimeMs || finalPathStat.ctimeMs !== stat.ctimeMs
+      || realpathSync(planPath) !== realFile
+    ) return { ok: false, error: 'read_failed' };
 
-    return { ok: true, data: parsePlanMd(bytes.toString('utf-8')) };
+    return {
+      ok: true,
+      data: parsePlanMd(new TextDecoder('utf-8', { fatal: true }).decode(bytes)),
+      version: createHash('sha256').update(bytes).digest('hex'),
+      updatedAt: finalStat.mtimeMs,
+      observedAt: Date.now(),
+    };
   } catch (error) {
     const code = error && typeof error === 'object' && 'code' in error
       ? String((error as { code?: unknown }).code || '')

@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { randomBytes, timingSafeEqual, createHash } from 'crypto';
 import { readFileSync } from 'fs';
-import type { ServerConfig, CursorState, CommandPayload, CommandResult, PlanBlock, SanitizedDiscoveryStatus } from './types.js';
+import type { ServerConfig, CursorState, CommandPayload, CommandResult, PlanBlock, PlanFullData, PlanDiscoveryData, SanitizedDiscoveryStatus } from './types.js';
 import { AdapterStore } from './adapter-store.js';
 import { ActionRegistry } from './action-registry.js';
 import { capabilityAllows } from './capability-guard.js';
@@ -47,6 +47,7 @@ const LOGIN_RATE_WINDOW_MS = 60_000;
 const MAX_RATE_LIMIT_KEYS = 2048;
 const MAX_OPERATION_CACHE = 1024;
 const OPERATION_CACHE_TTL_MS = 5 * 60_000;
+const PLAN_REFERENCE_TTL_MS = 5 * 60_000;
 const API_JSON_LIMIT = '64kb';
 
 /** Dedicated socket events that mutate Cursor and require a bounded operationId. */
@@ -385,6 +386,8 @@ export class Relay {
   private rateLimiter = new BoundedRateLimiter(MAX_RATE_LIMIT_KEYS);
   private operationCache = new Map<string, OperationCacheEntry>();
   private socketOperationCache = new Map<string, OperationCacheEntry>();
+  // 仅跨越 await 到最终响应发送的校验；不缓存计划正文或结果。
+  private readonly planResultGuards = new WeakMap<CommandResult, () => boolean>();
 
   private get authEnabled(): boolean {
     return this.config.webappPassword.length > 0;
@@ -1173,6 +1176,14 @@ export class Relay {
     if (!socketCommandRequiresOperationId(route, payload.actionType)) {
       try {
         const result = await execute(payload, commandId);
+        if ((route === 'get_plan_full' || route === 'discover_plans') && result.ok) {
+          const valid = this.planResultGuards.get(result);
+          this.planResultGuards.delete(result);
+          if (!valid?.()) {
+            this.emitCommandResult(socket, commandId, { ok: false, error: '计划读取目标或权限已失效' });
+            return;
+          }
+        }
         this.emitCommandResult(socket, commandId, this.cachedCommandResult(result));
       } catch (err) {
         this.emitCommandResult(socket, commandId, {
@@ -1352,26 +1363,188 @@ export class Relay {
         return result;
       });
 
-      onCommand('get_plan_full', async (payload, commandId) => {
-        const planLabel = currentPlanLabel(this.stateManager.getCurrentState(), payload.planId);
-        if (!planLabel) {
-          return { commandId, ok: false, error: 'Plan is not available in the current session' };
+      // 单个连接只保留一批短期阅读引用；不进入状态广播、磁盘或正文缓存。
+      const planReferences = new Map<string, PlanBlock>();
+      let planReferencesExpireAt = 0;
+      let planReferenceTimer: ReturnType<typeof setTimeout> | undefined;
+      let planEpoch = 0;
+      let planDiscoveryBusy = false;
+      const clearPlanReferences = () => {
+        planReferences.clear();
+        planReferencesExpireAt = 0;
+        if (planReferenceTimer) clearTimeout(planReferenceTimer);
+        planReferenceTimer = undefined;
+      };
+      const planScopeIdentity = () => {
+        const state = this.stateManager.getCurrentState();
+        return JSON.stringify([state.activeWindowId, state.activeComposerId, state.connected,
+          this.cdpBridge.activeTargetId, this.cdpBridge.getTargetGeneration(),
+          this.resolveSocketSession(socket)]);
+      };
+      let lastPlanScope = planScopeIdentity();
+      const updatePlanScope = () => {
+        const current = planScopeIdentity();
+        if (current !== lastPlanScope) {
+          lastPlanScope = current;
+          planEpoch += 1;
+          clearPlanReferences();
         }
-        console.log(`[relay] Command: get_plan_full for current plan ${payload.planId} from ${socket.id}`);
-        const result = readPlanFileResult(planLabel);
-        if (!result.ok) {
-          return { commandId, ok: false, error: planFileErrorMessage(result.error) };
-        }
-        return {
-          commandId,
-          ok: true,
-          data: {
-            todos: result.data.todos,
-            body: result.data.body,
-            bodyHtml: markdownToWebHtml(result.data.body),
-          },
+      };
+      this.stateManager.on('state:patch', updatePlanScope);
+      this.stateManager.on('connection:changed', updatePlanScope);
+      const capturePlanGuard = (payload: CommandPayload) => {
+        updatePlanScope();
+        const epoch = planEpoch;
+        let invalidated = false;
+        return () => {
+          updatePlanScope();
+          const state = this.stateManager.getCurrentState();
+          const now = Date.now();
+          const valid = !invalidated && epoch === planEpoch && socket.connected
+            && (!this.authEnabled || !!this.resolveSocketSession(socket))
+            && state.connected && state.extractorStatus === 'ok'
+            && typeof state.lastExtractionAt === 'number'
+            && state.lastExtractionAt <= now && now - state.lastExtractionAt <= 15_000
+            && state.activeWindowId === payload.windowId && state.activeComposerId === payload.composerId
+            && this.cdpBridge.activeTargetId === payload.windowId;
+          if (!valid) invalidated = true;
+          return valid;
         };
-      }, (payload) => (!payload.planId ? 'Missing commandId or planId' : null));
+      };
+
+      onCommand('discover_plans', async (payload, commandId) => {
+        const fail = (error = '当前会话的目标或读取权限无法确认，请刷新后重试'): CommandResult =>
+          ({ commandId, ok: false, error });
+        if (planDiscoveryBusy) return fail('当前连接正在查找历史计划，请等待完成');
+        const scopeCurrent = capturePlanGuard(payload);
+        if (!scopeCurrent()) return fail();
+        clearPlanReferences();
+        planDiscoveryBusy = true;
+        try {
+          const result = await this.commandExecutor.discoverPlans(commandId, {
+            windowId: payload.windowId!, composerId: payload.composerId!,
+          }, scopeCurrent);
+          if (!scopeCurrent()) return fail();
+          if (!result.ok) return result;
+          const data = result.data as {
+            plans?: Array<{ toolCallId?: unknown; title?: unknown; description?: unknown }>;
+            observedAt?: unknown; reachedStart?: unknown; completeness?: unknown;
+          } | undefined;
+          const now = Date.now();
+          if (!data || !Array.isArray(data.plans) || data.completeness !== 'partial'
+            || typeof data.reachedStart !== 'boolean' || typeof data.observedAt !== 'number'
+            || !Number.isFinite(data.observedAt) || data.observedAt <= 0
+            || data.observedAt > now || now - data.observedAt > 15_000) return fail();
+          const plans: PlanDiscoveryData['plans'] = [];
+          const seen = new Set<string>();
+          for (const item of data.plans.slice(0, 32)) {
+            if (!item || typeof item.toolCallId !== 'string' || !item.toolCallId.trim()
+              || item.toolCallId.length > 512 || typeof item.title !== 'string' || !item.title.trim()) return fail();
+            if (seen.has(item.toolCallId)) continue;
+            seen.add(item.toolCallId);
+            const title = item.title.trim().slice(0, 200);
+            const plan = {
+              id: `plan-ref:${randomBytes(18).toString('hex')}`, toolCallId: item.toolCallId,
+              title, label: title,
+              ...(typeof item.description === 'string' ? { description: item.description.slice(0, 200) } : {}),
+            };
+            plans.push(plan);
+          }
+          if (!scopeCurrent()) return fail();
+          for (const plan of plans) {
+            planReferences.set(plan.id, { ...plan, type: 'plan', flatIndex: -1, todosCompleted: 0, todosTotal: 0 });
+          }
+          planReferencesExpireAt = now + PLAN_REFERENCE_TTL_MS;
+          const expiresAt = planReferencesExpireAt;
+          planReferenceTimer = setTimeout(clearPlanReferences, PLAN_REFERENCE_TTL_MS);
+          planReferenceTimer.unref();
+          const response: CommandResult = {
+            commandId, ok: true,
+            data: { plans, windowId: payload.windowId!, composerId: payload.composerId!,
+              observedAt: data.observedAt, expiresAt, completeness: 'partial', reachedStart: data.reachedStart,
+            } satisfies PlanDiscoveryData,
+          };
+          this.planResultGuards.set(response, () => scopeCurrent()
+            && planReferencesExpireAt === expiresAt && Date.now() < expiresAt);
+          return response;
+        } finally {
+          planDiscoveryBusy = false;
+        }
+      }, (payload) => (
+        [payload.windowId, payload.composerId].every((value) => typeof value === 'string' && value.trim().length > 0)
+          ? null : '查找计划需要明确的窗口和会话标识'
+      ));
+
+      onCommand('get_plan_full', async (payload, commandId) => {
+        const scopeCurrent = capturePlanGuard(payload);
+        const initial = this.stateManager.getCurrentState();
+        const reference = planReferences.get(payload.planId!);
+        const plan = reference ?? initial.messages.find((message): message is PlanBlock =>
+          message.type === 'plan' && message.id === payload.planId);
+        const fail = (): CommandResult => ({ commandId, ok: false, error: '当前会话的计划、目标或读取权限无法确认，请刷新后重试' });
+        if (!plan) return fail();
+        const fingerprint = (value: PlanBlock) => JSON.stringify([
+          value.id, value.toolCallId, value.fileName, value.label, value.title, value.description,
+          value.todos, value.todosCompleted, value.todosTotal,
+        ]);
+        const initialFingerprint = fingerprint(plan);
+        let invalidated = false;
+        const isCurrent = () => {
+          const state = this.stateManager.getCurrentState();
+          const current = state.messages.find((message): message is PlanBlock =>
+            message.type === 'plan' && message.id === plan.id);
+          return !invalidated && scopeCurrent()
+            && (reference
+              ? planReferences.get(plan.id) === reference && Date.now() < planReferencesExpireAt
+              : !!current && fingerprint(current) === initialFingerprint);
+        };
+        if (!isCurrent()) return fail();
+        // 已观察到的目标变化不可被切回同名会话消除。
+        const onStateChange = () => { if (!isCurrent()) invalidated = true; };
+        this.stateManager.on('state:patch', onStateChange);
+        this.stateManager.on('connection:changed', onStateChange);
+        try {
+          let fileName = plan.fileName;
+          if (!fileName) {
+            if (!plan.toolCallId) return fail();
+            const resolved = await this.commandExecutor.resolvePlanFile(commandId, {
+              windowId: payload.windowId!, composerId: payload.composerId!,
+              planId: plan.id, toolCallId: plan.toolCallId,
+            }, isCurrent);
+            if (!isCurrent()) return fail();
+            if (!resolved.ok) return resolved;
+            const data = resolved.data as { fileName?: unknown } | undefined;
+            if (typeof data?.fileName !== 'string') return fail();
+            fileName = data.fileName;
+          }
+          if (!isCurrent()) return fail();
+          const result = readPlanFileResult(fileName);
+          if (!result.ok) return { commandId, ok: false, error: planFileErrorMessage(result.error) };
+          if (!result.data.body) return { commandId, ok: false, error: '计划文件缺少正文，无法确认全文完整性' };
+          if (!isCurrent()) return fail();
+          const response: CommandResult = {
+            commandId, ok: true,
+            data: {
+              todos: result.data.todos,
+              body: result.data.body,
+              bodyHtml: markdownToWebHtml(result.data.body),
+              metadata: {
+                windowId: payload.windowId!, composerId: payload.composerId!, planId: plan.id,
+                source: 'cursor_plan_file', fileName, version: result.version,
+                observedAt: result.observedAt, updatedAt: result.updatedAt, completeness: 'complete',
+              },
+            } satisfies PlanFullData,
+          };
+          this.planResultGuards.set(response, isCurrent);
+          return response;
+        } finally {
+          this.stateManager.off('state:patch', onStateChange);
+          this.stateManager.off('connection:changed', onStateChange);
+        }
+      }, (payload) => (
+        [payload.planId, payload.windowId, payload.composerId].every((value) => typeof value === 'string' && value.trim().length > 0)
+          ? null : '读取计划需要明确的计划、窗口和会话标识'
+      ));
 
       onCommand('get_plan_model_options', (payload, commandId) => {
         console.log(`[relay] Command: get_plan_model_options from ${socket.id}`);
@@ -1408,6 +1581,10 @@ export class Relay {
       }, (payload) => (!payload.windowId ? 'Missing commandId or windowId' : null));
 
       socket.on('disconnect', (reason) => {
+        planEpoch += 1;
+        clearPlanReferences();
+        this.stateManager.off('state:patch', updatePlanScope);
+        this.stateManager.off('connection:changed', updatePlanScope);
         console.log(`[relay] Client disconnected: ${socket.id} (${reason})`);
       });
     });

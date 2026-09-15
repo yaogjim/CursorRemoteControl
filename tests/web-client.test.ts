@@ -2962,6 +2962,68 @@ describe('web: current-session plan file browsing', () => {
     env = createTestEnv();
   });
 
+  const PLAN_META = {
+    windowId: 'window-1',
+    composerId: 'composer-1',
+    planId: 'plan1',
+    version: 'a'.repeat(64),
+    source: 'cursor_plan_file',
+    fileName: 'auth_system.plan.md',
+    observedAt: 1700000000000,
+    updatedAt: 1699999000000,
+    completeness: 'complete',
+  };
+
+  function planMsg(overrides: Record<string, unknown> = {}) {
+    return {
+      type: 'plan' as const,
+      id: 'plan1',
+      flatIndex: 0,
+      label: 'auth_system_abc.plan.md',
+      title: 'Auth System',
+      todosCompleted: 0,
+      todosTotal: 0,
+      ...overrides,
+    };
+  }
+
+  function targetState(messages: unknown[]) {
+    return {
+      ...patchBaseState(),
+      activeWindowId: 'window-1',
+      activeComposerId: 'composer-1',
+      messages,
+    };
+  }
+
+  function openPlan(messages: unknown[]) {
+    fireFullState(env.mockSocket, targetState(messages));
+    (env.document.querySelector('.plan-btn-view') as HTMLButtonElement).click();
+    return env.document.querySelector('.plan-btn-view') as HTMLButtonElement;
+  }
+
+  function fullResult(
+    payload: Record<string, unknown>,
+    dataOverrides: Record<string, unknown> = {},
+    metaOverrides: Record<string, unknown> = {},
+  ) {
+    return {
+      commandId: payload.commandId,
+      ok: true,
+      data: {
+        todos: [{ text: 'Add login', status: 'pending' }],
+        body: '# Full plan',
+        bodyHtml: '<h1>Full plan</h1>',
+        metadata: { ...PLAN_META, ...metaOverrides },
+        ...dataOverrides,
+      },
+    };
+  }
+
+  function modalBodyText() {
+    return env.document.getElementById('plan-modal-body')!.textContent || '';
+  }
+
   it('always offers View Plan for a session plan without a view_plan action', () => {
     fireFullState(env.mockSocket, {
       ...patchBaseState(),
@@ -2981,26 +3043,55 @@ describe('web: current-session plan file browsing', () => {
     assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), false);
   });
 
-  it('loads the plan file body for a current-session .plan.md label', async () => {
-    fireFullState(env.mockSocket, {
-      ...patchBaseState(),
-      messages: [{
-        type: 'plan',
-        id: 'plan1',
-        flatIndex: 0,
-        label: 'auth_system_abc.plan.md',
-        title: 'Auth System',
-        todosCompleted: 0,
-        todosTotal: 0,
-      }],
-    });
-    (env.document.querySelector('.plan-btn-view') as HTMLButtonElement).click();
+  it('requests the plan file for a plain display label, not only .md labels', async () => {
+    openPlan([planMsg({ label: 'Auth System' })]);
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    assert.equal(payload.type, 'get_plan_full');
+    assert.equal(payload.planId, 'plan1');
+    assert.equal('planLabel' in payload, false);
+  });
+
+  it('requests the explicit plan/window/session target', async () => {
+    openPlan([planMsg()]);
     await Promise.resolve();
     const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
     assert.equal(payload.planId, 'plan1');
-    assert.equal('planLabel' in payload, false);
+    assert.equal(payload.windowId, 'window-1');
+    assert.equal(payload.composerId, 'composer-1');
+  });
+
+  it('shows the full body with accessible source, version, and read times', async () => {
+    openPlan([planMsg()]);
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', fullResult(payload));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.match(modalBodyText(), /Full plan/);
+    assert.match(modalBodyText(), /Add login/);
+    assert.match(modalBodyText(), /auth_system\.plan\.md/);
+    assert.match(modalBodyText(), /window-1/);
+    assert.match(modalBodyText(), /composer-1/);
+    assert.match(modalBodyText(), new RegExp(PLAN_META.version));
+    assert.match(modalBodyText(), /读取时间/);
+    assert.match(modalBodyText(), /文件修改时间（非批准时间）/);
+    assert.match(modalBodyText(), /非持续实时/);
+
+    const reread = [...env.document.querySelectorAll('#plan-modal-body .plan-btn')]
+      .find((btn) => btn.textContent === '重新读取') as HTMLButtonElement;
+    assert.ok(reread, 'an explicit re-read button must be present');
+    reread.focus();
+    assert.equal(env.document.activeElement, reread);
+  });
+
+  it('never shows the body for missing, mismatched, or malformed metadata', async () => {
+    openPlan([planMsg()]);
+    await Promise.resolve();
+    const first = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
     env.mockSocket.fire('command:result', {
-      commandId: payload.commandId,
+      commandId: first.commandId,
       ok: true,
       data: {
         todos: [{ text: 'Add login', status: 'pending' }],
@@ -3010,8 +3101,242 @@ describe('web: current-session plan file browsing', () => {
     });
     await Promise.resolve();
     await Promise.resolve();
-    assert.match(env.document.getElementById('plan-modal-body')!.textContent || '', /Full plan/);
-    assert.match(env.document.getElementById('plan-modal-body')!.textContent || '', /Add login/);
+    assert.doesNotMatch(modalBodyText(), /Full plan/);
+    assert.match(modalBodyText(), /元信息缺失/);
+
+    (env.document.querySelector('.plan-btn-view') as HTMLButtonElement).click();
+    await Promise.resolve();
+    const second = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', fullResult(second, {}, { composerId: 'other-window-session' }));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.doesNotMatch(modalBodyText(), /Full plan/);
+    assert.match(modalBodyText(), /身份与请求的窗口\/会话\/计划不一致/);
+
+    (env.document.querySelector('.plan-btn-view') as HTMLButtonElement).click();
+    await Promise.resolve();
+    const third = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', fullResult(third, {}, { version: 'not-a-sha256' }));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.doesNotMatch(modalBodyText(), /Full plan/);
+    assert.match(modalBodyText(), /元信息格式非法/);
+  });
+
+  it('rejects an empty or malformed body instead of claiming a complete full plan', async () => {
+    openPlan([planMsg()]);
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', fullResult(payload, { body: '   ', bodyHtml: '' }));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.doesNotMatch(modalBodyText(), /内容版本/);
+    assert.match(modalBodyText(), /正文为空/);
+
+    const emitsBefore = commandEmits(env.mockSocket, 'command:get_plan_full').length;
+    const view = [...env.document.querySelectorAll('#messages .plan-btn-view')].at(-1) as HTMLButtonElement;
+    view.click();
+    await Promise.resolve();
+    const second = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    assert.equal(commandEmits(env.mockSocket, 'command:get_plan_full').length, emitsBefore + 1);
+    env.mockSocket.fire('command:result', fullResult(second, { todos: [{ text: '', status: 'pending' }] }));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.doesNotMatch(modalBodyText(), /Full plan/);
+    assert.match(modalBodyText(), /待办列表缺失或格式非法/);
+  });
+
+  it('keeps the loaded body when only the plan model ticket refreshes', async () => {
+    openPlan([planMsg({ modelActionId: 'act_plan_model', model: 'Opus' })]);
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', fullResult(payload));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.match(modalBodyText(), /Full plan/);
+
+    // The model action id is a short-lived TTL ticket, not plan content.
+    firePatch(env.mockSocket, {
+      messages: [planMsg({ modelActionId: 'act_plan_model_v2', model: 'Opus' })],
+    });
+    assert.match(modalBodyText(), /Full plan/);
+    assert.match(modalBodyText(), /内容版本/);
+    assert.doesNotMatch(modalBodyText(), /请重新读取/);
+  });
+
+  it('offers a working re-read button after the summary changes', async () => {
+    openPlan([planMsg()]);
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', fullResult(payload));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.match(modalBodyText(), /Full plan/);
+
+    firePatch(env.mockSocket, {
+      messages: [planMsg({ todos: [{ text: 'Add login', status: 'completed' }], todosCompleted: 1, todosTotal: 1 })],
+    });
+    assert.doesNotMatch(modalBodyText(), /Full plan/);
+    assert.match(modalBodyText(), /请重新读取/);
+
+    const reread = [...env.document.querySelectorAll('#plan-modal-body .plan-btn')]
+      .find((btn) => btn.textContent === '重新读取') as HTMLButtonElement;
+    assert.ok(reread, 're-read must stay available after the summary changed');
+    assert.equal(reread.disabled, false);
+
+    const emitsBefore = commandEmits(env.mockSocket, 'command:get_plan_full').length;
+    reread.click();
+    await Promise.resolve();
+    assert.equal(commandEmits(env.mockSocket, 'command:get_plan_full').length, emitsBefore + 1);
+    const second = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', fullResult(second, {
+      body: '# Fresh',
+      bodyHtml: '<h1>Fresh</h1>',
+    }));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.match(modalBodyText(), /Fresh/);
+  });
+
+  it('invalidates an in-flight full plan when the summary changes first', async () => {
+    openPlan([planMsg()]);
+    await Promise.resolve();
+    const first = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    firePatch(env.mockSocket, { messages: [planMsg({ description: '新版本摘要' })] });
+    env.mockSocket.fire('command:result', fullResult(first, { body: '# Stale', bodyHtml: '<h1>Stale</h1>' }));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.doesNotMatch(modalBodyText(), /Stale/);
+    assert.match(modalBodyText(), /请重新读取/);
+    assert.equal(commandEmits(env.mockSocket, 'command:get_plan_full').length, 1);
+  });
+
+  it('keeps distinct CreatePlan cards that share a display label', () => {
+    fireFullState(env.mockSocket, targetState([
+      planMsg({ id: 'first', toolCallId: 'tc-first', label: 'Created Plan', title: 'First' }),
+      planMsg({ id: 'second', toolCallId: 'tc-second', label: 'Created Plan', title: 'Second', flatIndex: 1 }),
+    ]));
+    const chips = [...env.document.querySelectorAll('.session-plan-chip')];
+    assert.equal(chips.length, 2);
+    assert.match(chips[0].textContent || '', /First/);
+    assert.match(chips[1].textContent || '', /Second/);
+  });
+
+  it('discards a stale response after closing and reopening the same plan', async () => {
+    const view = openPlan([planMsg()]);
+    await Promise.resolve();
+    const first = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+
+    (env.document.getElementById('plan-modal-close') as HTMLButtonElement).click();
+    view.click();
+    await Promise.resolve();
+    const second = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    assert.notEqual(second.commandId, first.commandId);
+
+    env.mockSocket.fire('command:result', fullResult(first, {
+      body: '# Old body',
+      bodyHtml: '<h1>Old body</h1>',
+    }));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.doesNotMatch(modalBodyText(), /Old body/);
+
+    env.mockSocket.fire('command:result', fullResult(second, {
+      body: '# New body',
+      bodyHtml: '<h1>New body</h1>',
+    }));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.match(modalBodyText(), /New body/);
+    assert.doesNotMatch(modalBodyText(), /Old body/);
+  });
+
+  it('keeps only the latest concurrent re-read when responses arrive out of order', async () => {
+    openPlan([planMsg()]);
+    await Promise.resolve();
+    const initial = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', fullResult(initial));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const reread = [...env.document.querySelectorAll('#plan-modal-body .plan-btn')]
+      .find((btn) => btn.textContent === '重新读取') as HTMLButtonElement;
+    reread.click();
+    await Promise.resolve();
+    reread.click();
+    await Promise.resolve();
+    const emits = commandEmits(env.mockSocket, 'command:get_plan_full');
+    const firstReRead = emits[emits.length - 2].args[0] as Record<string, unknown>;
+    const secondReRead = emits[emits.length - 1].args[0] as Record<string, unknown>;
+
+    env.mockSocket.fire('command:result', fullResult(secondReRead, {
+      body: '# Latest',
+      bodyHtml: '<h1>Latest</h1>',
+    }));
+    await Promise.resolve();
+    await Promise.resolve();
+    env.mockSocket.fire('command:result', fullResult(firstReRead, {
+      body: '# Stale',
+      bodyHtml: '<h1>Stale</h1>',
+    }));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.match(modalBodyText(), /Latest/);
+    assert.doesNotMatch(modalBodyText(), /Stale/);
+  });
+
+  it('clears the modal and body on disconnect', async () => {
+    openPlan([planMsg()]);
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', fullResult(payload));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.match(modalBodyText(), /Full plan/);
+
+    env.mockSocket.connected = false;
+    env.mockSocket.fire('disconnect');
+    assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), true);
+    assert.equal(modalBodyText(), '');
+  });
+
+  it('clears the modal when the window/session target changes', async () => {
+    openPlan([planMsg()]);
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', fullResult(payload));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    firePatch(env.mockSocket, { activeComposerId: 'composer-2' });
+    assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), true);
+    assert.equal(modalBodyText(), '');
+  });
+
+  it('shows only the summary with no advance buttons when the read fails', async () => {
+    openPlan([planMsg({
+      modelActionId: 'act_plan_model',
+      model: 'Opus',
+      actions: [
+        { label: 'Build', type: 'build', actionId: 'act_build_123' },
+        { label: 'View Plan', type: 'view_plan', selectorPath: 'secret-view' },
+      ],
+    })]);
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', {
+      commandId: payload.commandId,
+      ok: false,
+      error: 'Plan file not found',
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.match(modalBodyText(), /Plan file not found/);
+    assert.match(modalBodyText(), /并非计划文件全文/);
+    assert.equal(env.document.querySelector('#plan-modal-body .plan-btn-build'), null);
+    assert.equal(env.document.querySelector('#plan-modal-body .plan-model-pill'), null);
+    assert.doesNotMatch(modalBodyText(), /secret-view/);
   });
 
   it('deduplicates current-session plans and shows conservative statuses', () => {
@@ -3021,11 +3346,11 @@ describe('web: current-session plan file browsing', () => {
       messages: [
         {
           type: 'plan', id: 'plan-old', flatIndex: 0,
-          label: 'same.plan.md', title: 'Old copy', todosCompleted: 0, todosTotal: 1,
+          label: 'same.plan.md', fileName: 'same.plan.md', title: 'Old copy', todosCompleted: 0, todosTotal: 1,
         },
         {
           type: 'plan', id: 'plan-new', flatIndex: 1,
-          label: 'same.plan.md', title: 'Current copy', todosCompleted: 1, todosTotal: 1,
+          label: 'same.plan.md', fileName: 'same.plan.md', title: 'Current copy', todosCompleted: 1, todosTotal: 1,
           todos: [{ text: 'Done', status: 'completed' }],
         },
         {
@@ -3043,7 +3368,7 @@ describe('web: current-session plan file browsing', () => {
 
   it('shows loading and read-error fallback without retrying on every patch', async () => {
     const state = {
-      ...patchBaseState(),
+      ...targetState([]),
       messages: [{
         type: 'plan' as const,
         id: 'plan-error',
@@ -3056,7 +3381,7 @@ describe('web: current-session plan file browsing', () => {
     };
     fireFullState(env.mockSocket, state);
     (env.document.querySelector('.plan-btn-view') as HTMLButtonElement).click();
-    assert.match(env.document.getElementById('plan-modal-body')!.textContent || '', /Loading plan file/);
+    assert.match(env.document.getElementById('plan-modal-body')!.textContent || '', /正在读取计划文件/);
     const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
     env.mockSocket.fire('command:result', {
       commandId: payload.commandId,
@@ -3067,7 +3392,7 @@ describe('web: current-session plan file browsing', () => {
     await Promise.resolve();
     assert.match(
       env.document.getElementById('plan-modal-body')!.textContent || '',
-      /Plan file not found.*available session summary/,
+      /Plan file not found.*会话摘要/,
     );
     const before = commandEmits(env.mockSocket, 'command:get_plan_full').length;
     firePatch(env.mockSocket, { messages: state.messages });
@@ -3110,7 +3435,9 @@ describe('web: current-session plan file browsing', () => {
 
     assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), true);
     assert.equal(env.document.getElementById('session-plans-bar')!.classList.contains('hidden'), true);
-    assert.equal(env.document.getElementById('session-plans-toggle')!.classList.contains('hidden'), true);
+    // The target is still confirmable, so the Plans entry stays discoverable even
+    // with zero known plans for the new session.
+    assert.equal(env.document.getElementById('session-plans-toggle')!.classList.contains('hidden'), false);
 
     firePatch(env.mockSocket, {
       messages: [{
@@ -3121,6 +3448,290 @@ describe('web: current-session plan file browsing', () => {
     assert.equal(env.document.getElementById('session-plans-toggle')!.classList.contains('hidden'), false);
     assert.equal(env.document.getElementById('session-plans-bar')!.classList.contains('hidden'), true);
     assert.match(env.document.querySelector('.session-plan-chip')!.textContent || '', /Second session plan/);
+  });
+});
+
+describe('web: on-demand session plan discovery', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  const REF_ID = 'plan-ref:1';
+
+  function discoveryState(messages: unknown[] = []) {
+    return {
+      ...patchBaseState(),
+      activeWindowId: 'window-1',
+      activeComposerId: 'composer-1',
+      messages,
+    };
+  }
+
+  function historyPlan(overrides: Record<string, unknown> = {}) {
+    return {
+      type: 'plan',
+      id: REF_ID,
+      toolCallId: 'tc-hist-1',
+      label: '历史计划',
+      title: '历史计划 One',
+      description: 'from history',
+      flatIndex: 3,
+      todosTotal: 0,
+      todosCompleted: 0,
+      ...overrides,
+    };
+  }
+
+  function discoveryResult(payload: Record<string, unknown>, overrides: Record<string, unknown> = {}) {
+    return {
+      commandId: payload.commandId,
+      ok: true,
+      data: {
+        windowId: 'window-1',
+        composerId: 'composer-1',
+        observedAt: Date.now(),
+        expiresAt: Date.now() + 150,
+        completeness: 'partial',
+        reachedStart: false,
+        plans: [historyPlan()],
+        ...overrides,
+      },
+    };
+  }
+
+  function toggle() {
+    return env.document.getElementById('session-plans-toggle') as HTMLButtonElement;
+  }
+
+  function bar() {
+    return env.document.getElementById('session-plans-bar')!;
+  }
+
+  function discoveryBtn() {
+    return env.document.getElementById('plan-discovery-btn') as HTMLButtonElement;
+  }
+
+  function chips() {
+    return [...env.document.querySelectorAll('.session-plan-chip')];
+  }
+
+  function emits() {
+    return commandEmits(env.mockSocket, 'command:discover_plans');
+  }
+
+  function openDiscoveryBar(messages: unknown[] = []) {
+    fireFullState(env.mockSocket, discoveryState(messages));
+    toggle().click();
+  }
+
+  async function runDiscovery(messages: unknown[] = [], overrides: Record<string, unknown> = {}) {
+    openDiscoveryBar(messages);
+    discoveryBtn().click();
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:discover_plans');
+    env.mockSocket.fire('command:result', discoveryResult(payload, overrides));
+    await Promise.resolve();
+    await Promise.resolve();
+    return payload;
+  }
+
+  it('keeps the Plans entry discoverable with no plan cards at all', () => {
+    fireFullState(env.mockSocket, discoveryState([]));
+    assert.equal(toggle().classList.contains('hidden'), false);
+    assert.equal(toggle().textContent, 'Plans');
+
+    toggle().click();
+    assert.equal(bar().classList.contains('hidden'), false);
+    assert.match(discoveryBtn().textContent || '', /查找当前会话历史计划/);
+    assert.match(env.document.getElementById('plan-discovery-hint')!.textContent || '', /临时滚动当前会话/);
+    assert.match(env.document.getElementById('plan-discovery-hint')!.textContent || '', /可能不完整/);
+  });
+
+  it('only scans after an explicit click and targets the active window/session', async () => {
+    openDiscoveryBar([]);
+    assert.equal(emits().length, 0, 'opening the bar must not scan');
+
+    discoveryBtn().click();
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:discover_plans');
+    assert.equal(payload.type, 'discover_plans');
+    assert.equal(payload.windowId, 'window-1');
+    assert.equal(payload.composerId, 'composer-1');
+    assert.equal(emits().length, 1);
+  });
+
+  it('refuses to scan while this page still holds a draft', async () => {
+    openDiscoveryBar([]);
+    const input = env.document.getElementById('message-input') as HTMLTextAreaElement;
+    input.value = 'half-typed prompt';
+    input.dispatchEvent(new env.window.Event('input', { bubbles: true }));
+
+    discoveryBtn().click();
+    await Promise.resolve();
+    assert.equal(emits().length, 0);
+  });
+
+  it('lists partial-scan references and reads them through the existing full-plan protocol', async () => {
+    await runDiscovery([]);
+    assert.equal(chips().length, 1);
+    assert.match(chips()[0].textContent || '', /历史计划 One/);
+    const meta = env.document.getElementById('plan-discovery-meta')!;
+    assert.match(meta.textContent || '', /发现时间/);
+    assert.match(meta.textContent || '', /partial/);
+
+    chips()[0].click();
+    await Promise.resolve();
+    const read = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    assert.equal(read.planId, REF_ID);
+    assert.equal(read.windowId, 'window-1');
+    assert.equal(read.composerId, 'composer-1');
+
+    env.mockSocket.fire('command:result', {
+      commandId: read.commandId,
+      ok: true,
+      data: {
+        todos: [{ text: 'Historic step', status: 'pending' }],
+        body: '# Historic plan',
+        bodyHtml: '<h1>Historic plan</h1>',
+        metadata: {
+          windowId: 'window-1',
+          composerId: 'composer-1',
+          planId: REF_ID,
+          version: 'b'.repeat(64),
+          source: 'cursor_plan_file',
+          fileName: 'historic.plan.md',
+          observedAt: Date.now(),
+          updatedAt: Date.now(),
+          completeness: 'complete',
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), false);
+    assert.match(env.document.getElementById('plan-modal-body')!.textContent || '', /Historic plan/);
+  });
+
+  it('keeps a reference-backed modal readable after its card leaves the DOM', async () => {
+    await runDiscovery([]);
+    chips()[0].click();
+    await Promise.resolve();
+    const read = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', {
+      commandId: read.commandId,
+      ok: true,
+      data: {
+        todos: [{ text: 'Historic step', status: 'pending' }],
+        body: '# Historic plan',
+        bodyHtml: '<h1>Historic plan</h1>',
+        metadata: {
+          windowId: 'window-1',
+          composerId: 'composer-1',
+          planId: REF_ID,
+          version: 'b'.repeat(64),
+          source: 'cursor_plan_file',
+          fileName: 'historic.plan.md',
+          observedAt: Date.now(),
+          updatedAt: Date.now(),
+          completeness: 'complete',
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    firePatch(env.mockSocket, { messages: [] });
+    assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), false);
+    assert.match(env.document.getElementById('plan-modal-body')!.textContent || '', /Historic plan/);
+  });
+
+  it('重新发现失败也不恢复已失效的历史计划引用', async () => {
+    await runDiscovery([]);
+    chips()[0].click();
+    await Promise.resolve();
+    discoveryBtn().click();
+    await Promise.resolve();
+    assert.equal(chips().length, 0);
+    assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), true);
+    const request = lastCommandPayload(env.mockSocket, 'command:discover_plans');
+    env.mockSocket.fire('command:result', { commandId: request.commandId, ok: false, error: '人工介入，查找已停止' });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(chips().length, 0);
+    assert.match(bar().textContent || '', /人工介入/);
+  });
+
+  it('clears expired references, closes their modal, and asks for a fresh scan', async () => {
+    await runDiscovery([], { expiresAt: Date.now() + 30 });
+    chips()[0].click();
+    await Promise.resolve();
+    assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), false);
+
+    await new Promise((resolve) => setTimeout(resolve, 320));
+    assert.equal(chips().length, 0);
+    assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), true);
+    assert.equal(env.document.getElementById('plan-modal-body')!.textContent, '');
+    assert.equal(toggle().classList.contains('hidden'), false);
+    assert.match(bar().textContent || '', /引用已过期，请重新查找/);
+  });
+
+  it('drops a late discovery response after the session changed back', async () => {
+    openDiscoveryBar([]);
+    discoveryBtn().click();
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:discover_plans');
+
+    firePatch(env.mockSocket, { activeComposerId: 'composer-2' });
+    firePatch(env.mockSocket, { activeComposerId: 'composer-1' });
+
+    env.mockSocket.fire('command:result', discoveryResult(payload));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(chips().length, 0, 'a stale nonce response must not populate plans');
+    assert.equal(commandEmits(env.mockSocket, 'command:get_plan_full').length, 0);
+  });
+
+  it('clears discovered references on disconnect without auto-rescanning', async () => {
+    await runDiscovery([]);
+    assert.equal(chips().length, 1);
+
+    env.mockSocket.connected = false;
+    env.mockSocket.fire('disconnect');
+    assert.equal(chips().length, 0);
+    assert.equal(bar().classList.contains('hidden'), true);
+    assert.equal(emits().length, 1, 'disconnect must not trigger another scan');
+  });
+
+  it('replaces references on a newer scan and never scans automatically', async () => {
+    await runDiscovery([]);
+    assert.equal(emits().length, 1);
+    assert.equal(chips().length, 1);
+
+    discoveryBtn().click();
+    await Promise.resolve();
+    assert.equal(emits().length, 2, 'an explicit second scan is allowed');
+    const second = lastCommandPayload(env.mockSocket, 'command:discover_plans');
+    env.mockSocket.fire('command:result', discoveryResult(second, {
+      plans: [historyPlan({ id: 'plan-ref:2', toolCallId: 'tc-hist-2', title: '历史计划 Two' })],
+    }));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(chips().length, 1);
+    assert.match(chips()[0].textContent || '', /历史计划 Two/);
+    assert.doesNotMatch(bar().textContent || '', /历史计划 One/);
+
+    firePatch(env.mockSocket, { messages: [] });
+    await Promise.resolve();
+    assert.equal(emits().length, 2, 'state updates must never trigger a scan');
+  });
+
+  it('does not present an empty partial scan as "no plans"', async () => {
+    await runDiscovery([], { plans: [] });
+    assert.equal(chips().length, 0);
+    assert.match(bar().textContent || '', /不代表当前会话没有计划/);
+    assert.match(bar().textContent || '', /partial/);
   });
 });
 

@@ -198,7 +198,7 @@ Cursor IDE  ←──CDP──→  Relay Server  ←──socket.io──→  Ph
 | `set_mode(modeId)` | 对 mode 下拉触发器 JS `.click()`，再对目标 mode 项 `.click()`。 |
 | `set_model(modelId)` | 对 model 下拉触发器 JS `.click()`，再对目标 model 项 `.click()`。选择后验证菜单关闭。选项 ID 来自现场菜单（`getModelOptions`），不是硬编码列表。 |
 | `get_model_options()` | 打开 composer 模型菜单，刮取行，返回 `{ id, label, selected }[]`。 |
-| `get_plan_full(planId)` / `get_plan_model_options` / `set_plan_model` | `get_plan_full` 只接受当前 `CursorState.messages` 中 plan 的不透明 ID，中继从当前状态解析文件名并读取 `~/.cursor/plans` 下有界的普通非符号链接文件；其余命令刮取计划作用域模型菜单并把所选计划模型应用回 Cursor。 |
+| `get_plan_full(planId, windowId, composerId)` / `get_plan_model_options` / `set_plan_model` | 全文读取校验当前目标、读取权限及观察时间；使用明确文件引用，或在共享界面操作队列中按真实工具调用标识打开计划并核对编辑器路径。安全读取一次返回带 SHA-256 版本和观察时间的文件快照；其余命令仍处理计划模型菜单。 |
 | `click_action(selectorPath)` | 通用操作按钮点击。Evaluate 以滚入视图 + JS `.click()`。用于带 `selectorPath` 提取的 Run、Skip、Allow、Build、View Plan 和问卷按钮。 |
 
 **为什么用 CDP Input 域输入文本**：Cursor 的聊天 composer 使用 ProseMirror/TipTap。DOM 级方法（`document.execCommand`、`element.value=`）会绕过 ProseMirror 的内部状态模型。CDP 的 `Input.insertText` 和 `Input.dispatchKeyEvent` 走 Chromium 原生输入管道，ProseMirror 通过 `beforeinput`/`input` 事件处理程序正确处理。
@@ -500,10 +500,14 @@ mode 和 model 下拉都通过 `Runtime.evaluate` 的普通 JavaScript `.click()
 
 legacy 计划格式（`.plan-execution-message-content`）有不同的 DOM 结构，出现在 `role=human` 包装器内。两者都映射到 `PlanBlock` 类型。
 
+Cursor 3.15.19 实测的新卡片位于带 `data-tool-call-id` 的 AI 工具包装器内，使用 `.ui-tool-call-card[data-tool-call-card-marker="root"]` 和专用 `[data-testid="composer-plan-filename"]` 标记。该标记实际仅提供标题，卡片正文仅为概述，不能据此猜测磁盘文件名。提取器保留真实工具调用标识，仅暴露新版卡片的阅读动作，不增加 Build 或模型选择能力。普通 `.plan.md` 文件读取记录仍为工具消息。
+
 远程控制时，Web 客户端不再只依赖紧凑的已提取 widget 载荷：
 
 - `View Plan` 打开本地 Web 模态框。
-- 中继可以读取 `~/.cursor/plans/<label>` 并返回完整计划正文/todos，在保存文件存在时与 Telegram 更丰富的完整计划渲染一致。
+- 中继使用服务端确认的文件引用，或通过准确卡片的 `View Plan` 核对同组编辑器标签和面包屑后，再读取 `~/.cursor/plans` 下有界文件；成功响应附目标和版本元数据。路径不明、已发生人工交互或目标变化时拒绝，不以摘要替代全文。
+- `discover_plans` 复用同一界面协调队列、当前 composer 精确定位、有界滚动及人工输入检查，最多向上 24 屏、返回 32 个真实计划卡片的标题/摘要及工具身份，始终声明部分范围。中继按 socket 保留一批 5 分钟有效的随机 `plan-ref:` 引用，不保存全文、不扫描目录、不广播引用；读取引用时再次定位真实卡片和文档。目标、连接代次或登录身份改变、断线、到期及重新发现使旧引用失效；最终发送响应前重查权限、目标及引用有效性。
+- 读取包含必要滚动、一次打开和条件恢复，均处于共享界面操作队列内；未知失败不盲目恢复界面。人工输入观察仅是尽力检测，不是桌面输入锁或目标端事务；绕过服务端协调的其他程序操作仍不在该保证内。
 - 计划模型药丸通过中继请求 Cursor 当前计划模型菜单中的现场选项，再把所选选项发回 Cursor，无需用户直接操作桌面 UI。
 
 ### 6.7 Run command widget 使用 `.composer-terminal-tool-call-block-container`

@@ -111,7 +111,7 @@ CursorRemote 中继服务器（Node.js + TypeScript）
 
 ```bash
 # 从命令行安装
-cursor --install-extension cursor-remote-0.1.59.vsix
+cursor --install-extension cursor-remote-0.2.0.0.vsix
 ```
 
 或在 Cursor 中：打开命令面板（`Ctrl+Shift+P`），运行 **Extensions: Install from VSIX...**，然后选择文件。

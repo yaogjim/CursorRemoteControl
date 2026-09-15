@@ -241,6 +241,10 @@ export interface PlanBlock {
   type: 'plan';
   id: string;
   flatIndex: number;
+  /** 仅由文件标签明确提供的引用；展示标题不作文件名。 */
+  fileName?: string;
+  /** Cursor tool-call id of the card that produced this plan (binds to the plan document read). */
+  toolCallId?: string;
   label: string;
   title: string;
   todosCompleted: number;
@@ -265,10 +269,32 @@ export interface PlanModelOption {
   selected?: boolean;
 }
 
+export interface PlanDiscoveryData {
+  plans: Array<{ id: string; toolCallId: string; label: string; title: string; description?: string }>;
+  windowId: string;
+  composerId: string;
+  observedAt: number;
+  expiresAt: number;
+  completeness: 'partial';
+  reachedStart: boolean;
+}
+
 export interface PlanFullData {
   todos: PlanTodo[];
   body: string;
   bodyHtml: string;
+  /** 单次文件读取快照；不代表持续实时状态或用户批准。 */
+  metadata: {
+    windowId: string;
+    composerId: string;
+    planId: string;
+    source: 'cursor_plan_file';
+    fileName: string;
+    version: string;
+    observedAt: number;
+    updatedAt: number;
+    completeness: 'complete';
+  };
 }
 
 export interface TodoListBlock {
@@ -338,7 +364,7 @@ export interface SelectorConfig {
 
 export interface CommandPayload {
   commandId: string;
-  type: 'send_message' | 'approve' | 'reject' | 'approve_all' | 'switch_tab' | 'new_chat' | 'set_mode' | 'set_model' | 'click_action' | 'get_plan_full' | 'get_plan_model_options' | 'set_plan_model';
+  type: 'send_message' | 'approve' | 'reject' | 'approve_all' | 'switch_tab' | 'new_chat' | 'set_mode' | 'set_model' | 'click_action' | 'discover_plans' | 'get_plan_full' | 'get_plan_model_options' | 'set_plan_model';
   text?: string;
   approvalId?: string;
   actionType?: string;

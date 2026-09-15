@@ -13,6 +13,526 @@ const MAX_CACHED_COMMAND_RESULTS = 1_000;
 // Cursor 3.8+ uses data-message-index; older builds use data-flat-index.
 const MESSAGE_WRAPPER_SELECTOR = '[data-message-index], [data-flat-index]';
 
+// Plan document read: the plan path is only trustworthy when Cursor itself
+// opened it under this prefix, so anything else is rejected rather than guessed.
+const PLAN_DOCUMENT_PATH_PREFIX = '~/.cursor/plans/';
+const PLAN_DOCUMENT_SCROLL_MAX_STEPS = 24;
+// One composer's transcript can hold a lot of plan cards; the reported list and
+// the per-card text are both hard-capped so a discovery response stays small.
+const PLAN_DISCOVERY_MAX_PLANS = 32;
+const PLAN_DOCUMENT_RENDER_WAIT_MS = 150;
+const PLAN_DOCUMENT_OPEN_POLL_MAX = 40;
+const PLAN_DOCUMENT_OPEN_POLL_WAIT_MS = 150;
+const PLAN_DOCUMENT_RESTORE_POLL_MAX = 20;
+const PLAN_DOCUMENT_READ_TIMEOUT_MS = 30_000;
+
+// Makes each read attempt's in-page interaction watch token unique. Not
+// persisted; a page reload simply loses the old watches.
+let planWatchSeq = 0;
+
+/** Extract the single `.plan.md` name under the plans root, or null. Never a path. */
+function planFileNameFromPath(path: string): string | null {
+  if (typeof path !== 'string' || !path.startsWith(PLAN_DOCUMENT_PATH_PREFIX)) return null;
+  const name = path.slice(PLAN_DOCUMENT_PATH_PREFIX.length);
+  if (!name || name === '.plan.md') return null;
+  if (!name.endsWith('.plan.md')) return null;
+  if (name.includes('/') || name.includes('\\') || name.includes('\0')) return null;
+  return name;
+}
+
+// In-browser helpers for the plan document read. Non-message editor elements
+// (tabs / breadcrumb / plan editor group) come from selectors.json; the plan
+// tool card markers are message-internal and stay here. Injected as
+// `${PLAN_DOCUMENT_HELPERS_JS}` inside an evaluate().
+const PLAN_DOCUMENT_HELPERS_JS = `
+  const planNormalizeText = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+
+  const planUniqueAttrRoot = (attribute, value) => {
+    if (!value) return null;
+    const matches = Array.from(document.querySelectorAll('[' + attribute + ']'))
+      .filter((el) => el.getAttribute(attribute) === value);
+    const roots = matches.filter((el) => !matches.some((other) => other !== el && other.contains(el)));
+    return roots.length === 1 ? roots[0] : null;
+  };
+
+  const planComposerRoot = (composerId) => {
+    const root = planUniqueAttrRoot('data-composer-id', composerId);
+    if (!root) return null;
+    const rect = root.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    return root;
+  };
+
+  const planDraftText = (root) => {
+    if (!root) return null;
+    for (const field of Array.from(root.querySelectorAll('[contenteditable="true"], textarea'))) {
+      const text = field.isContentEditable
+        ? (field.textContent || '')
+        : (typeof field.value === 'string' && field.value.length > 0 ? field.value : (field.textContent || ''));
+      if (text.trim().length > 0) return text.trim();
+    }
+    return '';
+  };
+
+  const planCardCandidates = (root, toolCallId) => {
+    if (!root || !toolCallId) return [];
+    const hosts = Array.from(root.querySelectorAll('[data-tool-call-id]'))
+      .filter((el) => el.getAttribute('data-tool-call-id') === toolCallId)
+      .filter((el) => el.getAttribute('data-message-role') === 'ai'
+        && el.getAttribute('data-message-kind') === 'tool');
+    const cards = [];
+    for (const host of hosts) {
+      const card = host.querySelector('.ui-tool-call-card[data-tool-call-card-marker="root"]');
+      if (card && !cards.includes(card)) cards.push(card);
+    }
+    return cards;
+  };
+
+  const planViewPlanButton = (card) => {
+    if (!card) return null;
+    // Strict, case-exact label match: a differently-cased label is not the same button.
+    const buttons = Array.from(card.querySelectorAll('button'))
+      .filter((btn) => planNormalizeText(btn.textContent) === 'View Plan');
+    return buttons.length === 1 ? buttons[0] : null;
+  };
+
+  const planLocateCard = (root, toolCallId) => {
+    const cards = planCardCandidates(root, toolCallId);
+    if (cards.length === 0) return { status: 'missing' };
+    if (cards.length > 1) return { status: 'ambiguous' };
+    const card = cards[0];
+    if (!card.querySelector('[data-testid="composer-plan-filename"]')) return { status: 'not_plan' };
+    if (!planViewPlanButton(card)) return { status: 'no_view_plan' };
+    return { status: 'ok', card: card };
+  };
+
+const planSelectedTabs = (tabSelector) => Array.from(document.querySelectorAll(tabSelector))
+    .filter((tab) => tab.getAttribute('aria-selected') === 'true')
+    .filter((tab) => (tab.getAttribute('data-resource-name') || '').length > 0);
+
+  // Exactly one selected resource tab, inside exactly one editor group. An
+  // editor switch caused by this flow opening the plan is expected; a
+  // multi-selection or an ungrouped selection is not.
+  const planSelection = (selectors) => {
+    const tabs = planSelectedTabs(selectors.tab);
+    if (tabs.length !== 1) return { status: 'selection_ambiguous', count: tabs.length };
+    if (!tabs[0].closest(selectors.group)) return { status: 'selection_group_missing' };
+    return { status: 'ok', resourceName: tabs[0].getAttribute('data-resource-name') || '' };
+  };
+
+  const planButtonBlocker = (button) => {
+    if (button.disabled === true || button.hasAttribute('disabled')) return 'disabled';
+    if (button.getAttribute('aria-disabled') === 'true') return 'disabled';
+    if (button.hasAttribute('hidden') || button.getAttribute('aria-hidden') === 'true' || button.closest('[hidden]')) return 'hidden';
+    const style = getComputedStyle(button);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return 'hidden';
+    const rect = button.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return 'hidden';
+    return '';
+  };
+
+  const planScrollContainer = (root, selector) => (root ? root.querySelector(selector) : null);
+
+  // Short-lived observation of real user input on this page, one entry per read
+  // attempt and keyed by that attempt's token. Only trusted browser events
+  // count, so this program's own .click() and dispatched MouseEvents are
+  // ignored. Listeners are passive: user input is never blocked, only noted.
+  const planWatchEvents = ['pointerdown', 'mousedown', 'keydown', 'input', 'wheel'];
+
+  const planWatchInstall = (token) => {
+    if (!token) return { status: 'watch_invalid' };
+    const registry = window.__cursorRemotePlanWatch || (window.__cursorRemotePlanWatch = {});
+    if (registry[token]) return { status: 'watch_conflict' };
+    const entry = { events: [], cleanup: null };
+    const record = (event) => {
+      if (!event || event.isTrusted !== true) return;
+      if (entry.events.indexOf(event.type) === -1) entry.events.push(event.type);
+    };
+    for (const type of planWatchEvents) {
+      document.addEventListener(type, record, { capture: true, passive: true });
+    }
+    entry.cleanup = () => {
+      for (const type of planWatchEvents) document.removeEventListener(type, record, { capture: true });
+    };
+    registry[token] = entry;
+    return { status: 'ok' };
+  };
+
+  const planWatchState = (token) => {
+    const registry = window.__cursorRemotePlanWatch;
+    const entry = registry && token ? registry[token] : null;
+    if (!entry) return { status: 'watch_lost' };
+    if (entry.events.length > 0) return { status: 'user_activity', events: entry.events.slice() };
+    return { status: 'ok' };
+  };
+
+  const planWatchRemove = (token) => {
+    const registry = window.__cursorRemotePlanWatch;
+    const entry = registry && token ? registry[token] : null;
+    if (!entry) return { status: 'absent' };
+    if (typeof entry.cleanup === 'function') entry.cleanup();
+    delete registry[token];
+    if (Object.keys(registry).length === 0) delete window.__cursorRemotePlanWatch;
+    return { status: 'removed' };
+  };
+
+  // Layout-compensation record for the transcript scroll. Cursor can re-anchor
+  // the virtualized transcript right after this flow writes scrollTop: the
+  // content above the viewport changes height and the browser keeps the visual
+  // anchor by moving scrollTop by exactly the same amount. Each attempt records
+  // what it just wrote - the scroller, its offsets, and the uniquely keyed
+  // non-sticky message rows it could see - and a later step accepts a moved
+  // offset only when every part of that story still holds. Nothing here waits
+  // or allows a height difference on its own: a missing piece keeps the strict
+  // rejection. Records live in this attempt's watch entry and die with it.
+  const planScrollAnchorLimit = 6;
+
+  const planScrollAnchors = (scroller) => {
+    if (!scroller) return [];
+    const rows = Array.from(scroller.querySelectorAll('[data-find-row-key][data-sticky="false"]'));
+    // A Map, so a key that happens to collide with an Object prototype name
+    // ("constructor", "toString") still counts as exactly one row.
+    const keyCounts = new Map();
+    for (const row of rows) {
+      const key = row.getAttribute('data-find-row-key');
+      if (key) keyCounts.set(key, (keyCounts.get(key) || 0) + 1);
+    }
+    const scrollerRect = scroller.getBoundingClientRect();
+    const anchors = [];
+    for (const row of rows) {
+      if (anchors.length >= planScrollAnchorLimit) break;
+      const key = row.getAttribute('data-find-row-key');
+      // A key that is not unique in this transcript cannot anchor anything.
+      if (!key || keyCounts.get(key) !== 1) continue;
+      const rect = row.getBoundingClientRect();
+      if (rect.height <= 0) continue;
+      const top = rect.top - scrollerRect.top;
+      // Only a row actually on screen can anchor a visual position.
+      if (top + rect.height <= 0 || top >= scroller.clientHeight) continue;
+      anchors.push({ key: key, top: top, height: rect.height });
+    }
+    return anchors;
+  };
+
+  const planScrollObserve = (token, scroller) => {
+    const registry = window.__cursorRemotePlanWatch;
+    const entry = registry && token ? registry[token] : null;
+    if (!entry || !scroller) return { status: 'scroll_missing' };
+    entry.scroll = {
+      scroller: scroller,
+      top: scroller.scrollTop,
+      height: scroller.scrollHeight,
+      client: scroller.clientHeight,
+      anchors: planScrollAnchors(scroller),
+    };
+    return { status: 'ok' };
+  };
+
+  // True only for a layout shift this attempt can prove: the same scroller, an
+  // unchanged viewport, an offset that moved by exactly what the content height
+  // moved, and at least one uniquely keyed non-sticky row still at the same
+  // place on screen (1px of rounding). On success the record advances, so the
+  // same shift can never be counted twice.
+  const planScrollReanchored = (token, scroller) => {
+    const registry = window.__cursorRemotePlanWatch;
+    const entry = registry && token ? registry[token] : null;
+    const record = entry && entry.scroll ? entry.scroll : null;
+    if (!record || record.scroller !== scroller) return false;
+    const top = scroller.scrollTop;
+    const height = scroller.scrollHeight;
+    if (top === record.top) return false;
+    if (scroller.clientHeight !== record.client) return false;
+    if (top - record.top !== height - record.height) return false;
+    const anchors = planScrollAnchors(scroller);
+    let reanchored = false;
+    for (const anchor of anchors) {
+      const before = record.anchors.find((item) => item.key === anchor.key);
+      if (!before) continue;
+      if (Math.abs(anchor.top - before.top) <= 1 && Math.abs(anchor.height - before.height) <= 1) {
+        reanchored = true;
+        break;
+      }
+    }
+    if (!reanchored) return false;
+    record.top = top;
+    record.height = height;
+    record.anchors = anchors;
+    return true;
+  };
+
+  // The offset this step may stand behind, or null when the transcript cannot be
+  // tied to what this attempt recorded. The record has to name this very
+  // scroller even when the offset already looks right: a freshly swapped
+  // container that happens to sit at the same offset is still a change. A moved
+  // offset is accepted only as the re-anchor proof above.
+  const planScrollConfirmed = (token, scroller, expectedTop) => {
+    if (!scroller) return null;
+    const registry = window.__cursorRemotePlanWatch;
+    const entry = registry && token ? registry[token] : null;
+    const record = entry && entry.scroll ? entry.scroll : null;
+    if (!record || record.scroller !== scroller) return null;
+    const top = scroller.scrollTop;
+    if (top === expectedTop) return top;
+    return planScrollReanchored(token, scroller) ? scroller.scrollTop : null;
+  };
+
+  // Shared pre-side-effect check for one read attempt. Every mutating step
+  // (transcript scroll, View Plan click, tab restore) and every read of the
+  // plan editor runs this inside the same evaluate, so a DOM change the outer
+  // poll has not observed yet still blocks the step. The token's interaction
+  // watch is checked first and fails closed when it is gone. The expected
+  // selection is '' before a selection is recorded; the expected scroll top is
+  // null before this flow has scrolled.
+  const planFlowState = (token, selectors, composerId, expectedSelection, flowScrollTop) => {
+    const watch = planWatchState(token);
+    if (watch.status !== 'ok') return { status: watch.status };
+    const root = planComposerRoot(composerId);
+    if (!root) return { status: 'composer_missing' };
+    if (planDraftText(root) !== '') return { status: 'draft_present' };
+    const selection = planSelection(selectors);
+    if (selection.status !== 'ok') return { status: selection.status };
+    if (expectedSelection && selection.resourceName !== expectedSelection) return { status: 'selection_changed' };
+    if (flowScrollTop !== null) {
+      const scroller = planScrollContainer(root, selectors.scroll);
+      // A moved offset is accepted only as Cursor's own re-anchor, re-proved
+      // against the same visible rows inside this same evaluate. Anything else
+      // stays the strict rejection, and no record at all means no acceptance.
+      const confirmed = planScrollConfirmed(token, scroller, flowScrollTop);
+      if (confirmed === null) return { status: 'scroll_changed' };
+      return { status: 'ok', root: root, resourceName: selection.resourceName, scrollTop: confirmed };
+    }
+    return { status: 'ok', root: root, resourceName: selection.resourceName };
+  };
+
+  const planStepPreflight = (token, selectors, composerId, toolCallId) => {
+    const state = planFlowState(token, selectors, composerId, '', null);
+    if (state.status !== 'ok') return { status: state.status };
+    return { status: 'ok', baseline: state.resourceName, cardStatus: planLocateCard(state.root, toolCallId).status };
+  };
+
+  const planStepScrollUp = (token, selectors, composerId, expectedSelection, flowScrollTop) => {
+    const state = planFlowState(token, selectors, composerId, expectedSelection, flowScrollTop);
+    if (state.status !== 'ok') return { status: state.status };
+    const scroller = planScrollContainer(state.root, selectors.scroll);
+    if (!scroller) return { status: 'scroll_missing' };
+    const before = scroller.scrollTop;
+    // Both branches report the offset this guard just confirmed: a compensation
+    // accepted above moved the transcript before this step wrote, so the caller
+    // has to see it in order to keep following the position.
+    if (before <= 0) return { status: 'scroll_top', scrollTop: state.scrollTop };
+    const step = Math.max(1, Math.floor(scroller.clientHeight));
+    scroller.scrollTop = Math.max(0, before - step);
+    // Recorded in the same evaluate as the write, so a later re-anchor is
+    // measured against exactly what this flow left behind.
+    planScrollObserve(token, scroller);
+    return { status: 'scrolled', before: before, after: scroller.scrollTop, scrollTop: state.scrollTop };
+  };
+
+  const planStepCardProbe = (token, selectors, composerId, toolCallId, expectedSelection, flowScrollTop) => {
+    const state = planFlowState(token, selectors, composerId, expectedSelection, flowScrollTop);
+    if (state.status !== 'ok') return { status: state.status };
+    return { status: 'ok', cardStatus: planLocateCard(state.root, toolCallId).status, scrollTop: state.scrollTop };
+  };
+
+  const planStepClickViewPlan = (token, selectors, composerId, toolCallId, expectedSelection, flowScrollTop) => {
+    const state = planFlowState(token, selectors, composerId, expectedSelection, flowScrollTop);
+    if (state.status !== 'ok') return { status: state.status };
+    const located = planLocateCard(state.root, toolCallId);
+    if (located.status !== 'ok') return { status: 'card_' + located.status };
+    const button = planViewPlanButton(located.card);
+    if (!button) return { status: 'card_no_view_plan' };
+    const blocker = planButtonBlocker(button);
+    if (blocker) return { status: 'card_button_' + blocker };
+    button.click();
+    // Input that arrives while Cursor handles this click synchronously has to
+    // invalidate the attempt in the same evaluate, before any read-back.
+    const afterClick = planWatchState(token);
+    if (afterClick.status !== 'ok') return { status: afterClick.status };
+    return { status: 'clicked', scrollTop: state.scrollTop };
+  };
+
+  const planStepReadOpen = (token, selectors, composerId, expectedSelection, flowScrollTop) => {
+    const state = planFlowState(token, selectors, composerId, '', flowScrollTop);
+    if (state.status !== 'ok') return { status: state.status };
+    const selection = planSelection(selectors);
+    if (selection.status !== 'ok') return { status: selection.status };
+    const resourceName = selection.resourceName;
+    if (resourceName === expectedSelection) {
+      return { status: 'not_open', resourceName: resourceName, scrollTop: state.scrollTop };
+    }
+    const group = planSelectedTabs(selectors.tab)[0].closest(selectors.group);
+    const icons = Array.from(group.querySelectorAll(selectors.breadcrumb))
+      .filter((icon) => (icon.getAttribute('aria-label') || '').trim().length > 0);
+    if (icons.length !== 1) {
+      return { status: 'path_ambiguous', resourceName: resourceName, count: icons.length, scrollTop: state.scrollTop };
+    }
+    const editors = Array.from(group.querySelectorAll(selectors.editor));
+    if (editors.length !== 1) {
+      return { status: 'editor_missing', resourceName: resourceName, count: editors.length, scrollTop: state.scrollTop };
+    }
+    if (editors[0].getAttribute('data-streaming') !== 'false') {
+      return { status: 'editor_streaming', resourceName: resourceName, scrollTop: state.scrollTop };
+    }
+    return {
+      status: 'ok',
+      resourceName: resourceName,
+      breadcrumbPath: (icons[0].getAttribute('aria-label') || '').trim(),
+      scrollTop: state.scrollTop,
+    };
+  };
+
+  const planStepRestoreTab = (token, selectors, composerId, expectedPlanSelection, baselineSelection, flowScrollTop) => {
+    const state = planFlowState(token, selectors, composerId, expectedPlanSelection, flowScrollTop);
+    if (state.status !== 'ok') return { status: state.status };
+    const tabs = planSelectedTabs(selectors.tab);
+    if (tabs.length !== 1) return { status: 'selection_ambiguous' };
+    const group = tabs[0].closest(selectors.group);
+    if (!group) return { status: 'selection_group_missing' };
+    const target = Array.from(group.querySelectorAll(selectors.tab))
+      .find((tab) => tab.getAttribute('data-resource-name') === baselineSelection);
+    if (!target) return { status: 'baseline_missing' };
+    const dispatch = (type, buttons) => target.dispatchEvent(new MouseEvent(type, {
+      bubbles: true, cancelable: true, view: window, button: 0, buttons: buttons,
+    }));
+    dispatch('mousedown', 1);
+    dispatch('mouseup', 0);
+    return { status: 'restored', scrollTop: state.scrollTop };
+  };
+
+  // Read-only confirmation: exactly one document is selected, optionally the
+  // one named here, and - when this flow scrolled - the transcript is at the
+  // offset this attempt recorded. Used both by the restore poll and by the
+  // final post-restore confirmation.
+  const planStepVerifySelection = (token, selectors, composerId, flowScrollTop, expectedSelection) => {
+    const state = planFlowState(token, selectors, composerId, expectedSelection || '', flowScrollTop);
+    if (state.status !== 'ok') return { status: state.status };
+    return { status: 'ok', selection: state.resourceName, scrollTop: state.scrollTop };
+  };
+
+  const planStepRestoreScroll = (token, selectors, composerId, expectedSelection, flowScrollTop, restoreBase) => {
+    const state = planFlowState(token, selectors, composerId, expectedSelection, flowScrollTop);
+    if (state.status !== 'ok') return { status: state.status };
+    const scroller = planScrollContainer(state.root, selectors.scroll);
+    if (!scroller) return { status: 'scroll_missing' };
+    // The guard above may have just accepted one more layout compensation: the
+    // transcript moved by that much before this step could write, so the target
+    // absorbs the delta instead of landing short of the original position.
+    const delta = (typeof state.scrollTop === 'number' && typeof flowScrollTop === 'number')
+      ? state.scrollTop - flowScrollTop
+      : 0;
+    const target = restoreBase + delta;
+    scroller.scrollTop = target;
+    if (scroller.scrollTop !== target) return { status: 'scroll_unverified' };
+    // The restored position becomes this attempt's new record, so the final
+    // confirmation can apply the same re-anchor proof instead of raw pixels.
+    planScrollObserve(token, scroller);
+    return { status: 'ok', restoredTop: scroller.scrollTop };
+  };
+
+  // --- Plan discovery, in the same page helpers ---------------------------
+  // Reads only this exact composer's own AI tool wrappers that carry the
+  // dedicated plan-filename marker. Nothing is expanded, clicked, or switched;
+  // text is hard-clipped so a plan body can never ride along, and a label that
+  // looks like a path is dropped instead of reported.
+  const planDiscoverMaxCards = ${PLAN_DISCOVERY_MAX_PLANS};
+  const planDiscoverTextMax = 200;
+  const planDiscoverClip = (value) => {
+    const text = planNormalizeText(value);
+    return text.length > planDiscoverTextMax ? text.slice(0, planDiscoverTextMax) : text;
+  };
+  const planDiscoverTitle = (card) => {
+    const label = card.querySelector('[data-testid="composer-plan-filename"]');
+    if (!label) return '';
+    const title = planDiscoverClip(label.textContent);
+    if (!title) return '';
+    for (const separator of [String.fromCharCode(47), String.fromCharCode(92)]) {
+      if (title.indexOf(separator) !== -1) return '';
+    }
+    return title;
+  };
+  const planDiscoverCards = (root) => {
+    if (!root) return [];
+    const plans = [];
+    const seen = new Set();
+    const hosts = Array.from(root.querySelectorAll('[data-message-role="ai"][data-message-kind="tool"][data-tool-call-id]'));
+    for (const host of hosts) {
+      if (plans.length >= planDiscoverMaxCards) break;
+      const toolCallId = planNormalizeText(host.getAttribute('data-tool-call-id'));
+      if (!toolCallId || seen.has(toolCallId)) continue;
+      const card = host.querySelector('.ui-tool-call-card[data-tool-call-card-marker="root"]');
+      if (!card) continue;
+      const title = planDiscoverTitle(card);
+      if (!title) continue;
+      seen.add(toolCallId);
+      const summary = card.querySelector('.markdown-root');
+      const description = planDiscoverClip(summary ? summary.textContent : '');
+      plans.push(description
+        ? { toolCallId: toolCallId, title: title, description: description }
+        : { toolCallId: toolCallId, title: title });
+    }
+    return plans;
+  };
+
+  // Discovery preflight: the same watch / composer root / draft / single
+  // selection checks as a read, with no card to locate. Only plain values
+  // leave the page.
+  const planStepDiscoverStart = (token, selectors, composerId) => {
+    const state = planFlowState(token, selectors, composerId, '', null);
+    if (state.status !== 'ok') return { status: state.status };
+    return { status: 'ok', baseline: state.resourceName };
+  };
+
+  const planStepScanPlans = (token, selectors, composerId, expectedSelection, flowScrollTop) => {
+    const state = planFlowState(token, selectors, composerId, expectedSelection, flowScrollTop);
+    if (state.status !== 'ok') return { status: state.status };
+    return { status: 'ok', plans: planDiscoverCards(state.root), scrollTop: state.scrollTop };
+  };
+
+  // Post-restore confirmation: this attempt's watch is still live, the composer
+  // still holds no draft, exactly one document is still selected, and - when
+  // this flow scrolled - the transcript is back where it started. The scroll
+  // half is the same proof as everywhere else: a re-anchored view passes only
+  // while the visible rows this attempt recorded are still in place.
+  const planStepDiscoverDone = (token, selectors, composerId, expectedSelection, restoreTop) => {
+    const state = planFlowState(token, selectors, composerId, expectedSelection, restoreTop);
+    if (state.status !== 'ok') return { status: state.status };
+    return { status: 'ok', selection: state.resourceName };
+  };
+`;
+
+// Client-facing failures for every step status. Plan paths, plan bodies, and CDP
+// exception text never reach a caller.
+const PLAN_DOCUMENT_STEP_ERRORS: Record<string, string> = {
+  watch_invalid: '计划文档交互监测不可用',
+  watch_conflict: '计划文档交互监测不可用',
+  watch_lost: '计划文档交互监测已失效',
+  watch_install_failed: '计划文档交互监测不可用',
+  user_activity: '检测到人工输入，已中止计划文档读取',
+  composer_missing: '未找到该会话的输入区',
+  draft_present: '该会话输入框已有草稿',
+  selection_ambiguous: '编辑器选中的文档不唯一',
+  selection_group_missing: '编辑器组不可用',
+  selection_changed: '编辑器选中的文档已改变',
+  scroll_missing: '未找到会话滚动容器',
+  scroll_changed: '会话滚动位置已改变',
+  scroll_unverified: '会话滚动位置无法恢复',
+  card_missing: '未找到该计划卡片',
+  card_ambiguous: '计划卡片不唯一',
+  card_not_plan: '该消息卡片不是计划卡片',
+  card_no_view_plan: '计划卡片没有唯一的 View Plan 按钮',
+  card_button_disabled: 'View Plan 按钮已禁用',
+  card_button_hidden: 'View Plan 按钮不可见',
+  path_ambiguous: '计划文档路径不唯一',
+  editor_missing: '未找到计划文档编辑器',
+  editor_streaming: '计划文档仍在生成中',
+  not_open: '计划文档未打开',
+  doc_path_unsafe: '计划文档路径不可安全读取',
+  doc_path_mismatch: '计划文档路径与打开的编辑器不一致',
+  doc_not_opened: '计划文档未如期打开',
+  doc_other_opened: '打开了其他文档',
+  baseline_missing: '原编辑器标签已不存在',
+  restore_unverified: '原编辑器标签未能恢复',
+};
 // Resolves the currently-open model picker menu element across Cursor versions.
 // Older builds expose `[data-testid="model-picker-menu"]`; newer builds (~3.5.17)
 // removed the testid and render the picker as a generic `[role="menu"]` opened
@@ -1415,6 +1935,529 @@ export class CommandExecutor {
       }
       console.log(`[command-executor] Plan model set to: ${planModelId}`);
     });
+  }
+
+/**
+   * Resolve the on-disk file name of the plan document behind one plan tool
+   * card. No retries: one View Plan click, a bounded async read-back of the
+   * editor tab / breadcrumb / plan editor, then a conditional tab and
+   * transcript restore. The whole flow shares the configured target lane so it
+   * cannot interleave with another window command.
+   *
+   * The tab/breadcrumb match shows the reader agrees on one file at read time;
+   * it is not a transaction against the target window.
+   */
+  async resolvePlanFile(
+    commandId: string,
+    expected: { windowId: string; composerId: string; planId: string; toolCallId: string },
+    isCurrent: () => boolean,
+  ): Promise<CommandResult> {
+    const coordinator = this.uiCoordinator;
+    const queuedClient = this.client;
+    const targetId = this.targetIdProvider?.() ?? '';
+    if (typeof isCurrent !== 'function' || !coordinator || !targetId) {
+      return { commandId, ok: false, error: '计划文档读取不可用' };
+    }
+    if (!queuedClient || !queuedClient.isConnected()) {
+      return { commandId, ok: false, error: '未连接到 Cursor' };
+    }
+    if (expected.windowId !== targetId) {
+      return { commandId, ok: false, error: '计划文档目标窗口不匹配' };
+    }
+    const generationProvider = this.targetGenerationProvider;
+    const generation = generationProvider?.() ?? coordinator.getGeneration(targetId);
+    const guard = () => {
+      if (this.client !== queuedClient) throw new Error('计划文档目标已改变');
+      if (!queuedClient.isConnected()) throw new Error('未连接到 Cursor');
+      if ((this.targetIdProvider?.() ?? '') !== targetId) throw new Error('计划文档目标已改变');
+      if (expected.windowId !== (this.targetIdProvider?.() ?? '')) throw new Error('计划文档目标窗口已改变');
+      if (generationProvider && generationProvider() !== generation) throw new Error('计划文档目标已改变');
+      if (!isCurrent()) throw new Error('计划文档请求已失效');
+    };
+    try {
+      return await coordinator.enqueue(targetId, (ctx) => {
+        const stateGuard = () => {
+          if (ctx.signal.aborted) throw new Error('计划文档读取已取消');
+          guard();
+        };
+        return this.enqueueWindowCommand(queuedClient, () =>
+          this.resolvePlanFileOnClient(commandId, queuedClient, expected, stateGuard)
+        );
+      }, { generation, label: `command:${commandId}`, timeoutMs: PLAN_DOCUMENT_READ_TIMEOUT_MS });
+    } catch (err) {
+      if (err instanceof TargetUiError) {
+        const message = err.code === 'generation_changed'
+          ? '计划文档目标已改变'
+          : err.code === 'timeout' ? '计划文档读取超时' : '计划文档读取已取消';
+        return { commandId, ok: false, error: message };
+      }
+      return { commandId, ok: false, error: err instanceof Error ? err.message : '计划文档读取未能完成' };
+    }
+  }
+
+  private async resolvePlanFileOnClient(
+    commandId: string,
+    client: CdpClient,
+    expected: { windowId: string; composerId: string; planId: string; toolCallId: string },
+    guard: () => void,
+  ): Promise<CommandResult> {
+    const tabSelector = this.selectors.planDocumentTab?.strategies?.[0];
+    const groupSelector = this.selectors.planDocumentEditorGroup?.strategies?.[0];
+    const breadcrumbSelector = this.selectors.planDocumentBreadcrumbIcon?.strategies?.[0];
+    const editorSelector = this.selectors.planDocumentEditor?.strategies?.[0];
+    const scrollSelector = this.selectors.composerMessagesScroll?.strategies?.[0];
+    if (!tabSelector || !groupSelector || !breadcrumbSelector || !editorSelector || !scrollSelector) {
+      return { commandId, ok: false, error: 'Plan document selectors are unavailable' };
+    }
+    const composerId = expected.composerId;
+    // The real tool-call id is matched exactly — no prefix normalization.
+    const toolCallId = expected.toolCallId;
+    if (!composerId || !toolCallId) {
+      return { commandId, ok: false, error: '计划文档范围不可用' };
+    }
+    const token = `${commandId}:${++planWatchSeq}:${Date.now().toString(36)}`;
+    const selectorsLiteral = JSON.stringify({
+      tab: tabSelector,
+      group: groupSelector,
+      breadcrumb: breadcrumbSelector,
+      editor: editorSelector,
+      scroll: scrollSelector,
+    });
+    const composerLiteral = JSON.stringify(composerId);
+    const toolCallLiteral = JSON.stringify(toolCallId);
+    const tokenLiteral = JSON.stringify(token);
+
+    type PlanStepResult = ({ status?: string } & Record<string, unknown>) | null;
+    // Transcript scroll bookkeeping for this attempt. `scrollCorrection` sums
+    // the layout shifts the page re-proved against rows that stayed put, so the
+    // expected top follows Cursor's own re-anchor and the restore target is the
+    // corrected original position instead of stale pixels. A step reports an
+    // observed top only after re-checking it in the same evaluate.
+    let flowScrollTop: number | null = null;
+    let initialScrollTop: number | null = null;
+    let scrollCorrection = 0;
+    let scrolled = false;
+    const flowArg = (): string => (flowScrollTop === null ? 'null' : String(flowScrollTop));
+    const followScroll = (step: PlanStepResult): void => {
+      if (!step) return;
+      const observed = step.scrollTop;
+      const expected = flowScrollTop;
+      if (typeof observed !== 'number' || expected === null || observed === expected) return;
+      scrollCorrection += observed - expected;
+      flowScrollTop = observed;
+    };
+    // Every evaluate is bracketed by the Node-side guard so a cancellation,
+    // window switch, or target replacement stops the flow before the next side
+    // effect. The in-page steps re-check the same conditions plus this attempt's
+    // interaction watch before they read or write anything.
+    const runStep = async (call: string): Promise<PlanStepResult> => {
+      guard();
+      let value: PlanStepResult;
+      try {
+        value = await client.evaluate(`(() => {\n${PLAN_DOCUMENT_HELPERS_JS}\nreturn ${call};\n})()`) as PlanStepResult;
+      } catch {
+        throw new Error('计划文档读取时页面执行失败');
+      }
+      guard();
+      followScroll(value);
+      return value;
+    };
+    const fail = (status: string | undefined): CommandResult => ({
+      commandId,
+      ok: false,
+      error: (status && PLAN_DOCUMENT_STEP_ERRORS[status]) || '计划文档读取未能完成',
+    });
+    // Removes only this attempt's listeners. Never restores UI, never touches
+    // another attempt's entry, and never reaches the page at all when the
+    // attempt was already stale before its watch could be installed.
+    let watchAttempted = false;
+    const removeWatch = async (): Promise<void> => {
+      if (!watchAttempted) return;
+      try {
+        await client.evaluate(`(() => {\n${PLAN_DOCUMENT_HELPERS_JS}\nreturn planWatchRemove(${tokenLiteral});\n})()`);
+      } catch {
+        /* page context gone: its listeners died with it and nothing else is touched */
+      }
+    };
+
+    const flow = async (): Promise<CommandResult> => {
+      // The Node-side guard runs before the flag is set, so a request that is
+      // already stale never touches the page and never claims a watch.
+      guard();
+      watchAttempted = true;
+      const install = await runStep(`planWatchInstall(${tokenLiteral})`);
+      if (!install) return fail('watch_install_failed');
+      if (install.status !== 'ok') return fail(String(install.status ?? 'watch_install_failed'));
+
+      let baseline = '';
+      let planTabName = '';
+
+      const preflight = await runStep(
+        `planStepPreflight(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${toolCallLiteral})`
+      );
+      if (!preflight) return fail(undefined);
+      if (preflight.status !== 'ok') return fail(preflight.status);
+      baseline = String(preflight.baseline ?? '');
+      let cardStatus = String(preflight.cardStatus ?? '');
+      if (cardStatus !== 'missing' && cardStatus !== 'ok') return fail(`card_${cardStatus}`);
+
+      // The card is normally already mounted; only a virtualized transcript
+      // needs a bounded upward search in this exact composer's own container.
+      for (let stepIndex = 0; cardStatus === 'missing' && stepIndex < PLAN_DOCUMENT_SCROLL_MAX_STEPS; stepIndex += 1) {
+        const step = await runStep(
+          `planStepScrollUp(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${JSON.stringify(baseline)}, ${flowArg()})`
+        );
+        if (!step) return fail(undefined);
+        if (step.status === 'scroll_top') break;
+        if (step.status !== 'scrolled') return fail(step.status);
+        scrolled = true;
+        if (initialScrollTop === null && typeof step.before === 'number') initialScrollTop = step.before;
+        flowScrollTop = typeof step.after === 'number' ? step.after : flowScrollTop;
+        await sleep(PLAN_DOCUMENT_RENDER_WAIT_MS);
+        guard();
+        const probe = await runStep(
+          `planStepCardProbe(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${toolCallLiteral}, ${JSON.stringify(baseline)}, ${flowArg()})`
+        );
+        if (!probe) return fail(undefined);
+        if (probe.status !== 'ok') return fail(probe.status);
+        cardStatus = String(probe.cardStatus ?? '');
+        if (cardStatus !== 'missing' && cardStatus !== 'ok') return fail(`card_${cardStatus}`);
+      }
+
+      // Restores the transcript only while the environment is still the one
+      // this attempt recorded; the check runs inside the evaluate with the write.
+      // The page reports the position it actually reached, because the guard in
+      // the same evaluate may absorb one more proven compensation before writing.
+      const restoreSearchScroll = async (): Promise<boolean> => {
+        const base = initialScrollTop;
+        if (!scrolled || base === null) return true;
+        const target = base + scrollCorrection;
+        const state = await runStep(
+          `planStepRestoreScroll(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${JSON.stringify(baseline)}, ${flowArg()}, ${target})`
+        );
+        if (state?.status !== 'ok') return false;
+        const restored = typeof state.restoredTop === 'number' ? state.restoredTop : target;
+        scrollCorrection += restored - target;
+        flowScrollTop = restored;
+        return true;
+      };
+
+      if (cardStatus !== 'ok') {
+        await restoreSearchScroll();
+        return { commandId, ok: false, error: '未找到该计划卡片' };
+      }
+
+      const clickState = await runStep(
+        `planStepClickViewPlan(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${toolCallLiteral}, ${JSON.stringify(baseline)}, ${flowArg()})`
+      );
+      if (!clickState) return fail(undefined);
+      if (clickState.status !== 'clicked') return fail(clickState.status);
+
+      let documentState: Record<string, unknown> | null = null;
+      for (let attempt = 0; attempt < PLAN_DOCUMENT_OPEN_POLL_MAX; attempt += 1) {
+        const state = await runStep(
+          `planStepReadOpen(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${JSON.stringify(baseline)}, ${flowArg()})`
+        );
+        if (!state) return fail(undefined);
+        if (state.status === 'ok') {
+          documentState = state;
+          break;
+        }
+        const selectedName = typeof state.resourceName === 'string' ? state.resourceName : '';
+        if (state.status === 'path_ambiguous' && Number(state.count) > 1) {
+          return fail('path_ambiguous');
+        }
+        if (state.status === 'editor_missing' || state.status === 'editor_streaming' || state.status === 'path_ambiguous') {
+          // Wait only while the selected editor is itself a plan document; any
+          // other document means something else opened, so refuse instead of
+          // waiting for a plan editor that may show up later.
+          if (!selectedName.endsWith('.plan.md')) return fail('doc_other_opened');
+        } else if (state.status !== 'not_open') {
+          return fail(state.status);
+        }
+        await sleep(PLAN_DOCUMENT_OPEN_POLL_WAIT_MS);
+        guard();
+      }
+      if (!documentState) return fail('doc_not_opened');
+
+      const resourceName = String(documentState.resourceName ?? '');
+      const fileName = planFileNameFromPath(String(documentState.breadcrumbPath ?? ''));
+      if (!fileName) return fail('doc_path_unsafe');
+      if (fileName !== resourceName) return fail('doc_path_mismatch');
+      if (resourceName === baseline) return fail('not_open');
+      planTabName = resourceName;
+
+      const restoreState = await runStep(
+        `planStepRestoreTab(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${JSON.stringify(planTabName)}, ${JSON.stringify(baseline)}, ${flowArg()})`
+      );
+      if (!restoreState) return fail(undefined);
+      if (restoreState.status !== 'restored') return fail(restoreState.status);
+      let restored = false;
+      for (let attempt = 0; attempt < PLAN_DOCUMENT_RESTORE_POLL_MAX; attempt += 1) {
+        const state = await runStep(
+          `planStepVerifySelection(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${flowArg()})`
+        );
+        if (!state) return fail(undefined);
+        if (state.status !== 'ok') return fail(state.status);
+        if (state.selection === baseline) {
+          restored = true;
+          break;
+        }
+        await sleep(PLAN_DOCUMENT_RENDER_WAIT_MS);
+        guard();
+      }
+      if (!restored) return fail('restore_unverified');
+
+      // An unverifiable restore is never reported as success.
+      const scrollRestored = await restoreSearchScroll();
+      if (!scrollRestored) return fail('scroll_unverified');
+
+      // Final confirmation of the restore itself: the original document is
+      // selected again and the transcript sits at the position this attempt
+      // recorded (including any proven compensation). Read-only, no side effect.
+      const restoreConfirmed = await runStep(
+        `planStepVerifySelection(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${flowArg()}, ${JSON.stringify(baseline)})`
+      );
+      if (!restoreConfirmed) return fail(undefined);
+      if (restoreConfirmed.status !== 'ok') return fail(restoreConfirmed.status);
+
+      // Last look at this attempt's own watch, after the final side effect: user
+      // input that lands after the last guarded step must not yield a filename.
+      const finalWatch = await runStep(`planWatchState(${tokenLiteral})`);
+      if (!finalWatch) return fail(undefined);
+      if (finalWatch.status !== 'ok') return fail(String(finalWatch.status));
+
+      return { commandId, ok: true, data: { fileName, observedAt: Date.now() } };
+    };
+
+    try {
+      return await flow();
+    } finally {
+      await removeWatch();
+    }
+  }
+
+  /**
+   * Structured discovery of CreatePlan cards in one composer's transcript,
+   * walking upward screen by screen in the same UI lane as a plan read. Only
+   * already-rendered cards are read: no card is expanded, View Plan is never
+   * clicked, no editor opens, and the composer scope never changes. The
+   * transcript scroll is restored only while this flow still owns the
+   * environment — a changed target, draft, scroll, or any real user input
+   * gives no results at all.
+   *
+   * Results are always `partial`: folded cards and history below the bounded
+   * walk are not inspected, so a complete list is never claimed.
+   */
+  async discoverPlans(
+    commandId: string,
+    expected: { windowId: string; composerId: string },
+    isCurrent: () => boolean,
+  ): Promise<CommandResult> {
+    const coordinator = this.uiCoordinator;
+    const queuedClient = this.client;
+    const targetId = this.targetIdProvider?.() ?? '';
+    if (typeof isCurrent !== 'function' || !coordinator || !targetId || !expected.composerId) {
+      return { commandId, ok: false, error: '计划发现不可用' };
+    }
+    if (!queuedClient || !queuedClient.isConnected()) {
+      return { commandId, ok: false, error: '未连接到 Cursor' };
+    }
+    if (expected.windowId !== targetId) {
+      return { commandId, ok: false, error: '计划发现目标窗口不匹配' };
+    }
+    const generationProvider = this.targetGenerationProvider;
+    const generation = generationProvider?.() ?? coordinator.getGeneration(targetId);
+    const guard = () => {
+      if (this.client !== queuedClient) throw new Error('计划文档目标已改变');
+      if (!queuedClient.isConnected()) throw new Error('未连接到 Cursor');
+      if ((this.targetIdProvider?.() ?? '') !== targetId) throw new Error('计划文档目标已改变');
+      if (expected.windowId !== (this.targetIdProvider?.() ?? '')) throw new Error('计划文档目标窗口已改变');
+      if (generationProvider && generationProvider() !== generation) throw new Error('计划文档目标已改变');
+      if (!isCurrent()) throw new Error('计划文档请求已失效');
+    };
+    try {
+      return await coordinator.enqueue(targetId, (ctx) => {
+        const stateGuard = () => {
+          if (ctx.signal.aborted) throw new Error('计划发现已取消');
+          guard();
+        };
+        return this.enqueueWindowCommand(queuedClient, () =>
+          this.discoverPlansOnClient(commandId, queuedClient, expected.composerId, stateGuard)
+        );
+      }, { generation, label: `command:${commandId}`, timeoutMs: PLAN_DOCUMENT_READ_TIMEOUT_MS });
+    } catch (err) {
+      if (err instanceof TargetUiError) {
+        const message = err.code === 'generation_changed'
+          ? '计划文档目标已改变'
+          : err.code === 'timeout' ? '计划发现超时' : '计划发现已取消';
+        return { commandId, ok: false, error: message };
+      }
+      return { commandId, ok: false, error: err instanceof Error ? err.message : '计划发现未能完成' };
+    }
+  }
+
+  private async discoverPlansOnClient(
+    commandId: string,
+    client: CdpClient,
+    composerId: string,
+    guard: () => void,
+  ): Promise<CommandResult> {
+    const tabSelector = this.selectors.planDocumentTab?.strategies?.[0];
+    const groupSelector = this.selectors.planDocumentEditorGroup?.strategies?.[0];
+    const scrollSelector = this.selectors.composerMessagesScroll?.strategies?.[0];
+    // Discovery never looks at a plan document: the editor tab/group only give
+    // the selection guard, and the scroll container the viewport walk.
+    if (!tabSelector || !groupSelector || !scrollSelector) {
+      return { commandId, ok: false, error: 'Plan document selectors are unavailable' };
+    }
+    const token = `${commandId}:${++planWatchSeq}:${Date.now().toString(36)}`;
+    const selectorsLiteral = JSON.stringify({ tab: tabSelector, group: groupSelector, scroll: scrollSelector });
+    const composerLiteral = JSON.stringify(composerId);
+    const tokenLiteral = JSON.stringify(token);
+
+    type PlanStepResult = ({ status?: string } & Record<string, unknown>) | null;
+    // Same scroll bookkeeping as a read: the expected top and the restore
+    // target both follow a layout shift only after the page re-proved it
+    // against rows that kept their place on screen.
+    let flowScrollTop: number | null = null;
+    let initialScrollTop: number | null = null;
+    let scrollCorrection = 0;
+    let scrolled = false;
+    const flowArg = (): string => (flowScrollTop === null ? 'null' : String(flowScrollTop));
+    const followScroll = (step: PlanStepResult): void => {
+      if (!step) return;
+      const observed = step.scrollTop;
+      const expected = flowScrollTop;
+      if (typeof observed !== 'number' || expected === null || observed === expected) return;
+      scrollCorrection += observed - expected;
+      flowScrollTop = observed;
+    };
+    const runStep = async (call: string): Promise<PlanStepResult> => {
+      guard();
+      let value: PlanStepResult;
+      try {
+        value = await client.evaluate(`(() => {\n${PLAN_DOCUMENT_HELPERS_JS}\nreturn ${call};\n})()`) as PlanStepResult;
+      } catch {
+        throw new Error('计划发现时页面执行失败');
+      }
+      guard();
+      followScroll(value);
+      return value;
+    };
+    const fail = (status: string | undefined): CommandResult => ({
+      commandId,
+      ok: false,
+      error: (status && PLAN_DOCUMENT_STEP_ERRORS[status]) || '计划发现未能完成',
+    });
+    // Same watch lifecycle as a read: only this attempt's listeners, no UI work,
+    // and no page contact at all when the attempt was already stale.
+    let watchAttempted = false;
+    const removeWatch = async (): Promise<void> => {
+      if (!watchAttempted) return;
+      try {
+        await client.evaluate(`(() => {\n${PLAN_DOCUMENT_HELPERS_JS}\nreturn planWatchRemove(${tokenLiteral});\n})()`);
+      } catch {
+        /* page context gone: its listeners died with it and nothing else is touched */
+      }
+    };
+
+    const flow = async (): Promise<CommandResult> => {
+      guard();
+      watchAttempted = true;
+      const install = await runStep(`planWatchInstall(${tokenLiteral})`);
+      if (!install || install.status !== 'ok') return fail(String(install?.status ?? 'watch_install_failed'));
+      const start = await runStep(`planStepDiscoverStart(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral})`);
+      if (!start) return fail(undefined);
+      if (start.status !== 'ok') return fail(start.status);
+      const baseline = typeof start.baseline === 'string' ? start.baseline : '';
+
+      const plans: Array<{ toolCallId: string; title: string; description?: string }> = [];
+      const seen = new Set<string>();
+      const collect = (step: PlanStepResult): void => {
+        const list = step && Array.isArray(step.plans) ? step.plans : [];
+        for (const item of list) {
+          if (plans.length >= PLAN_DISCOVERY_MAX_PLANS) return;
+          const entry = (item ?? {}) as { toolCallId?: unknown; title?: unknown; description?: unknown };
+          const toolCallId = typeof entry.toolCallId === 'string' ? entry.toolCallId : '';
+          const title = typeof entry.title === 'string' ? entry.title : '';
+          if (!toolCallId || !title || seen.has(toolCallId)) continue;
+          seen.add(toolCallId);
+          plans.push(typeof entry.description === 'string' && entry.description
+            ? { toolCallId, title, description: entry.description }
+            : { toolCallId, title });
+        }
+      };
+
+      let reachedStart = false;
+      const scan = (): Promise<PlanStepResult> =>
+        runStep(`planStepScanPlans(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${JSON.stringify(baseline)}, ${flowArg()})`);
+
+      const first = await scan();
+      if (!first) return fail(undefined);
+      if (first.status !== 'ok') return fail(first.status);
+      collect(first);
+
+      // Upward only, one screen per step, bounded. No card is expanded and no
+      // button is pressed anywhere in this walk.
+      for (let stepIndex = 0; stepIndex < PLAN_DOCUMENT_SCROLL_MAX_STEPS; stepIndex += 1) {
+        if (plans.length >= PLAN_DISCOVERY_MAX_PLANS) break;
+        const step = await runStep(
+          `planStepScrollUp(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${JSON.stringify(baseline)}, ${flowArg()})`
+        );
+        if (!step) return fail(undefined);
+        if (step.status === 'scroll_top') {
+          reachedStart = true;
+          break;
+        }
+        if (step.status !== 'scrolled') return fail(step.status);
+        scrolled = true;
+        if (initialScrollTop === null && typeof step.before === 'number') initialScrollTop = step.before;
+        flowScrollTop = typeof step.after === 'number' ? step.after : flowScrollTop;
+        await sleep(PLAN_DOCUMENT_RENDER_WAIT_MS);
+        guard();
+        const next = await scan();
+        if (!next) return fail(undefined);
+        if (next.status !== 'ok') return fail(next.status);
+        collect(next);
+      }
+
+      // Restore and confirm only while this flow still owns the environment.
+      // Both use the corrected original position: the pixels this flow wrote
+      // are stale once Cursor moved the transcript by itself. The restore step
+      // reports the position it actually reached, which also covers a
+      // compensation its own guard absorbed right before the write.
+      const restoreBase = initialScrollTop === null ? null : initialScrollTop + scrollCorrection;
+      let restoreTop: number | null = null;
+      if (scrolled && restoreBase !== null) {
+        const restore = await runStep(
+          `planStepRestoreScroll(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${JSON.stringify(baseline)}, ${flowArg()}, ${restoreBase})`
+        );
+        if (!restore) return fail(undefined);
+        if (restore.status !== 'ok') return fail(restore.status);
+        restoreTop = typeof restore.restoredTop === 'number' ? restore.restoredTop : restoreBase;
+        scrollCorrection += restoreTop - restoreBase;
+        flowScrollTop = restoreTop;
+      }
+      const restoreTopLiteral = restoreTop === null ? 'null' : String(restoreTop);
+      const done = await runStep(
+        `planStepDiscoverDone(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${JSON.stringify(baseline)}, ${restoreTopLiteral})`
+      );
+      if (!done) return fail(undefined);
+      if (done.status !== 'ok') return fail(done.status);
+
+      return {
+        commandId,
+        ok: true,
+        data: { plans, observedAt: Date.now(), reachedStart, completeness: 'partial' },
+      };
+    };
+
+    try {
+      return await flow();
+    } finally {
+      await removeWatch();
+    }
   }
 
   private getOrRunCommand<T extends CommandResult>(

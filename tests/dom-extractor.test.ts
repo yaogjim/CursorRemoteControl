@@ -451,4 +451,163 @@ describe('extractionFunction', () => {
       ]
     );
   });
+
+  it('extracts a Cursor 3.15 CreatePlan card from the composer-plan-filename marker', () => {
+    const state = withDom(`
+      <main id="root" data-composer-id="4caf6000-d7cf-445c-9f01-ae914d61069c">
+        <div class="virtualized-composer-messages-row" data-index="23">
+          <div style="display:contents">
+            <div data-message-id="ac3dd8d2-9316-4d01-9cae-ac7dcf9e1981" data-message-kind="tool" data-message-role="ai" data-react-transcript-row-kind="activity" data-tool-call-id="tc_2098230ea283_call_hUrBk8HLwY5bBPodOrbHmDKJ" data-tool-status="completed">
+              <div class="ui-tool-call-card" data-tool-call-card-marker="root">
+                <div class="ui-tool-call-card__header" title="工作区 Agent 托管方案">
+                  <span>Created Plan</span>
+                  <span data-testid="composer-plan-filename">工作区 Agent 托管方案</span>
+                </div>
+                <div class="ui-tool-call-card__body">
+                  <div class="markdown-root"><p>Overview summary</p></div>
+                </div>
+                <div class="ui-tool-call-card__footer">
+                  <button type="button">View Plan</button>
+                  <button type="button">Build</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+    `);
+
+    const plan = state.messages.find((message) => message.type === 'plan');
+    assert.ok(plan, 'expected a plan element to be emitted');
+    assert.equal(plan.toolCallId, 'tc_2098230ea283_call_hUrBk8HLwY5bBPodOrbHmDKJ');
+    assert.equal(plan.label, 'Created Plan');
+    assert.equal(plan.fileName, undefined, '展示标签不是文件引用');
+    assert.equal(plan.title, '工作区 Agent 托管方案');
+    assert.equal(plan.description, 'Overview summary');
+    assert.equal(plan.todosTotal, 0);
+    assert.equal(plan.todos, undefined);
+    assert.deepEqual(
+      plan.actions?.map((action) => [action.label, action.type]),
+      [['View Plan', 'view_plan']]
+    );
+    assert.equal(
+      plan.actions?.[0].selectorPath,
+      'main#root > div > div > div > div > div:nth-of-type(3) > button:nth-of-type(1)'
+    );
+  });
+
+  it('extracts a CreatePlan card nested in a composer message group and keeps wrapper/tool-id association', () => {
+    const state = withDom(`
+      <main id="root">
+        <article data-flat-index="5">
+          <div class="composer-message-group">
+            <div class="ui-collapsible ui-step-group-collapsible">
+              <div class="ui-collapsible-header"><span>Explored</span></div>
+              <div class="ui-collapsible-content">
+                <div class="column">
+                  <div data-message-role="ai" data-message-kind="tool" data-message-id="m-grouped-plan" data-tool-call-id="tc-grouped-plan" data-tool-status="completed">
+                    <div class="ui-tool-call-card" data-tool-call-card-marker="root">
+                      <div class="ui-tool-call-card__header" title="Grouped Plan">
+                        <span>Created Plan</span>
+                        <span data-testid="composer-plan-filename">Grouped Plan</span>
+                      </div>
+                      <div class="ui-tool-call-card__body">
+                        <div class="markdown-root">Grouped overview</div>
+                      </div>
+                      <div class="ui-tool-call-card__footer">
+                        <button type="button">View Plan</button>
+                        <button type="button">Build</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </article>
+      </main>
+    `);
+
+    const plans = state.messages.filter((message) => message.type === 'plan');
+    assert.equal(plans.length, 1);
+    assert.equal(plans[0].toolCallId, 'tc-grouped-plan');
+    assert.equal(plans[0].title, 'Grouped Plan');
+    assert.deepEqual(
+      plans[0].actions?.map((action) => [action.label, action.type]),
+      [['View Plan', 'view_plan']]
+    );
+  });
+
+  it('does not treat a Read tool that mentions a .plan.md file as a CreatePlan plan', () => {
+    const state = withDom(`
+      <main id="root">
+        <div class="virtualized-composer-messages-row" data-index="24">
+          <div style="display:contents">
+            <div data-message-id="m-read-plan-file" data-message-kind="tool" data-message-role="ai" data-react-transcript-row-kind="activity" data-tool-call-id="tc-read-plan-file" data-tool-status="completed">
+              <div class="ui-tool-call-card" data-tool-call-card-marker="root">
+                <div class="ui-tool-call-card__header"><span>Read</span></div>
+                <div class="ui-tool-call-line-details">.cursor/plans/工作区_agent_托管方案_622ce6c4.plan.md</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+    `);
+
+    assert.equal(state.messages.some((message) => message.type === 'plan'), false);
+    const tool = state.messages.find((message) => message.type === 'tool');
+    assert.ok(tool, 'expected the Read tool to stay a tool element');
+    assert.equal(tool.action, 'Read');
+  });
+
+  it('does not treat composer-plan-filename outside the root tool-call card as a plan', () => {
+    const state = withDom(`
+      <main id="root">
+        <div data-message-id="m-stray-marker" data-message-kind="tool" data-message-role="ai" data-tool-call-id="tc-stray-marker" data-tool-status="completed">
+          <div class="ui-tool-call-card">
+            <div class="ui-tool-call-card__header"><span>Read</span></div>
+            <span data-testid="composer-plan-filename">Not a plan card</span>
+          </div>
+        </div>
+      </main>
+    `);
+
+    assert.equal(state.messages.some((message) => message.type === 'plan'), false);
+    const tool = state.messages.find((message) => message.type === 'tool');
+    assert.ok(tool);
+    assert.equal(tool.type, 'tool');
+  });
+
+  it('keeps legacy composer-create-plan-container semantics and adds its toolCallId', () => {
+    const state = withDom(`
+      <main id="root">
+        <article data-flat-index="1" data-message-role="ai" data-message-kind="tool" data-message-id="m-legacy-plan" data-tool-call-id="tc-legacy-plan" data-tool-status="completed">
+          <div class="composer-create-plan-container">
+            <div class="composer-create-plan-label">Created Plan</div>
+            <div class="composer-create-plan-title">Legacy Plan</div>
+            <div class="composer-create-plan-text"><div class="markdown-root">Legacy overview</div></div>
+            <div class="composer-create-plan-todo-item">
+              <div class="composer-plan-todo-indicator completed"></div>
+              <div class="composer-create-plan-todo-content">Step one</div>
+            </div>
+            <div class="composer-create-plan-view-plan-button">View Plan</div>
+            <div class="composer-create-plan-build-button">Build</div>
+          </div>
+        </article>
+      </main>
+    `);
+
+    const plan = state.messages.find((message) => message.type === 'plan');
+    assert.ok(plan, 'expected the legacy plan element to be emitted');
+    assert.equal(plan.toolCallId, 'tc-legacy-plan');
+    assert.equal(plan.label, 'Created Plan');
+    assert.equal(plan.title, 'Legacy Plan');
+    assert.equal(plan.description, 'Legacy overview');
+    assert.equal(plan.todosTotal, 1);
+    assert.equal(plan.todosCompleted, 1);
+    assert.deepEqual(
+      plan.actions?.map((action) => [action.label, action.type]),
+      [['View Plan', 'view_plan'], ['Build', 'build']]
+    );
+  });
 });

@@ -1,4 +1,7 @@
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, mock } from 'node:test';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'fs';
 import { join, resolve } from 'path';
@@ -49,6 +52,12 @@ describe('resolvePlanFilePath', () => {
     assert.equal(resolvePlanFilePath('/tmp/cursor-plans-root/../secret.md', root), null);
   });
 
+  it('rejects non-markdown files and alternate traversal syntax', () => {
+    for (const label of ['secret.txt', '../safe.plan.md', 'sub/../safe.plan.md', '..\\safe.plan.md', 'C:\\safe.plan.md']) {
+      assert.equal(resolvePlanFilePath(label, root), null);
+    }
+  });
+
   it('rejects empty and NUL-containing labels', () => {
     assert.equal(resolvePlanFilePath('', root), null);
     assert.equal(resolvePlanFilePath('safe.plan.md\0../secret.md', root), null);
@@ -85,6 +94,44 @@ describe('readPlanFile', () => {
     assert.equal(data.todos.length, 1);
     assert.equal(data.todos[0].text, 'Do the thing');
     assert.equal(data.todos[0].status, 'pending');
+  });
+
+  it('binds the full file bytes to a version and observation time', () => {
+    const before = Date.now();
+    const result = readPlanFileResult('safe_plan_abc123.plan.md', plansRoot);
+    assert.ok(result.ok);
+    assert.equal(result.version, createHash('sha256').update(PLAN_MD).digest('hex'));
+    assert.ok(result.observedAt >= before && result.observedAt <= Date.now());
+    assert.equal(result.updatedAt, fs.statSync(join(plansRoot, 'safe_plan_abc123.plan.md')).mtimeMs);
+    const changed = PLAN_MD.replace('Safe Plan Body', 'Next Plan Body');
+    writeFileSync(join(plansRoot, 'version-change.plan.md'), changed);
+    const next = readPlanFileResult('version-change.plan.md', plansRoot);
+    assert.ok(next.ok);
+    assert.notEqual(next.version, result.version);
+  });
+
+  it('rejects a same-size change observed during the read without returning content', () => {
+    const original = fs.fstatSync;
+    let calls = 0;
+    const stub = mock.method(fs, 'fstatSync', (...args: Parameters<typeof fs.fstatSync>) => {
+      const stat = original(...args);
+      calls += 1;
+      if (calls === 2) Object.defineProperty(stat, 'mtimeMs', { value: Number(stat.mtimeMs) + 1 });
+      return stat;
+    });
+    syncBuiltinESMExports();
+    try {
+      const result = readPlanFileResult('safe_plan_abc123.plan.md', plansRoot);
+      assert.deepEqual(result, { ok: false, error: 'read_failed' });
+    } finally {
+      stub.mock.restore();
+      syncBuiltinESMExports();
+    }
+  });
+
+  it('rejects invalid UTF-8 instead of marking replacement text complete', () => {
+    writeFileSync(join(plansRoot, 'invalid-encoding.plan.md'), Buffer.from([0xc3, 0x28]));
+    assert.deepEqual(readPlanFileResult('invalid-encoding.plan.md', plansRoot), { ok: false, error: 'read_failed' });
   });
 
   it('reads a unicode plan filename', () => {

@@ -239,7 +239,17 @@ Web 页头始终展示该状态：空闲为 `Idle`（任务已停止/未在跑�
 
 Web 工具卡为双层：第一行是工具名和短统计（+/-），可见摘要与文件名放在下方缩进，避免窄屏被同一 nowrap 行挤掉。摘要只来自已显示的标题/header/preview，不抓 thinking 正文。
 
-当前会话中的 plan 卡片和页头下的 Plans 条可打开计划；若 `label` 像计划文件名（`.md`），客户端会通过 `get_plan_full` 发送不透明的 `planId`。中继只从当前 `CursorState.messages` 中匹配该 ID 并取服务端已观察到的 `label`，再读取 `~/.cursor/plans` 下的普通非符号链接文件；不信任客户端文件名，也不做历史计划浏览器。
+当前会话中的 plan 卡片和页头下的 Plans 条可打开计划。客户端通过 `get_plan_full` 发送 `planId`、`windowId`、`composerId`，不接受客户端文件路径。中继要求当前目标一致、提取健康且观察时间不超过 15 秒；优先使用旧版文件标签明确给出的 `fileName`，新版仅有展示标题时，通过当前会话中的真实 `toolCallId` 卡片执行一次 `View Plan`，核对同一编辑器组的选中标签、面包屑路径及计划编辑器。相关打开、定位和条件恢复复用界面操作协调器，检测到人工输入或目标改变时停止，不自动重试。
+
+文件读取限 `~/.cursor/plans` 内不超过 1 MiB 的普通 Markdown 文件；符号链接、越界、非法编码及读取期变更均拒绝。全文一次返回，不分页；`metadata` 包含目标标识、来源文件、SHA-256 内容版本、文件修改时间、读取时间和读取时完整性。它只表示单份文件快照，不代表完整会话、持续实时或用户批准。摘要变化使在途旧响应和已读正文失效，用户需明确重新读取。
+
+即使当前没有已加载的计划卡片，目标明确时 Plans 入口仍提供“查找当前会话历史计划”。`discover_plans` 只在当前会话向上最多滚动 24 屏、发现最多 32 个真实 CreatePlan 工具卡片；不点击计划、不扫描磁盘目录、不切换或枚举其他会话。发现范围始终标为 `partial`，即使到达顶部也不宣称列表完整。仅在无人介入且目标仍匹配时恢复滚动；人工介入后保留当前界面。虚拟列表重新布局时，只有同一容器、视口高度不变、内容高度与滚动位置等量变化，且同一非吸顶消息仍保持屏幕位置及高度，才接受布局补偿并修正恢复位置；证据不足仍中止。服务端为当前 socket 签发 5 分钟有效的 `plan-ref:` 阅读引用，仅暂存工具身份及有界标题/摘要，不保存全文；断线、目标/连接代次/登录身份变化、到期或重新发现使旧引用失效。全文读取必须凭该连接的有效引用按真实工具身份重新定位文件，不能凭客户端标题、路径或工具标识读取。
+
+### 4.2.1 计划入口候选版本验收记录
+
+本机独立候选服务已通过一次正式 Web 入口阅读验收：浏览器在 `cursorremote` 当前会话中发现并打开 `RC-托管核对-02`，实际滚动核对正文开头、中段和末尾，窗口、会话、来源及任务状态可见。验收时来源文件为 `工作区_agent_托管方案_e00f35aa.plan.md`，内容版本为 `7fe897eb5852ac255d60466ab5c46c63643462c8a59f4a544e76c38cf8d9365e`，与独立文件核对结果一致；该版本是验收快照，不保证后续任务状态更新后仍相同。
+
+此前出现过滚动位置变化中止、部分扫描空列表及阅读引用到期关闭，均未记为通过；最终成功样本也不代表完整历史或所有布局均已验证。验收后临时服务已关闭，原安装扩展未替换；后续托管实现、真实任务写入和审批不包含在本次验收结论中。
 
 ### 4.3 ChatElement（带判别的联合）
 
@@ -302,7 +312,9 @@ Web 工具卡为双层：第一行是工具名和短统计（+/-），可见摘�
 | ---------------- | -------------- | -------------------------------------------------------- |
 | `id` | `string` | 消息 UUID |
 | `flatIndex` | `number` | 顺序位置 |
-| `label` | `string` | 计划文件名或标签徽章（例如 “Build”） |
+| `label` | `string` | 计划文件名或标签徽章（例如 “Build”）；仅用于展示 |
+| `fileName` | `string?` | 由旧版文件标签明确提供的文件引用，新版展示标题不设置此字段 |
+| `toolCallId` | `string?` | 创建计划的真实工具调用标识，用于限定文档定位 |
 | `title` | `string` | 计划标题（例如 “Telegram Integration Module”） |
 | `todosCompleted` | `number` | 已完成 todo 数 |
 | `todosTotal` | `number` | todo 总数 |
@@ -498,7 +510,8 @@ agent 想执行的终端命令，显示为带完整命令文本和 Run/Skip/Allo
 | `command:set_mode` | `{ commandId, operationId, modeId }` | 更改 agent mode；id 必须来自当前已验证能力目录 |
 | `command:set_model` | `{ commandId, operationId, modelId }` | 更改模型；同样受能力目录约束 |
 | `command:get_model_options` | `{ commandId }` | 刮取 Cursor 现场模型菜单（INTERACTIVE，不是 PASSIVE） |
-| `command:get_plan_full` | `{ commandId, label }` | 从磁盘加载完整计划正文/todos |
+| `command:discover_plans` | `{ commandId, windowId, composerId }` | 有界发现当前会话历史计划；返回部分列表、观察/到期时间和当前连接专属的短期阅读引用，不返回全文 |
+| `command:get_plan_full` | `{ commandId, planId, windowId, composerId }` | 读取当前目标已关联计划或有效短期引用的全文/todos，附身份、版本及单次快照元数据；失败不返回正文 |
 | `command:get_plan_model_options` | `{ commandId, actionId }` | 刮取计划作用域模型菜单；只接受已注册的 plan-model action |
 | `command:set_plan_model` | `{ commandId, operationId, planModelId, actionId }` | 把所选计划模型应用回 Cursor；属于危险写命令 |
 | `command:switch_window` | `{ commandId, windowId }` | 切换到不同 Cursor 窗口 |
