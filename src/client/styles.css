@@ -3003,6 +3003,52 @@ html.login-html body {
   color: var(--accent-red);
 }
 
+/* --- Workspace supervision --- */
+
+.supervision-panel {
+  margin: 8px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.supervision-panel.hidden {
+  display: none;
+}
+
+#btn-supervision-check.hidden,
+#btn-supervision-request.hidden {
+  display: none;
+}
+
+.supervision-header,
+.supervision-issue-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.supervision-summary,
+.supervision-checks,
+.supervision-operations,
+.supervision-issue {
+  margin-top: 6px;
+}
+
+.supervision-issue {
+  padding-top: 6px;
+  border-top: 1px solid var(--border-color);
+}
+
+.supervision-issue-actions button {
+  min-height: 32px;
+  padding: 0 10px;
+}
+
 /* --- Desktop --- */
 
 @media (min-width: 768px) {

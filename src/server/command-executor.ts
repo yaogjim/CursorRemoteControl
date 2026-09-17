@@ -1,8 +1,10 @@
 import type { CdpClient } from './cdp-client.js';
 import type { SelectorConfig, CommandResult, PlanModelOption, CapabilitySummary } from './types.js';
+import { planFailResult, planRequestedTarget } from './plan-command-failure.js';
 import { TargetUiCoordinator, TargetUiError } from './target-ui-coordinator.js';
 import { ActionRegistry, ActionRegistryError, isExecutableActionType } from './action-registry.js';
 import { capabilityAllows } from './capability-guard.js';
+import { fileWorkspacePlansRoot, planFileFromFileUri } from './plan-files.js';
 
 const MAX_RETRIES = 2;
 const RETRY_DELAY_MS = 500;
@@ -30,14 +32,19 @@ const PLAN_DOCUMENT_READ_TIMEOUT_MS = 30_000;
 // persisted; a page reload simply loses the old watches.
 let planWatchSeq = 0;
 
-/** Extract the single `.plan.md` name under the plans root, or null. Never a path. */
-function planFileNameFromPath(path: string): string | null {
-  if (typeof path !== 'string' || !path.startsWith(PLAN_DOCUMENT_PATH_PREFIX)) return null;
-  const name = path.slice(PLAN_DOCUMENT_PATH_PREFIX.length);
+/** Extract the single `.plan.md` name under a known plans root prefix, or null. Never a path. */
+function planFileNameFromPrefix(path: string, prefix: string): string | null {
+  if (typeof path !== 'string' || !path.startsWith(prefix)) return null;
+  const name = path.slice(prefix.length);
   if (!name || name === '.plan.md') return null;
   if (!name.endsWith('.plan.md')) return null;
   if (name.includes('/') || name.includes('\\') || name.includes('\0')) return null;
   return name;
+}
+
+/** Extract the single `.plan.md` name under the plans root, or null. Never a path. */
+function planFileNameFromPath(path: string): string | null {
+  return planFileNameFromPrefix(path, PLAN_DOCUMENT_PATH_PREFIX);
 }
 
 // In-browser helpers for the plan document read. Non-message editor elements
@@ -104,6 +111,62 @@ const PLAN_DOCUMENT_HELPERS_JS = `
     if (!card.querySelector('[data-testid="composer-plan-filename"]')) return { status: 'not_plan' };
     if (!planViewPlanButton(card)) return { status: 'no_view_plan' };
     return { status: 'ok', card: card };
+  };
+
+  // Read-only: the uniquely located card's React fiber, then one composerDataHandle
+  // on the return chain. Identity must match the host; the URI is never guessed
+  // from title / params.name / planId, and nothing here scans the disk.
+  const planReactFiber = (el) => {
+    if (!el) return null;
+    const keys = Object.keys(el).filter((k) => k.indexOf('__reactFiber$') === 0 || k.indexOf('__reactInternalInstance$') === 0);
+    if (keys.length !== 1) return null;
+    const fiber = el[keys[0]];
+    return fiber && typeof fiber === 'object' ? fiber : null;
+  };
+
+  const planFileUriOrEmpty = (value) => {
+    if (typeof value !== 'string' || !value) return '';
+    if (value.indexOf('file:///') !== 0) return '';
+    if (value.indexOf('?') !== -1 || value.indexOf('#') !== -1) return '';
+    if (value.indexOf('\\\\') !== -1 || value.indexOf('%') !== -1 || value.indexOf('..') !== -1) return '';
+    if (value.length < 8 || value.slice(-8) !== '.plan.md') return '';
+    const path = value.slice(7);
+    if (!path || path.charAt(0) !== '/' || path.charAt(path.length - 1) === '/') return '';
+    const slash = path.lastIndexOf('/');
+    const name = slash === -1 ? '' : path.slice(slash + 1);
+    if (!name || name === '.plan.md' || name.indexOf('/') !== -1) return '';
+    return value;
+  };
+
+  const planDirectPlanUri = (card, expectedToolCallId) => {
+    if (!card || !expectedToolCallId) return '';
+    const host = card.closest('[data-message-role="ai"][data-message-kind="tool"][data-tool-call-id]');
+    if (!host) return '';
+    const messageId = host.getAttribute('data-message-id');
+    const hostCallId = host.getAttribute('data-tool-call-id');
+    if (!messageId || !hostCallId || hostCallId !== expectedToolCallId) return '';
+    const start = planReactFiber(card);
+    if (!start) return '';
+    const hits = [];
+    let fiber = start;
+    for (let i = 0; i < 16 && fiber; i += 1) {
+      const props = fiber.memoizedProps;
+      if (props && props.composerDataHandle) hits.push(props);
+      fiber = fiber.return;
+    }
+    if (hits.length !== 1) return '';
+    const props = hits[0];
+    const vm = props.vm;
+    if (props.bubbleId !== messageId) return '';
+    if (!vm || vm.callId !== expectedToolCallId || vm.case !== 'createPlanToolCall') return '';
+    const handle = props.composerDataHandle;
+    const map = handle && handle.data ? handle.data.conversationMap : null;
+    if (!map || !Object.prototype.hasOwnProperty.call(map, messageId)) return '';
+    const toolCall = map[messageId];
+    const tfd = toolCall ? toolCall.toolFormerData : null;
+    if (!tfd || tfd.toolCallId !== expectedToolCallId || tfd.name !== 'create_plan') return '';
+    const additional = tfd.additionalData;
+    return planFileUriOrEmpty(additional ? additional.planUri : '');
   };
 
 const planSelectedTabs = (tabSelector) => Array.from(document.querySelectorAll(tabSelector))
@@ -351,6 +414,30 @@ const planSelectedTabs = (tabSelector) => Array.from(document.querySelectorAll(t
     return { status: 'clicked', scrollTop: state.scrollTop };
   };
 
+  const planStepReadDirectUri = (token, selectors, composerId, toolCallId, expectedSelection, flowScrollTop) => {
+    const state = planFlowState(token, selectors, composerId, expectedSelection, flowScrollTop);
+    if (state.status !== 'ok') return { status: state.status };
+    const located = planLocateCard(state.root, toolCallId);
+    if (located.status !== 'ok') return { status: 'card_' + located.status };
+    let workspace = null;
+    try {
+      const ws = vscode.context.configuration().workspace;
+      if (ws && ws.uri) {
+        workspace = {
+          id: ws.id,
+          uri: { scheme: ws.uri.scheme, authority: ws.uri.authority, path: ws.uri.path },
+          folderCount: Array.isArray(ws.folders) ? ws.folders.length : 1,
+        };
+      }
+    } catch (e) {}
+    return {
+      status: 'ok',
+      planUri: planDirectPlanUri(located.card, toolCallId) || '',
+      workspace: workspace,
+      scrollTop: state.scrollTop,
+    };
+  };
+
   const planStepReadOpen = (token, selectors, composerId, expectedSelection, flowScrollTop) => {
     const state = planFlowState(token, selectors, composerId, '', flowScrollTop);
     if (state.status !== 'ok') return { status: state.status };
@@ -373,10 +460,22 @@ const planSelectedTabs = (tabSelector) => Array.from(document.querySelectorAll(t
     if (editors[0].getAttribute('data-streaming') !== 'false') {
       return { status: 'editor_streaming', resourceName: resourceName, scrollTop: state.scrollTop };
     }
+    let workspace = null;
+    try {
+      const ws = vscode.context.configuration().workspace;
+      if (ws && ws.uri) {
+        workspace = {
+          id: ws.id,
+          uri: { scheme: ws.uri.scheme, authority: ws.uri.authority, path: ws.uri.path },
+          folderCount: Array.isArray(ws.folders) ? ws.folders.length : 1,
+        };
+      }
+    } catch (e) {}
     return {
       status: 'ok',
       resourceName: resourceName,
       breadcrumbPath: (icons[0].getAttribute('aria-label') || '').trim(),
+      workspace: workspace,
       scrollTop: state.scrollTop,
     };
   };
@@ -875,6 +974,7 @@ export function isActionRevalidationFailure(error?: string): boolean {
   if (error === 'action composer scope changed') return true;
   if (error === 'action is not executable') return true;
   if (error.includes('generation_changed')) return true;
+  if (error.startsWith('Pre-dispatch check failed')) return true;
   if (error.startsWith('action target is ')) return true;
   if (error.startsWith('action target not found')) return true;
   return false;
@@ -1087,6 +1187,15 @@ export const MODE_ITEM_PICK_JS = `
   };
 `;
 
+export interface CommandDispatchOptions {
+  /** Runs inside the target UI lane immediately before the first DOM/Input mutation. */
+  beforeDispatch?: () => void | Promise<void>;
+  /** Supervisory writes disable retries because a failed response may follow a real side effect. */
+  retry?: boolean;
+  /** Existing Web/Telegram calls are human initiated unless the scoped service opts out. */
+  humanInitiated?: boolean;
+}
+
 export class CommandExecutor {
   private selectors: SelectorConfig;
   private client: CdpClient | null = null;
@@ -1099,6 +1208,7 @@ export class CommandExecutor {
   private commandResultCache = new Map<string, CachedCommandResult>();
   private actionRegistry: ActionRegistry | null = null;
   private capabilityGuard: CapabilityGuardSource | null = null;
+  private humanTakeoverHandler: (() => void | Promise<void>) | null = null;
 
   constructor(selectors: SelectorConfig) {
     this.selectors = selectors;
@@ -1121,6 +1231,35 @@ export class CommandExecutor {
 
   setClient(client: CdpClient | null): void {
     this.client = client;
+  }
+
+  /** Read the current composer immediately; callers must already hold the target UI lane. */
+  async hasComposerDraftNow(): Promise<boolean | null> {
+    const client = this.client;
+    if (!client || !client.isConnected()) return null;
+    const strategies = this.selectors.chatInput.strategies;
+    try {
+      return await client.evaluate(`
+        (() => {
+          const strategies = ${JSON.stringify(strategies)};
+          let input = null;
+          for (const sel of strategies) {
+            try { input = document.querySelector(sel); if (input) break; } catch {}
+          }
+          if (!input) return null;
+          const valueText = typeof input.value === 'string' ? input.value : '';
+          const contentText = input.textContent || input.innerText || '';
+          const text = input.isContentEditable ? contentText : (valueText || contentText);
+          return text.trim().length > 0;
+        })()
+      `) as boolean | null;
+    } catch {
+      return null;
+    }
+  }
+
+  setHumanTakeoverHandler(handler: (() => void | Promise<void>) | null): void {
+    this.humanTakeoverHandler = handler;
   }
 
   setActionRegistry(registry: ActionRegistry | null): void {
@@ -1149,9 +1288,11 @@ export class CommandExecutor {
     commandId: string,
     actionId: string,
     expectedTarget?: { targetId?: string; targetGeneration?: number; actionType?: string },
+    opts: CommandDispatchOptions = {},
   ): Promise<CommandResult> {
     if (!this.actionRegistry) return { commandId, ok: false, error: 'Action authorization is unavailable' };
     let reservedId = '';
+    let dispatchAuthorized = false;
     const currentTargetId = this.targetIdProvider?.() ?? expectedTarget?.targetId;
     const currentGeneration = this.targetGenerationProvider?.() ?? expectedTarget?.targetGeneration;
     try {
@@ -1168,15 +1309,24 @@ export class CommandExecutor {
       // The registry scope is checked before queueing and the coordinator
       // checks this generation again when the operation starts. This prevents
       // a queued action from crossing a reconnect/window switch.
+      const guardedOptions: CommandDispatchOptions = {
+        ...opts,
+        beforeDispatch: async () => {
+          await opts.beforeDispatch?.();
+          dispatchAuthorized = true;
+        },
+      };
       const result = await this.clickAction(commandId, target.selectorPath, target.expectedLabel, {
         composerId: target.composerId,
         toolCallId: target.toolCallId,
-      }, { retry: false });
+      }, { ...guardedOptions, retry: opts.retry ?? false });
       const scope = { targetId: target.targetId, targetGeneration: target.targetGeneration, ...(expectedTarget?.actionType ? { actionType: expectedTarget.actionType } : {}) };
-      this.settleRegisteredAction(actionId, scope, result);
+      if (!dispatchAuthorized && !result.ok) this.actionRegistry.release(actionId);
+      else this.settleRegisteredAction(actionId, scope, result);
       return result;
     } catch (err) {
-      this.settleRegisteredActionError(actionId, reservedId, err);
+      if (!dispatchAuthorized && reservedId) this.actionRegistry.release(reservedId);
+      else this.settleRegisteredActionError(actionId, reservedId, err);
       const message = err instanceof ActionRegistryError ? err.code : (err instanceof Error ? err.message : String(err));
       return { commandId, ok: false, error: message };
     }
@@ -1200,9 +1350,15 @@ export class CommandExecutor {
     }
   }
 
-  async setRegisteredPlanModel(commandId: string, actionId: string, planModelId: string): Promise<CommandResult> {
+  async setRegisteredPlanModel(
+    commandId: string,
+    actionId: string,
+    planModelId: string,
+    opts: CommandDispatchOptions = {},
+  ): Promise<CommandResult> {
     if (!this.actionRegistry) return { commandId, ok:false, error:'Action authorization is unavailable' };
     let reservedId = '';
+    let dispatchAuthorized = false;
     try {
       const target = this.actionRegistry.reserve(actionId, {
         targetId: this.targetIdProvider?.(),
@@ -1210,11 +1366,20 @@ export class CommandExecutor {
         actionType: 'plan_model',
       });
       reservedId = target.actionId;
-      const result = await this.setPlanModel(commandId, target.selectorPath, planModelId);
-      this.settleRegisteredAction(actionId, { targetId: target.targetId, targetGeneration: target.targetGeneration, actionType: 'plan_model' }, result);
+      const result = await this.setPlanModel(commandId, target.selectorPath, planModelId, {
+        ...opts,
+        beforeDispatch: async () => {
+          await opts.beforeDispatch?.();
+          dispatchAuthorized = true;
+        },
+      });
+      const scope = { targetId: target.targetId, targetGeneration: target.targetGeneration, actionType: 'plan_model' };
+      if (!dispatchAuthorized && !result.ok) this.actionRegistry.release(actionId);
+      else this.settleRegisteredAction(actionId, scope, result);
       return result;
     } catch (err) {
-      this.settleRegisteredActionError(actionId, reservedId, err);
+      if (!dispatchAuthorized && reservedId) this.actionRegistry.release(reservedId);
+      else this.settleRegisteredActionError(actionId, reservedId, err);
       return { commandId, ok:false, error:err instanceof ActionRegistryError ? err.code : (err instanceof Error ? err.message : String(err)) };
     }
   }
@@ -1264,7 +1429,7 @@ export class CommandExecutor {
     return next;
   }
 
-  async sendMessage(commandId: string, text: string): Promise<CommandResult> {
+  async sendMessage(commandId: string, text: string, opts: CommandDispatchOptions = {}): Promise<CommandResult> {
     return this.withRetry(commandId, async (client) => {
       const strategies = this.selectors.chatInput.strategies;
 
@@ -1313,7 +1478,7 @@ export class CommandExecutor {
       console.log(`[command-executor] Enter pressed via CDP Input.dispatchKeyEvent`);
 
       const trimmedText = text.trim();
-      if (trimmedText.length > 0) {
+      if (opts.retry !== false && trimmedText.length > 0) {
         await sleep(300);
         const stillContainsTypedText = await client.evaluate(`
           (() => {
@@ -1340,7 +1505,7 @@ export class CommandExecutor {
           console.log(`[command-executor] ${isMac ? 'Cmd' : 'Ctrl'}+Enter retry fired because composer still contained typed text`);
         }
       }
-    });
+    }, opts);
   }
 
   async clickApproval(
@@ -1515,7 +1680,7 @@ export class CommandExecutor {
     });
   }
 
-  async setMode(commandId: string, modeId: string): Promise<CommandResult> {
+  async setMode(commandId: string, modeId: string, opts: CommandDispatchOptions = {}): Promise<CommandResult> {
     const denied = this.capabilityError('mode', modeId);
     if (denied) return { commandId, ok: false, error: denied };
 
@@ -1561,7 +1726,7 @@ export class CommandExecutor {
       `) as { ok: boolean; count: number } | null;
       if (!selected?.ok) throw new Error(`Mode "${modeId}" target is not unique (found ${selected?.count ?? 0})`);
       console.log(`[command-executor] Mode set to: ${modeId}`);
-    });
+    }, opts);
   }
 
   async clickAction(
@@ -1569,7 +1734,7 @@ export class CommandExecutor {
     selectorPath: string,
     expectedLabel?: string,
     expectedScope?: { composerId?: string; toolCallId?: string },
-    opts?: { retry?: boolean },
+    opts: CommandDispatchOptions = {},
   ): Promise<CommandResult> {
     return this.withRetry(commandId, async (client) => {
       if (expectedLabel === undefined) {
@@ -1623,7 +1788,7 @@ export class CommandExecutor {
         throw new Error(result?.error ?? `action target not found (label: ${expectedLabel})`);
       }
       console.log(`[command-executor] Clicked action: ${selectorPath.substring(0, 60)} (${expectedLabel})`);
-    }, { retry: opts?.retry });
+    }, opts);
   }
 
   async extractToolContent(toolCallId: string): Promise<{ code: string; language?: string; filename?: string } | null> {
@@ -1773,7 +1938,7 @@ export class CommandExecutor {
     return result;
   }
 
-  async setModel(commandId: string, modelId: string): Promise<CommandResult> {
+  async setModel(commandId: string, modelId: string, opts: CommandDispatchOptions = {}): Promise<CommandResult> {
     const denied = this.capabilityError('model', modelId);
     if (denied) return { commandId, ok: false, error: denied };
 
@@ -1844,7 +2009,7 @@ export class CommandExecutor {
       }
 
       console.log(`[command-executor] Model set to: ${modelId} (menu closed: ${!menuStillOpen})`);
-    });
+    }, opts);
   }
 
   private verifiedComposerModelOptions(): PlanModelOption[] {
@@ -1910,7 +2075,12 @@ export class CommandExecutor {
     return { commandId, ok: true, data: result.data };
   }
 
-  async setPlanModel(commandId: string, selectorPath: string, planModelId: string): Promise<CommandResult> {
+  async setPlanModel(
+    commandId: string,
+    selectorPath: string,
+    planModelId: string,
+    opts: CommandDispatchOptions = {},
+  ): Promise<CommandResult> {
     return this.withRetry(commandId, async (client) => {
       await this.openPlanModelMenu(client, selectorPath);
       const selected = await client.evaluate(`
@@ -1934,7 +2104,7 @@ export class CommandExecutor {
         await sleep(100);
       }
       console.log(`[command-executor] Plan model set to: ${planModelId}`);
-    });
+    }, opts);
   }
 
 /**
@@ -1956,13 +2126,22 @@ export class CommandExecutor {
     const queuedClient = this.client;
     const targetId = this.targetIdProvider?.() ?? '';
     if (typeof isCurrent !== 'function' || !coordinator || !targetId) {
-      return { commandId, ok: false, error: '计划文档读取不可用' };
+      return planFailResult({
+        commandId, error: '计划文档读取不可用', code: 'unknown', stage: 'resolve',
+        requested: planRequestedTarget(expected),
+      });
     }
     if (!queuedClient || !queuedClient.isConnected()) {
-      return { commandId, ok: false, error: '未连接到 Cursor' };
+      return planFailResult({
+        commandId, error: '未连接到 Cursor', code: 'connection', stage: 'resolve',
+        requested: planRequestedTarget(expected),
+      });
     }
     if (expected.windowId !== targetId) {
-      return { commandId, ok: false, error: '计划文档目标窗口不匹配' };
+      return planFailResult({
+        commandId, error: '计划文档目标窗口不匹配', code: 'window', stage: 'resolve',
+        requested: planRequestedTarget(expected),
+      });
     }
     const generationProvider = this.targetGenerationProvider;
     const generation = generationProvider?.() ?? coordinator.getGeneration(targetId);
@@ -1989,9 +2168,19 @@ export class CommandExecutor {
         const message = err.code === 'generation_changed'
           ? '计划文档目标已改变'
           : err.code === 'timeout' ? '计划文档读取超时' : '计划文档读取已取消';
-        return { commandId, ok: false, error: message };
+        const code = err.code === 'generation_changed' ? 'window' : err.code === 'timeout' ? 'expired' : 'unknown';
+        return planFailResult({
+          commandId, error: message, code, stage: 'resolve',
+          requested: planRequestedTarget(expected),
+        });
       }
-      return { commandId, ok: false, error: err instanceof Error ? err.message : '计划文档读取未能完成' };
+      return planFailResult({
+        commandId,
+        error: err instanceof Error ? err.message : '计划文档读取未能完成',
+        code: 'unknown',
+        stage: 'resolve',
+        requested: planRequestedTarget(expected),
+      });
     }
   }
 
@@ -2147,6 +2336,24 @@ export class CommandExecutor {
         return { commandId, ok: false, error: '未找到该计划卡片' };
       }
 
+      const directState = await runStep(
+        `planStepReadDirectUri(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${toolCallLiteral}, ${JSON.stringify(baseline)}, ${flowArg()})`
+      );
+      if (!directState) return fail(undefined);
+      if (directState.status !== 'ok') return fail(directState.status);
+      if (typeof directState.planUri === 'string' && directState.planUri.length > 0) {
+        const parsed = planFileFromFileUri(directState.planUri, directState.workspace);
+        if (parsed) {
+          const scrollRestored = await restoreSearchScroll();
+          if (!scrollRestored) return fail('scroll_unverified');
+          return {
+            commandId,
+            ok: true,
+            data: { fileName: parsed.fileName, observedAt: Date.now(), ...(parsed.plansRoot ? { plansRoot: parsed.plansRoot } : {}) },
+          };
+        }
+      }
+
       const clickState = await runStep(
         `planStepClickViewPlan(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${toolCallLiteral}, ${JSON.stringify(baseline)}, ${flowArg()})`
       );
@@ -2181,9 +2388,23 @@ export class CommandExecutor {
       if (!documentState) return fail('doc_not_opened');
 
       const resourceName = String(documentState.resourceName ?? '');
-      const fileName = planFileNameFromPath(String(documentState.breadcrumbPath ?? ''));
-      if (!fileName) return fail('doc_path_unsafe');
-      if (fileName !== resourceName) return fail('doc_path_mismatch');
+      const breadcrumbPath = String(documentState.breadcrumbPath ?? '');
+      const homeName = planFileNameFromPath(breadcrumbPath);
+      let fileName: string | null = null;
+      let plansRoot: string | undefined;
+      if (homeName) {
+        if (homeName !== resourceName) return fail('doc_path_mismatch');
+        fileName = homeName;
+      } else {
+        const workspaceRoot = fileWorkspacePlansRoot(documentState.workspace);
+        const workspaceName = workspaceRoot
+          ? planFileNameFromPrefix(breadcrumbPath, `${workspaceRoot}/`)
+          : null;
+        if (!workspaceName) return fail('doc_path_unsafe');
+        if (workspaceName !== resourceName) return fail('doc_path_mismatch');
+        fileName = workspaceName;
+        plansRoot = workspaceRoot as string;
+      }
       if (resourceName === baseline) return fail('not_open');
       planTabName = resourceName;
 
@@ -2227,7 +2448,7 @@ export class CommandExecutor {
       if (!finalWatch) return fail(undefined);
       if (finalWatch.status !== 'ok') return fail(String(finalWatch.status));
 
-      return { commandId, ok: true, data: { fileName, observedAt: Date.now() } };
+      return { commandId, ok: true, data: { fileName, observedAt: Date.now(), ...(plansRoot ? { plansRoot } : {}) } };
     };
 
     try {
@@ -2258,13 +2479,22 @@ export class CommandExecutor {
     const queuedClient = this.client;
     const targetId = this.targetIdProvider?.() ?? '';
     if (typeof isCurrent !== 'function' || !coordinator || !targetId || !expected.composerId) {
-      return { commandId, ok: false, error: '计划发现不可用' };
+      return planFailResult({
+        commandId, error: '计划发现不可用', code: 'unknown', stage: 'discover',
+        requested: planRequestedTarget(expected),
+      });
     }
     if (!queuedClient || !queuedClient.isConnected()) {
-      return { commandId, ok: false, error: '未连接到 Cursor' };
+      return planFailResult({
+        commandId, error: '未连接到 Cursor', code: 'connection', stage: 'discover',
+        requested: planRequestedTarget(expected),
+      });
     }
     if (expected.windowId !== targetId) {
-      return { commandId, ok: false, error: '计划发现目标窗口不匹配' };
+      return planFailResult({
+        commandId, error: '计划发现目标窗口不匹配', code: 'window', stage: 'discover',
+        requested: planRequestedTarget(expected),
+      });
     }
     const generationProvider = this.targetGenerationProvider;
     const generation = generationProvider?.() ?? coordinator.getGeneration(targetId);
@@ -2291,9 +2521,19 @@ export class CommandExecutor {
         const message = err.code === 'generation_changed'
           ? '计划文档目标已改变'
           : err.code === 'timeout' ? '计划发现超时' : '计划发现已取消';
-        return { commandId, ok: false, error: message };
+        const code = err.code === 'generation_changed' ? 'window' : err.code === 'timeout' ? 'expired' : 'unknown';
+        return planFailResult({
+          commandId, error: message, code, stage: 'discover',
+          requested: planRequestedTarget(expected),
+        });
       }
-      return { commandId, ok: false, error: err instanceof Error ? err.message : '计划发现未能完成' };
+      return planFailResult({
+        commandId,
+        error: err instanceof Error ? err.message : '计划发现未能完成',
+        code: 'unknown',
+        stage: 'discover',
+        requested: planRequestedTarget(expected),
+      });
     }
   }
 
@@ -2374,10 +2614,11 @@ export class CommandExecutor {
 
       const plans: Array<{ toolCallId: string; title: string; description?: string }> = [];
       const seen = new Set<string>();
-      const collect = (step: PlanStepResult): void => {
+      const collect = (step: PlanStepResult): number => {
+        const before = plans.length;
         const list = step && Array.isArray(step.plans) ? step.plans : [];
         for (const item of list) {
-          if (plans.length >= PLAN_DISCOVERY_MAX_PLANS) return;
+          if (plans.length >= PLAN_DISCOVERY_MAX_PLANS) break;
           const entry = (item ?? {}) as { toolCallId?: unknown; title?: unknown; description?: unknown };
           const toolCallId = typeof entry.toolCallId === 'string' ? entry.toolCallId : '';
           const title = typeof entry.title === 'string' ? entry.title : '';
@@ -2387,6 +2628,7 @@ export class CommandExecutor {
             ? { toolCallId, title, description: entry.description }
             : { toolCallId, title });
         }
+        return plans.length - before;
       };
 
       let reachedStart = false;
@@ -2396,12 +2638,14 @@ export class CommandExecutor {
       const first = await scan();
       if (!first) return fail(undefined);
       if (first.status !== 'ok') return fail(first.status);
-      collect(first);
+      let foundNew = collect(first) > 0;
 
-      // Upward only, one screen per step, bounded. No card is expanded and no
-      // button is pressed anywhere in this walk.
+      // Upward only, one screen per step, bounded. Stop as soon as a scan newly
+      // collects at least one plan card: extra walking is what lets a later
+      // layout shift discard cards that were already in hand. No card is
+      // expanded and no button is pressed anywhere in this walk.
       for (let stepIndex = 0; stepIndex < PLAN_DOCUMENT_SCROLL_MAX_STEPS; stepIndex += 1) {
-        if (plans.length >= PLAN_DISCOVERY_MAX_PLANS) break;
+        if (foundNew || plans.length >= PLAN_DISCOVERY_MAX_PLANS) break;
         const step = await runStep(
           `planStepScrollUp(${tokenLiteral}, ${selectorsLiteral}, ${composerLiteral}, ${JSON.stringify(baseline)}, ${flowArg()})`
         );
@@ -2419,7 +2663,7 @@ export class CommandExecutor {
         const next = await scan();
         if (!next) return fail(undefined);
         if (next.status !== 'ok') return fail(next.status);
-        collect(next);
+        foundNew = collect(next) > 0;
       }
 
       // Restore and confirm only while this flow still owns the environment.
@@ -2484,13 +2728,15 @@ export class CommandExecutor {
   private async withRetry(
     commandId: string,
     action: (client: CdpClient) => Promise<void>,
-    opts: { retry?: boolean } = {},
+    opts: CommandDispatchOptions = {},
   ): Promise<CommandResult> {
     return this.getOrRunCommand(commandId, () => {
       const queuedClient = this.client;
-      const run = () => this.enqueueWindowCommand(queuedClient, () =>
-        this.runWithRetry(commandId, queuedClient, action, opts.retry !== false)
-      );
+      const run = () => this.enqueueWindowCommand(queuedClient, async () => {
+        if (opts.humanInitiated !== false) await this.humanTakeoverHandler?.();
+        await opts.beforeDispatch?.();
+        return this.runWithRetry(commandId, queuedClient, action, opts.retry !== false);
+      });
       const targetId = this.targetIdProvider?.() ?? '';
       const generation = this.targetGenerationProvider?.() ?? undefined;
       if (!this.uiCoordinator || !targetId) return run();
@@ -2537,9 +2783,10 @@ export class CommandExecutor {
   ): Promise<CommandResult & { data?: T }> {
     return this.getOrRunCommand(commandId, () => {
       const queuedClient = this.client;
-      const run = () => this.enqueueWindowCommand(queuedClient, () =>
-        this.runWithRetryValue(commandId, queuedClient, action)
-      );
+      const run = () => this.enqueueWindowCommand(queuedClient, async () => {
+        await this.humanTakeoverHandler?.();
+        return this.runWithRetryValue(commandId, queuedClient, action);
+      });
       const targetId = this.targetIdProvider?.() ?? '';
       const generation = this.targetGenerationProvider?.() ?? undefined;
       if (!this.uiCoordinator || !targetId) return run();

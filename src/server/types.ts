@@ -108,6 +108,11 @@ export interface CursorState {
   /** Agent questionnaire widget (multiple-choice questions). */
   questionnaire: Questionnaire | null;
   /**
+   * Internal direct workspace identity observed in the same renderer evaluation.
+   * Stripped from public socket state; authorization code may compare it to a grant.
+   */
+  _workspaceIdentity?: WorkspaceIdentity | null;
+  /**
    * Internal extractor diagnostics. Stripped from socket `state:full` /
    * `state:patch`; inspect via `/debug/state`.
    */
@@ -371,6 +376,11 @@ export interface CommandPayload {
   /** Opaque ActionRegistry id; selectorPath is retained only for legacy reads. */
   actionId?: string;
   operationId?: string;
+  planVersion?: string;
+  authorizationVersion?: string;
+  controlVersion?: string;
+  issueId?: string;
+  contentDigest?: string;
   targetGeneration?: number;
   selectorPath?: string;
   actionLabel?: string;
@@ -383,11 +393,47 @@ export interface CommandPayload {
   windowId?: string;
 }
 
+export type PlanFailureCode =
+  | 'session'
+  | 'window'
+  | 'connection'
+  | 'expired'
+  | 'extraction'
+  | 'auth'
+  | 'busy'
+  | 'invalid'
+  | 'plan'
+  | 'file'
+  | 'unknown';
+
+export type PlanFailureStage =
+  | 'validate'
+  | 'guard'
+  | 'discover'
+  | 'resolve'
+  | 'read'
+  | 'emit';
+
+/** Requested plan target only. Never include other windows, paths, or secrets. */
+export interface PlanRequestedTarget {
+  windowId?: string;
+  composerId?: string;
+  planId?: string;
+}
+
+export interface PlanCommandFailure {
+  code: PlanFailureCode;
+  stage: PlanFailureStage;
+  commandId: string;
+  requested?: PlanRequestedTarget;
+}
+
 export interface CommandResult {
   commandId: string;
   ok: boolean;
   error?: string;
   data?: unknown;
+  failure?: PlanCommandFailure;
 }
 
 export interface ServerConfig {
@@ -655,4 +701,161 @@ export interface CompatibleModeModelProjection {
   mode: ModeInfo;
   model: ModelInfo;
   status: CapabilityState;
+}
+
+// --- Workspace supervision (phase 2 core; no relay/UI/Telegram wiring) ---
+
+export interface WorkspaceUri {
+  scheme: string;
+  authority: string;
+  path: string;
+}
+
+/** Stable workspace identity. Title is display-only and must not be used here. */
+export interface WorkspaceIdentity {
+  id: string;
+  uri: WorkspaceUri;
+}
+
+export type SupervisionGrantStatus = 'active' | 'revoked' | 'expired' | 'pending_recovery';
+
+export type SupervisionPauseReason =
+  | 'human_takeover'
+  | 'pending_issue'
+  | 'supervisor_lost'
+  | 'result_unknown'
+  | 'revoked'
+  | 'expired'
+  | 'pending_recovery';
+
+export interface SupervisionGrant {
+  grantId: string;
+  workspace: WorkspaceIdentity;
+  readComposerIds: string[];
+  writeComposerIds: string[];
+  goal: string;
+  constraints: string;
+  acceptanceCriteria: string;
+  planVersion: string;
+  authorizationVersion: string;
+  controlVersion: string;
+  expiresAt: number;
+  operationLimit: number;
+  operationsUsed: number;
+  /** 0 disables automatic supervisor-loss detection until explicitly configured. */
+  checkTtlMs: number;
+  allowedActionTypes: string[];
+  allowedModes: string[];
+  allowedModels: string[];
+  pauseReasons: SupervisionPauseReason[];
+  status: SupervisionGrantStatus;
+  createdAt: number;
+}
+
+export type IssuePermitStatus = 'pending' | 'consumed' | 'expired' | 'revoked';
+export type IssueDecision = 'pending' | 'approved' | 'rejected';
+
+export type IssueNotificationStatus =
+  | 'not_configured'
+  | 'pending'
+  | 'sent'
+  | 'delivery_unknown'
+  | 'confirmed';
+
+export type SupervisionCheckStatus = 'ok' | 'attention' | 'failed';
+
+export interface SupervisionCheckRecord {
+  checkId: string;
+  grantId: string;
+  checkedAt: number;
+  status: SupervisionCheckStatus;
+  summary: string;
+}
+
+export interface IssuePermit {
+  issueId: string;
+  grantId: string;
+  workspace: WorkspaceIdentity;
+  composerId: string;
+  actionType: string;
+  actionId: string;
+  planVersion: string;
+  authorizationVersion: string;
+  controlVersion: string;
+  contentDigest: string;
+  createdAt: number;
+  expiresAt: number;
+  status: IssuePermitStatus;
+  evidence: string;
+  recommendation: string;
+  attemptedActions: string[];
+  notificationStatus: IssueNotificationStatus;
+  decision: IssueDecision;
+  decidedAt: number | null;
+}
+
+export interface CreateSupervisionGrantInput {
+  workspace: WorkspaceIdentity;
+  readComposerIds?: string[];
+  writeComposerIds?: string[];
+  goal: string;
+  constraints?: string;
+  acceptanceCriteria?: string;
+  planVersion: string;
+  authorizationVersion: string;
+  controlVersion?: string;
+  expiresAt: number;
+  operationLimit?: number;
+  /** Explicit active-check validity window. Omitted/0 keeps loss detection disabled. */
+  checkTtlMs?: number;
+  allowedActionTypes?: string[];
+  allowedModes?: string[];
+  allowedModels?: string[];
+}
+
+export interface CreateIssuePermitInput {
+  grantId: string;
+  workspace: WorkspaceIdentity;
+  composerId: string;
+  actionType: string;
+  actionId: string;
+  planVersion: string;
+  authorizationVersion: string;
+  contentDigest: string;
+  expiresAt: number;
+  evidence?: string;
+  recommendation?: string;
+  attemptedActions?: string[];
+}
+
+export interface ConsumeIssuePermitInput {
+  issueId: string;
+  grantId: string;
+  workspace: WorkspaceIdentity;
+  composerId: string;
+  actionType: string;
+  actionId: string;
+  planVersion: string;
+  authorizationVersion: string;
+  controlVersion: string;
+  contentDigest: string;
+}
+
+export interface SupervisorAuthContext {
+  grant: SupervisionGrant;
+  expiresAt: number;
+}
+
+export interface SupervisionWriteRequest {
+  composerId: string;
+  actionType: string;
+  planVersion: string;
+  authorizationVersion: string;
+  controlVersion: string;
+  mode: string;
+  model: string;
+  issueId?: string;
+  actionId?: string;
+  contentDigest?: string;
+  now?: number;
 }

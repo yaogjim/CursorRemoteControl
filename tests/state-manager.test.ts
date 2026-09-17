@@ -202,6 +202,26 @@ describe('StateManager extraction heartbeat', () => {
     assert.equal('_rawSignals' in last, false);
   });
 
+  it('emits the new active composer id when the session changes', async () => {
+    const sm = new StateManager(0);
+    const patches: Partial<CursorState>[] = [];
+    sm.on('state:patch', (patch: Partial<CursorState>) => patches.push(patch));
+
+    sm.onConnectionChanged(true);
+    sm.onExtraction(extractionState({ activeComposerId: 'composer-a' }));
+    await wait(20);
+    const afterFirst = patches.length;
+
+    sm.onExtraction(extractionState({ activeComposerId: 'composer-b' }));
+    await wait(20);
+
+    assert.ok(patches.length > afterFirst);
+    const last = patches[patches.length - 1];
+    assert.equal(last.activeComposerId, 'composer-b');
+    assert.equal(sm.getCurrentState().activeComposerId, 'composer-b');
+    assert.equal('lastExtractionAt' in last, false);
+  });
+
   it('still patches extractor health failures', async () => {
     const sm = new StateManager(0);
     const patches: Partial<CursorState>[] = [];

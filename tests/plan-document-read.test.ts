@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { homedir } from 'node:os';
+import { resolve } from 'node:path';
 import { JSDOM } from 'jsdom';
 import { CommandExecutor } from '../src/server/command-executor.js';
 import { TargetUiCoordinator } from '../src/server/target-ui-coordinator.js';
@@ -24,9 +26,25 @@ const PLAN_SELECTORS: SelectorConfig = {
 const PLANS_PREFIX = '~/.cursor/plans/';
 const PLAN_FILE = '工作区_agent_托管方案_e00f35aa.plan.md';
 const OTHER_PLAN_FILE = '工作区_agent_托管方案_bbbbbbbb.plan.md';
+const HOME_PLANS_DIR = resolve(homedir(), '.cursor', 'plans');
+const HOME_PLAN_URI = `file://${HOME_PLANS_DIR}/${PLAN_FILE}`;
+const HOME_OTHER_PLAN_URI = `file://${HOME_PLANS_DIR}/${OTHER_PLAN_FILE}`;
 const BASELINE_TAB = 'index.ts';
 const OTHER_TAB = 'other.ts';
 const PLAN_BODY = 'PLAN_BODY_SHOULD_NOT_LEAK';
+const FILE_WORKSPACE_ID = '265d56b2c491736926ee6e06eeffd5de';
+const FILE_WORKSPACE_PATH = '/Users/yaogj/works/ccspace/cursorremote';
+const FILE_WORKSPACE_PLANS = `${FILE_WORKSPACE_PATH}/.cursor/plans`;
+const FILE_WORKSPACE = {
+  id: FILE_WORKSPACE_ID,
+  uri: { scheme: 'file', authority: '', path: FILE_WORKSPACE_PATH },
+};
+
+function installWorkspace(dom: JSDOM, workspace: unknown) {
+  (dom.window as unknown as { vscode: unknown }).vscode = {
+    context: { configuration: () => ({ workspace }) },
+  };
+}
 
 /**
  * jsdom defines `isTrusted` as a non-configurable own accessor on every event,
@@ -142,6 +160,56 @@ function planCardHtml(toolCallId: string, viewPlanButton = '<button id="view-pla
       </div>
     </div>
   `;
+}
+
+function installCreatePlanFiber(dom: JSDOM, opts: {
+  planUri?: string;
+  bubbleId?: string;
+  vmCallId?: string;
+  vmCase?: string;
+  tfdName?: string;
+  tfdCallId?: string;
+} = {}) {
+  const card = dom.window.document.querySelector('.ui-tool-call-card') as HTMLElement;
+  const host = card.closest('[data-tool-call-id]') as HTMLElement;
+  const messageId = host.getAttribute('data-message-id') || '';
+  const toolCallId = host.getAttribute('data-tool-call-id') || '';
+  const planUri = opts.planUri ?? '';
+  const handle = {
+    data: {
+      conversationMap: {
+        [messageId]: {
+          toolFormerData: {
+            name: opts.tfdName ?? 'create_plan',
+            toolCallId: opts.tfdCallId ?? toolCallId,
+            additionalData: { planUri },
+          },
+        },
+      },
+    },
+  };
+  const fiber = {
+    memoizedProps: {},
+    return: {
+      memoizedProps: {},
+      return: {
+        memoizedProps: {
+          bubbleId: opts.bubbleId ?? messageId,
+          composerDataHandle: handle,
+          vm: {
+            callId: opts.vmCallId ?? toolCallId,
+            case: opts.vmCase ?? 'createPlanToolCall',
+          },
+        },
+        return: null,
+      },
+    },
+  };
+  Object.defineProperty(card, '__reactFiber$test', {
+    value: fiber,
+    enumerable: true,
+    configurable: true,
+  });
 }
 
 interface WiringOptions {
@@ -319,6 +387,65 @@ describe('CommandExecutor.resolvePlanFile', () => {
     dom.window.close();
   });
 
+  it('reads a direct home-plans file URI from the card fiber without clicking View Plan', async () => {
+    const dom = setup(editorGroupHtml() + composerHtml('composer-a', planCardHtml('tc_1')));
+    const wiring = planWiring(dom);
+    installCreatePlanFiber(dom, { planUri: HOME_PLAN_URI });
+    const { executor, calls } = makeExecutor(dom);
+
+    const result = await executor.resolvePlanFile('cmd-direct-uri', expected(), () => true);
+
+    assert.equal(result.ok, true, result.error);
+    const data = result.data as { fileName: string; plansRoot?: string; observedAt: number };
+    assert.equal(data.fileName, PLAN_FILE);
+    assert.equal(typeof data.observedAt, 'number');
+    assert.equal('plansRoot' in data, false);
+    assert.equal(wiring.clicks(), 0, 'View Plan must not be clicked when the direct URI is trusted');
+    assert.equal(wiring.buildClicks(), 0);
+    assert.equal(selectedTabName(dom), BASELINE_TAB);
+    assert.equal(calls.some((entry) => entry.includes('planStepReadDirectUri(')), true);
+    assert.equal(calls.some((entry) => entry.includes('planStepClickViewPlan(')), false);
+    const serialized = JSON.stringify(result.data);
+    assert.ok(!serialized.includes(HOME_PLANS_DIR));
+    assert.ok(!serialized.includes('file:'));
+    assert.ok(!serialized.includes(PLAN_BODY));
+    dom.window.close();
+  });
+
+  it('falls back to View Plan when a direct URI is outside the allowed roots', async () => {
+    const dom = setup(editorGroupHtml() + composerHtml('composer-a', planCardHtml('tc_1')));
+    const wiring = planWiring(dom);
+    installCreatePlanFiber(dom, { planUri: 'file:///etc/outside.plan.md' });
+    const { executor, calls } = makeExecutor(dom);
+
+    const result = await executor.resolvePlanFile('cmd-direct-unsafe-fallback', expected(), () => true);
+
+    assert.equal(result.ok, true, result.error);
+    const data = result.data as { fileName: string };
+    assert.equal(data.fileName, PLAN_FILE);
+    assert.equal(wiring.clicks(), 1, 'an unusable direct URI must keep the existing click fallback');
+    assert.equal(calls.some((entry) => entry.includes('planStepClickViewPlan(')), true);
+    assert.ok(!JSON.stringify(result.data).includes('/etc/'));
+    dom.window.close();
+  });
+
+  it('ignores a fiber URI whose tool identity does not match and keeps the click flow', async () => {
+    const dom = setup(editorGroupHtml() + composerHtml('composer-a', planCardHtml('tc_1')));
+    const wiring = planWiring(dom);
+    installCreatePlanFiber(dom, { planUri: HOME_OTHER_PLAN_URI, vmCallId: 'tc_other' });
+    const { executor } = makeExecutor(dom);
+
+    const result = await executor.resolvePlanFile('cmd-direct-mismatch', expected(), () => true);
+
+    assert.equal(result.ok, true, result.error);
+    const data = result.data as { fileName: string };
+    assert.equal(data.fileName, PLAN_FILE);
+    assert.equal(wiring.clicks(), 1, 'identity mismatch must not consume the fiber URI');
+    assert.ok(!JSON.stringify(result.data).includes(HOME_PLANS_DIR));
+    assert.ok(!JSON.stringify(result.data).includes(OTHER_PLAN_FILE));
+    dom.window.close();
+  });
+
   it('rejects a wrong expected.windowId before any DOM work', async () => {
     const dom = setup(editorGroupHtml() + composerHtml('composer-a', planCardHtml('tc_1')));
     const wiring = planWiring(dom);
@@ -485,6 +612,96 @@ describe('CommandExecutor.resolvePlanFile', () => {
     assert.equal(wiring.clicks(), 1);
     assert.ok(!(result.error ?? '').includes(PLAN_FILE));
     dom.window.close();
+  });
+
+  it('accepts a local file-workspace breadcrumb and returns that plans root internally', async () => {
+    const dom = setup(editorGroupHtml() + composerHtml('composer-a', planCardHtml('tc_1')));
+    installWorkspace(dom, FILE_WORKSPACE);
+    const wiring = planWiring(dom, { breadcrumbPath: `${FILE_WORKSPACE_PLANS}/${PLAN_FILE}` });
+    const { executor, calls } = makeExecutor(dom);
+
+    const result = await executor.resolvePlanFile('cmd-workspace-ok', expected(), () => true);
+
+    assert.equal(result.ok, true, result.error);
+    const data = result.data as { fileName: string; plansRoot?: string; observedAt: number };
+    assert.equal(data.fileName, PLAN_FILE);
+    assert.equal(data.plansRoot, FILE_WORKSPACE_PLANS);
+    assert.equal(typeof data.observedAt, 'number');
+    assert.equal(wiring.clicks(), 1);
+    assert.equal(selectedTabName(dom), BASELINE_TAB);
+    const readOpens = calls.filter((entry) => entry.includes('planStepReadOpen('));
+    assert.ok(readOpens.length >= 1);
+    assert.ok(
+      readOpens.every((entry) => entry.includes('vscode.context.configuration().workspace')),
+      'workspace identity must be read in the same evaluate as the open document',
+    );
+    assert.ok(!JSON.stringify(result.data).includes(PLAN_BODY));
+    assert.ok(!(result.error ?? '').includes(FILE_WORKSPACE_PATH));
+    dom.window.close();
+  });
+
+  it('keeps ~/.cursor/plans even when the live workspace identity is remote', async () => {
+    const dom = setup(editorGroupHtml() + composerHtml('composer-a', planCardHtml('tc_1')));
+    installWorkspace(dom, {
+      id: FILE_WORKSPACE_ID,
+      uri: { scheme: 'vscode-remote', authority: 'ssh-remote+host', path: FILE_WORKSPACE_PATH },
+    });
+    const wiring = planWiring(dom);
+    const { executor } = makeExecutor(dom);
+
+    const result = await executor.resolvePlanFile('cmd-home-despite-remote', expected(), () => true);
+
+    assert.equal(result.ok, true, result.error);
+    const data = result.data as { fileName: string; plansRoot?: string };
+    assert.equal(data.fileName, PLAN_FILE);
+    assert.equal('plansRoot' in data, false);
+    assert.equal(wiring.clicks(), 1);
+    dom.window.close();
+  });
+
+  it('rejects a workspace breadcrumb outside the file workspace, a remote identity, and a name mismatch', async () => {
+    const cases: Array<{ workspace: unknown; breadcrumbPath: string; planFileName?: string; leaked: string[] }> = [
+      {
+        workspace: FILE_WORKSPACE,
+        breadcrumbPath: `/tmp/other/.cursor/plans/${PLAN_FILE}`,
+        leaked: ['/tmp/other', PLAN_FILE, FILE_WORKSPACE_PATH],
+      },
+      {
+        workspace: {
+          id: FILE_WORKSPACE_ID,
+          uri: { scheme: 'vscode-remote', authority: '', path: FILE_WORKSPACE_PATH },
+        },
+        breadcrumbPath: `${FILE_WORKSPACE_PLANS}/${PLAN_FILE}`,
+        leaked: [FILE_WORKSPACE_PATH, 'vscode-remote', PLAN_FILE],
+      },
+      {
+        workspace: FILE_WORKSPACE,
+        planFileName: OTHER_PLAN_FILE,
+        breadcrumbPath: `${FILE_WORKSPACE_PLANS}/${PLAN_FILE}`,
+        leaked: [PLAN_FILE, OTHER_PLAN_FILE, FILE_WORKSPACE_PATH],
+      },
+    ];
+
+    for (const item of cases) {
+      const dom = setup(editorGroupHtml() + composerHtml('composer-a', planCardHtml('tc_1')));
+      installWorkspace(dom, item.workspace);
+      const wiring = planWiring(dom, {
+        planFileName: item.planFileName ?? PLAN_FILE,
+        breadcrumbPath: item.breadcrumbPath,
+      });
+      const { executor } = makeExecutor(dom);
+
+      const result = await executor.resolvePlanFile('cmd-workspace-reject', expected(), () => true);
+
+      assert.equal(result.ok, false, item.breadcrumbPath);
+      assert.equal(result.data, undefined, item.breadcrumbPath);
+      assert.equal(wiring.clicks(), 1, item.breadcrumbPath);
+      const error = result.error ?? '';
+      for (const leaked of item.leaked) {
+        assert.ok(!error.includes(leaked), `${item.breadcrumbPath} leaked ${leaked}`);
+      }
+      dom.window.close();
+    }
   });
 
   it('rejects traversal and out-of-root breadcrumb paths', async () => {
@@ -850,7 +1067,7 @@ describe('CommandExecutor.discoverPlans', () => {
     assert.equal(result.ok, true, result.error);
     const data = result.data as DiscoverData;
     assert.equal(data.completeness, 'partial');
-    assert.equal(data.reachedStart, true);
+    assert.equal(data.reachedStart, false, 'finding a card mid-walk must not claim the transcript start');
     assert.equal(typeof data.observedAt, 'number');
     assert.deepEqual(Array.from(data.plans, (plan) => plan.toolCallId), ['tc_1']);
     assert.equal(data.plans[0].title, PLAN_FILE);
@@ -870,6 +1087,55 @@ describe('CommandExecutor.discoverPlans', () => {
       'planWatchRemove',
     ], 'only the discovery steps may run: no click, no expansion, no read-back');
     assert.equal(scroll.top, 2000, 'the original transcript position must come back');
+    dom.window.close();
+  });
+
+  it('首屏新收集到计划卡后不再向上写，直接确认成功', async () => {
+    const dom = setup(editorGroupHtml() + composerHtml('composer-a', planCardHtml('tc_1') + planCardHtml('tc_2')));
+    const scroll = virtualizedScroll(dom, 2000, 500);
+    const { executor, calls, isCurrent } = makeExecutor(dom);
+
+    const result = await executor.discoverPlans('cmd-discover-stop-first', discoverScope(), isCurrent);
+
+    assert.equal(result.ok, true, result.error);
+    const data = result.data as DiscoverData;
+    assert.equal(data.completeness, 'partial');
+    assert.equal(data.reachedStart, false);
+    assert.deepEqual(Array.from(data.plans, (plan) => plan.toolCallId), ['tc_1', 'tc_2']);
+    assert.equal(scroll.writes, 0, 'finding cards on the first screen must not scroll');
+    assert.equal(calls.filter((entry) => entry.includes('planStepScrollUp(')).length, 0);
+    assert.equal(calls.filter((entry) => entry.includes('planStepRestoreScroll(')).length, 0);
+    assert.ok(calls.some((entry) => entry.includes('planStepDiscoverDone(')));
+    assert.equal(scroll.top, 2000);
+    dom.window.close();
+  });
+
+  it('某屏新收集到计划卡后不再额外向上写，恢复一次并成功', async () => {
+    const dom = setup(editorGroupHtml() + composerHtml('composer-a', ''));
+    const wiring = planWiring(dom);
+    const scroll = virtualizedScroll(dom, 2000, 500, (value) => {
+      if (value > 1000) return;
+      if (dom.window.document.querySelector('.messages [data-tool-call-id]')) return;
+      (dom.window.document.querySelector('.messages') as HTMLElement).innerHTML =
+        planCardHtml('tc_1') + planCardHtml('tc_2');
+      wiring.wireCard();
+    });
+    const { executor, calls, isCurrent } = makeExecutor(dom);
+
+    const result = await executor.discoverPlans('cmd-discover-stop-later', discoverScope(), isCurrent);
+
+    assert.equal(result.ok, true, result.error);
+    const data = result.data as DiscoverData;
+    assert.equal(data.completeness, 'partial');
+    assert.equal(data.reachedStart, false, 'stopping after a hit must not claim the transcript start');
+    assert.deepEqual(Array.from(data.plans, (plan) => plan.toolCallId), ['tc_1', 'tc_2']);
+    const scrollUps = calls.filter((entry) => entry.includes('planStepScrollUp(')).length;
+    const restores = calls.filter((entry) => entry.includes('planStepRestoreScroll(')).length;
+    assert.equal(scrollUps, 2, '2000→1500 empty, 1500→1000 finds cards');
+    assert.equal(restores, 1, 'exactly one restore after the hit');
+    assert.equal(scroll.writes, 3, 'two search steps plus the restore, no extra upward writes');
+    assert.equal(scroll.top, 2000);
+    assert.equal(wiring.clicks(), 0);
     dom.window.close();
   });
 
@@ -999,8 +1265,8 @@ describe('CommandExecutor.discoverPlans', () => {
   });
 
   it('stops at the walk limit and still reports partial results', async () => {
-    const dom = setup(editorGroupHtml() + composerHtml('composer-a', planCardHtml('tc_deep')));
-    // A short viewport means the top of a long transcript is never reached
+    const dom = setup(editorGroupHtml() + composerHtml('composer-a', ''));
+    // A short viewport means the top of a long empty transcript is never reached
     // within the bounded walk, so completeness can never be claimed.
     const scroll = virtualizedScroll(dom, 2000, 10);
     const { executor, isCurrent } = makeExecutor(dom);
@@ -1011,7 +1277,7 @@ describe('CommandExecutor.discoverPlans', () => {
     const data = result.data as DiscoverData;
     assert.equal(data.reachedStart, false);
     assert.equal(data.completeness, 'partial');
-    assert.deepEqual(Array.from(data.plans, (plan) => plan.toolCallId), ['tc_deep']);
+    assert.deepEqual(data.plans, []);
     assert.equal(scroll.writes, 25, '24 bounded steps plus the restore');
     assert.equal(scroll.top, 2000, 'the original transcript position must come back');
     dom.window.close();

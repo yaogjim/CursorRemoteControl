@@ -16,7 +16,12 @@ import { basename, dirname, join } from 'path';
  * readers never see a truncated JSON file if the process dies mid-write.
  * Creates parent directories as needed.
  */
-export function writeFileAtomic(filePath: string, data: string): void {
+export interface AtomicWriteOptions {
+  /** Security journals require completed file and parent-directory fsyncs. */
+  requireFsync?: boolean;
+}
+
+export function writeFileAtomic(filePath: string, data: string, options: AtomicWriteOptions = {}): void {
   const dir = dirname(filePath);
   mkdirSync(dir, { recursive: true });
   const tmpPath = join(
@@ -32,8 +37,9 @@ export function writeFileAtomic(filePath: string, data: string): void {
       } finally {
         closeSync(fd);
       }
-    } catch {
-      // fsync is best-effort; the rename still avoids torn reads.
+    } catch (err) {
+      if (options.requireFsync) throw err;
+      // General settings keep the historical best-effort durability contract.
     }
     try {
       renameSync(tmpPath, filePath);
@@ -47,6 +53,14 @@ export function writeFileAtomic(filePath: string, data: string): void {
         throw err;
       }
     }
+    if (options.requireFsync) {
+      const dirFd = openSync(dir, 'r');
+      try {
+        fsyncSync(dirFd);
+      } finally {
+        closeSync(dirFd);
+      }
+    }
   } catch (err) {
     try { unlinkSync(tmpPath); } catch { /* ignore */ }
     throw err;
@@ -54,7 +68,12 @@ export function writeFileAtomic(filePath: string, data: string): void {
 }
 
 /** JSON.stringify + atomic write. Always UTF-8 with a trailing newline. */
-export function writeJsonAtomic(filePath: string, value: unknown, space?: number): void {
+export function writeJsonAtomic(
+  filePath: string,
+  value: unknown,
+  space?: number,
+  options: AtomicWriteOptions = {},
+): void {
   const json = space === undefined ? JSON.stringify(value) : JSON.stringify(value, null, space);
-  writeFileAtomic(filePath, json.endsWith('\n') ? json : `${json}\n`);
+  writeFileAtomic(filePath, json.endsWith('\n') ? json : `${json}\n`, options);
 }

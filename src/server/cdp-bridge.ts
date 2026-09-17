@@ -7,6 +7,7 @@ import type {
   DiscoveryDiagnosticCode,
   EndpointIdentity,
   SanitizedDiscoveryStatus,
+  WorkspaceIdentity,
 } from './types.js';
 import {
   createDiscoveryDiagnostic,
@@ -24,6 +25,105 @@ interface CDPTarget {
   webSocketDebuggerUrl?: string;
 }
 
+const WORKSPACE_IDENTITY_ID_MAX = 128;
+const WORKSPACE_IDENTITY_SCHEME_MAX = 32;
+const WORKSPACE_IDENTITY_AUTHORITY_MAX = 256;
+const WORKSPACE_IDENTITY_PATH_MAX = 4096;
+
+export interface ExtractedWorkspaceInfo {
+  name: string | null;
+  identity: WorkspaceIdentity | null;
+}
+
+function isBoundedString(value: unknown, max: number, allowEmpty: boolean): value is string {
+  if (typeof value !== 'string') return false;
+  if (value.includes('\0')) return false;
+  if (value.length > max) return false;
+  if (!allowEmpty && value.length === 0) return false;
+  return true;
+}
+
+function parseWorkspaceIdentity(raw: {
+  id?: unknown;
+  scheme?: unknown;
+  authority?: unknown;
+  path?: unknown;
+}): WorkspaceIdentity | null {
+  if (!isBoundedString(raw.id, WORKSPACE_IDENTITY_ID_MAX, false)) return null;
+  if (!isBoundedString(raw.scheme, WORKSPACE_IDENTITY_SCHEME_MAX, false)) return null;
+  if (!isBoundedString(raw.authority, WORKSPACE_IDENTITY_AUTHORITY_MAX, true)) return null;
+  if (!isBoundedString(raw.path, WORKSPACE_IDENTITY_PATH_MAX, false)) return null;
+  return {
+    id: raw.id,
+    uri: { scheme: raw.scheme, authority: raw.authority, path: raw.path },
+  };
+}
+
+/** Display name from uri.path basename plus optional remote qualifier. Never a stable identity. */
+export function formatWorkspaceDisplayName(
+  path: string,
+  authority: string,
+  includeQualifier = true,
+): string {
+  const basename = path.split('/').filter(Boolean).pop() || path;
+  if (!includeQualifier) return basename;
+  const qualifier = authorityToQualifier(authority);
+  return qualifier ? `${basename} ${qualifier}` : basename;
+}
+
+function cloneWorkspaceIdentity(identity: WorkspaceIdentity): WorkspaceIdentity {
+  return {
+    id: identity.id,
+    uri: {
+      scheme: identity.uri.scheme,
+      authority: identity.uri.authority,
+      path: identity.uri.path,
+    },
+  };
+}
+
+/**
+ * One Runtime.evaluate of vscode.context.configuration().workspace.
+ * Display name is path basename; identity is {id, uri} with no title fallback.
+ */
+export async function extractWorkspaceInfo(
+  client: CdpClient,
+  includeQualifier = true,
+): Promise<ExtractedWorkspaceInfo> {
+  const empty: ExtractedWorkspaceInfo = { name: null, identity: null };
+  try {
+    const raw = await client.evaluate(`
+      (() => {
+        try {
+          const ws = vscode.context.configuration().workspace;
+          if (!ws || !ws.uri) return null;
+          return JSON.stringify({
+            id: ws.id,
+            scheme: ws.uri.scheme,
+            authority: ws.uri.authority || '',
+            path: ws.uri.path || '',
+          });
+        } catch { return null; }
+      })()
+    `, 3000);
+    if (!raw || typeof raw !== 'string') return empty;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return empty;
+    }
+    if (!parsed || typeof parsed !== 'object') return empty;
+    const obj = parsed as { id?: unknown; scheme?: unknown; authority?: unknown; path?: unknown };
+    const path = typeof obj.path === 'string' ? obj.path : '';
+    const authority = typeof obj.authority === 'string' ? obj.authority : '';
+    const name = path ? formatWorkspaceDisplayName(path, authority, includeQualifier) : null;
+    return { name, identity: parseWorkspaceIdentity(obj) };
+  } catch {
+    return empty;
+  }
+}
+
 /**
  * Extract the workspace folder name from a connected Cursor renderer page.
  * Uses vscode.context.configuration().workspace.uri which is available in every
@@ -31,26 +131,8 @@ interface CDPTarget {
  * by the volatile document.title / CDP target title.
  */
 export async function extractWorkspaceName(client: CdpClient, includeQualifier = true): Promise<string | null> {
-  try {
-    const raw = await client.evaluate(`
-      (() => {
-        try {
-          const ws = vscode.context.configuration().workspace;
-          if (!ws || !ws.uri) return null;
-          return JSON.stringify({ path: ws.uri.path, authority: ws.uri.authority || '' });
-        } catch { return null; }
-      })()
-    `, 3000);
-    if (!raw || typeof raw !== 'string') return null;
-    const { path, authority } = JSON.parse(raw) as { path: string; authority: string };
-    if (!path) return null;
-    const basename = path.split('/').filter(Boolean).pop() || path;
-    if (!includeQualifier) return basename;
-    const qualifier = authorityToQualifier(authority);
-    return qualifier ? `${basename} ${qualifier}` : basename;
-  } catch {
-    return null;
-  }
+  const info = await extractWorkspaceInfo(client, includeQualifier);
+  return info.name;
 }
 
 /** Fallback title parsing for non-connected windows (before Runtime.evaluate is available). */
@@ -144,6 +226,8 @@ export class CDPBridge extends EventEmitter {
   private connectGen = 0;
   private _windows: CursorWindow[] = [];
   private _activeWorkspaceName: string | null = null;
+  /** Stable {id, uri} from evaluate; never derived from CDP title. */
+  private _activeWorkspaceIdentity: WorkspaceIdentity | null = null;
   private _verifiedWorkspaceIdentity: string | null = null;
   private _endpointIdentity: EndpointIdentity | null = null;
   private _targetGenerations = new Map<string, number>();
@@ -162,6 +246,12 @@ export class CDPBridge extends EventEmitter {
 
   get windows(): CursorWindow[] {
     return this._windows;
+  }
+
+  getActiveWorkspaceIdentity(): WorkspaceIdentity | null {
+    return this._activeWorkspaceIdentity
+      ? cloneWorkspaceIdentity(this._activeWorkspaceIdentity)
+      : null;
   }
 
   isEndpointVerified(): boolean {
@@ -299,11 +389,15 @@ export class CDPBridge extends EventEmitter {
       const prevGen = this._targetGenerations.get(target.id) ?? 0;
       this._targetGenerations.set(target.id, prevGen + 1);
 
-      this._activeWorkspaceName = await extractWorkspaceName(this.client, this.config.windowTitleQualifier);
+      const extracted = await extractWorkspaceInfo(this.client, this.config.windowTitleQualifier);
       if (gen !== this.connectGen) {
         if (required) throw new Error('CDP connect superseded');
         return;
       }
+      this._activeWorkspaceName = extracted.name;
+      this._activeWorkspaceIdentity = extracted.identity
+        ? cloneWorkspaceIdentity(extracted.identity)
+        : null;
       const titleIdentity = parseCdpTitle(target.title);
       this._verifiedWorkspaceIdentity = isUsableWorkspaceIdentity(this._activeWorkspaceName)
         ? this._activeWorkspaceName
@@ -340,6 +434,8 @@ export class CDPBridge extends EventEmitter {
   async switchWindow(targetId: string): Promise<void> {
     if (targetId === this._activeTargetId && this.isConnected()) return;
 
+    const previousWorkspace = this.getActiveWorkspaceIdentity();
+    this.emit('willSwitchWindow', previousWorkspace);
     this.intentionalDisconnect = true;
     this.cancelReconnect();
     this.reconnectDelay = 1000;
@@ -379,6 +475,7 @@ export class CDPBridge extends EventEmitter {
     this._preferredTargetId = '';
     this._lastConnectedTargetId = '';
     this._activeWorkspaceName = null;
+    this._activeWorkspaceIdentity = null;
     this._verifiedWorkspaceIdentity = null;
   }
 
@@ -514,6 +611,7 @@ export class CDPBridge extends EventEmitter {
   }
 
   private detachClient(): void {
+    this._activeWorkspaceIdentity = null;
     if (!this.client) return;
     this.client.removeAllListeners();
     this.client.disconnect();

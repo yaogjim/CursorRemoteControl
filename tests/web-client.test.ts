@@ -215,6 +215,9 @@ function createTestEnv(opts: {
             json: async () => ({ ok: true, data: opts.discoveryData ?? { revision: 1 } }),
           };
         }
+        if (url.includes('/api/supervision/')) {
+          return { ok: true, status: 200, json: async () => ({ ok: true }) };
+        }
         return { ok: false, status: 404, json: async () => ({ error: 'not found' }) };
       };
 
@@ -263,6 +266,10 @@ function createTestEnv(opts: {
 
 function fireFullState(mockSocket: MockSocket, state: CursorState) {
   mockSocket.fire('state:full', state);
+}
+
+function fireOwnerOverview(mockSocket: MockSocket, grants: unknown[] = []) {
+  mockSocket.fire('supervision:overview', { grants, observedAt: Date.now() });
 }
 
 function firePatch(mockSocket: MockSocket, patch: Partial<CursorState>) {
@@ -370,6 +377,7 @@ describe('web: connection status', () => {
     env.mockSocket.fire('connect');
     assert.equal(send.disabled, true);
 
+    fireOwnerOverview(env.mockSocket);
     fireFullState(env.mockSocket, full);
     assert.equal(send.disabled, false);
   });
@@ -1131,6 +1139,7 @@ describe('web: mode/model pills', () => {
   it('does not auto-run discovery and only POSTs /api/discovery/run from the refresh button', async () => {
     const calls = (env.window as unknown as { __fetchCalls: Array<{ url: string; init?: RequestInit }> }).__fetchCalls;
     env.mockSocket.fire('connect');
+    fireOwnerOverview(env.mockSocket);
     await Promise.resolve();
     await Promise.resolve();
     assert.equal(calls.some((item) => item.url.includes('/api/discovery/run')), false);
@@ -1291,6 +1300,7 @@ describe('web: connection/capability state matrix', () => {
 
     env.mockSocket.connected = true;
     env.mockSocket.fire('connect');
+    fireOwnerOverview(env.mockSocket);
     assert.equal(modePill().disabled, true, 'must stay locked while awaiting capabilities:full');
     assert.equal(modelPill().disabled, true);
     assert.equal(modePill().getAttribute('data-awaiting-full'), 'true');
@@ -1779,6 +1789,7 @@ describe('web: questionnaire widget', () => {
     await Promise.resolve();
     env.mockSocket.connected = true;
     env.mockSocket.fire('connect');
+    fireOwnerOverview(env.mockSocket);
     fireFullState(env.mockSocket, { ...state, questionnaire: null });
     fireFullState(env.mockSocket, state);
 
@@ -2494,6 +2505,7 @@ describe('web: relay command protocol', () => {
     await Promise.resolve();
     env.mockSocket.connected = true;
     env.mockSocket.fire('connect');
+    fireOwnerOverview(env.mockSocket);
     fireState({ inputAvailable: true });
 
     sendComposerText('retry after disconnect');
@@ -2515,6 +2527,7 @@ describe('web: relay command protocol', () => {
     env.mockSocket.fire('command:result', { commandId: first.commandId, ok: true });
     env.mockSocket.connected = true;
     env.mockSocket.fire('connect');
+    fireOwnerOverview(env.mockSocket);
     fireState({ inputAvailable: true });
     const emitCount = commandEmits(env.mockSocket, 'command:send_message').length;
 
@@ -3079,11 +3092,40 @@ describe('web: current-session plan file browsing', () => {
     assert.match(modalBodyText(), /文件修改时间（非批准时间）/);
     assert.match(modalBodyText(), /非持续实时/);
 
+    const basis = env.document.getElementById('plan-task-basis');
+    assert.ok(basis, 'task basis must be visible in the plan modal');
+    assert.match(basis!.textContent || '', /不是完整任务或会话/);
+    assert.match(basis!.textContent || '', /目标：未知（未结构化取得）/);
+    assert.match(basis!.textContent || '', /约束：未知（未结构化取得）/);
+    assert.match(basis!.textContent || '', /验收条件：未知（未结构化取得）/);
+    assert.match(basis!.textContent || '', /关键决策：未知（未结构化取得）/);
+
     const reread = [...env.document.querySelectorAll('#plan-modal-body .plan-btn')]
       .find((btn) => btn.textContent === '重新读取') as HTMLButtonElement;
     assert.ok(reread, 'an explicit re-read button must be present');
     reread.focus();
     assert.equal(env.document.activeElement, reread);
+  });
+
+  it('does not guess goals, constraints, acceptance, or decisions from plan body text', async () => {
+    openPlan([planMsg()]);
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', fullResult(payload, {
+      body: '# Full plan\n\n目标：Ship auth tomorrow\n约束：no secrets\n验收条件：all green\n关键决策：use JWT',
+      bodyHtml: '<h1>Full plan</h1><p>目标：Ship auth tomorrow</p>',
+    }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const basis = env.document.getElementById('plan-task-basis');
+    assert.ok(basis);
+    assert.match(basis!.textContent || '', /目标：未知（未结构化取得）/);
+    assert.match(basis!.textContent || '', /约束：未知（未结构化取得）/);
+    assert.match(basis!.textContent || '', /验收条件：未知（未结构化取得）/);
+    assert.match(basis!.textContent || '', /关键决策：未知（未结构化取得）/);
+    assert.doesNotMatch(basis!.textContent || '', /Ship auth tomorrow/);
+    assert.doesNotMatch(basis!.textContent || '', /use JWT/);
+    assert.doesNotMatch(basis!.textContent || '', /all green/);
   });
 
   it('never shows the body for missing, mismatched, or malformed metadata', async () => {
@@ -3337,6 +3379,37 @@ describe('web: current-session plan file browsing', () => {
     assert.equal(env.document.querySelector('#plan-modal-body .plan-btn-build'), null);
     assert.equal(env.document.querySelector('#plan-modal-body .plan-model-pill'), null);
     assert.doesNotMatch(modalBodyText(), /secret-view/);
+  });
+
+  it('shows structured plan-read failure codes in the modal without a body', async () => {
+    openPlan([planMsg()]);
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:get_plan_full');
+    env.mockSocket.fire('command:result', {
+      commandId: payload.commandId,
+      ok: false,
+      error: '当前会话的计划、目标或读取权限无法确认，请刷新后重试',
+      failure: {
+        code: 'session',
+        stage: 'guard',
+        commandId: payload.commandId,
+        requested: { windowId: 'window-1', composerId: 'composer-1', planId: 'plan1' },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.match(modalBodyText(), /session/);
+    assert.match(modalBodyText(), /守卫/);
+    assert.match(modalBodyText(), /会话不匹配/);
+    assert.ok(modalBodyText().includes(String(payload.commandId)));
+    assert.match(modalBodyText(), /无法确认/);
+    assert.match(modalBodyText(), /window-1/);
+    assert.doesNotMatch(modalBodyText(), /Full plan/);
+    const basis = env.document.getElementById('plan-task-basis');
+    assert.ok(basis);
+    assert.match(basis!.textContent || '', /目标：未知（未结构化取得）/);
+    assert.match(basis!.textContent || '', /未取得计划文件快照/);
+    assert.doesNotMatch(basis!.textContent || '', /依据范围：单次文件快照/);
   });
 
   it('deduplicates current-session plans and shows conservative statuses', () => {
@@ -3732,6 +3805,241 @@ describe('web: on-demand session plan discovery', () => {
     assert.equal(chips().length, 0);
     assert.match(bar().textContent || '', /不代表当前会话没有计划/);
     assert.match(bar().textContent || '', /partial/);
+  });
+
+  it('shows current target identifiers in the Plans bar before scanning', () => {
+    openDiscoveryBar([]);
+    const current = env.document.getElementById('plan-discovery-current-target');
+    assert.ok(current, 'current target must be in session-plans-bar, not a popup');
+    assert.match(current!.textContent || '', /window-1/);
+    assert.match(current!.textContent || '', /composer-1/);
+    assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), true);
+  });
+
+  it('shows result target and scroll-container top boundary, keeping partial', async () => {
+    await runDiscovery([], { reachedStart: true, plans: [] });
+    const resultTarget = env.document.getElementById('plan-discovery-result-target');
+    const meta = env.document.getElementById('plan-discovery-meta')!;
+    assert.ok(resultTarget);
+    assert.match(resultTarget!.textContent || '', /window-1/);
+    assert.match(resultTarget!.textContent || '', /composer-1/);
+    assert.match(meta.textContent || '', /partial/);
+    assert.match(meta.textContent || '', /到当前滚动容器顶部/);
+    assert.doesNotMatch(meta.textContent || '', /会话起点/);
+    assert.match(bar().textContent || '', /不代表当前会话没有计划/);
+    assert.equal(bar().classList.contains('hidden'), false);
+  });
+
+  it('shows structured discovery failure in the Plans bar without opening a popup', async () => {
+    openDiscoveryBar([]);
+    discoveryBtn().click();
+    await Promise.resolve();
+    const payload = lastCommandPayload(env.mockSocket, 'command:discover_plans');
+    env.mockSocket.fire('command:result', {
+      commandId: payload.commandId,
+      ok: false,
+      error: '当前会话的目标或读取权限无法确认，请刷新后重试',
+      failure: {
+        code: 'window',
+        stage: 'guard',
+        commandId: payload.commandId,
+        requested: { windowId: 'window-1', composerId: 'composer-1' },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const err = env.document.getElementById('plan-discovery-error');
+    assert.ok(err, 'failure must render inside session-plans-bar');
+    assert.match(err!.textContent || '', /window/);
+    assert.match(err!.textContent || '', /守卫/);
+    assert.match(err!.textContent || '', /窗口不匹配/);
+    assert.ok((err!.textContent || '').includes(String(payload.commandId)));
+    assert.match(err!.textContent || '', /无法确认/);
+    assert.match(bar().textContent || '', /window-1/);
+    assert.match(bar().textContent || '', /composer-1/);
+    assert.equal(env.document.getElementById('plan-modal-overlay')!.classList.contains('hidden'), true);
+    assert.equal(chips().length, 0);
+  });
+});
+
+describe('web: plan status basis', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  function basisState(overrides: Partial<CursorState> = {}): CursorState {
+    return {
+      ...patchBaseState(),
+      activeWindowId: 'window-1',
+      activeComposerId: 'composer-1',
+      lastExtractionAt: Date.now(),
+      extractorStatus: 'ok',
+      connected: true,
+      agentStatus: 'idle',
+      agentActivityText: null,
+      agentActivityLive: false,
+      agentActivitySource: 'none',
+      ...overrides,
+    };
+  }
+
+  function openPlans(state: CursorState = basisState()) {
+    fireFullState(env.mockSocket, state);
+    const toggle = env.document.getElementById('session-plans-toggle') as HTMLButtonElement;
+    toggle.click();
+    return env.document.getElementById('plan-status-basis');
+  }
+
+  function basisText() {
+    return env.document.getElementById('plan-status-basis')?.textContent || '';
+  }
+
+  function planCard() {
+    return {
+      type: 'plan' as const,
+      id: 'plan1',
+      flatIndex: 0,
+      label: 'auth.plan.md',
+      title: 'Auth',
+      todosCompleted: 0,
+      todosTotal: 0,
+    };
+  }
+
+  it('shows idle as an interface signal, not completion proof', () => {
+    const basis = openPlans();
+    assert.ok(basis, 'status basis must be visible in the Plans expand area');
+    const text = basis!.textContent || '';
+    assert.match(text, /连接：/);
+    assert.match(text, /提取：ok/);
+    assert.match(text, /界面 agentStatus：idle/);
+    assert.match(text, /活动信号：无活动/);
+    assert.match(text, /活动信号来源：none/);
+    assert.match(text, /Idle不是完成证明/);
+    assert.match(text, /任务完成：未知（未核对验收证据）/);
+    assert.match(text, /监督者主动检查：未启用/);
+    assert.match(text, /最近成功观察时间：/);
+    assert.match(text, /抽取时间，不是任务进展时间/);
+    assert.doesNotMatch(text, /最近进展时间/);
+    assert.doesNotMatch(text, /内容变化时间/);
+    assert.equal(commandEmits(env.mockSocket).length, 0);
+  });
+
+  it('marks observation older than 15s as expired even when Connected', () => {
+    const basis = openPlans(basisState({ lastExtractionAt: Date.now() - 16_000 }));
+    assert.ok(basis);
+    const text = basis!.textContent || '';
+    assert.match(text, /依据过期/);
+    assert.match(text, /依据过期不代表服务端停止提取/);
+    assert.match(env.document.getElementById('connection-text')!.textContent || '', /Connected/i);
+    assert.doesNotMatch(text, /最近进展时间/);
+    assert.doesNotMatch(text, /内容变化时间/);
+  });
+
+  it('marks a missing successful observation as missing basis', () => {
+    const basis = openPlans(basisState({ lastExtractionAt: null }));
+    assert.ok(basis);
+    assert.match(basis!.textContent || '', /依据缺失/);
+    assert.match(basis!.textContent || '', /最近成功观察时间：未知/);
+  });
+
+  it('marks extraction failure without leaking the raw extractor error', () => {
+    const secret = 'Runtime.evaluate exploded with secret=/tmp/secret.key';
+    const basis = openPlans(basisState({
+      extractorStatus: 'stale',
+      lastExtractionError: secret,
+      consecutiveExtractionFailures: 4,
+    }));
+    assert.ok(basis);
+    const text = basis!.textContent || '';
+    assert.match(text, /提取失败|依据缺失/);
+    assert.doesNotMatch(text, /secret\.key/);
+    assert.doesNotMatch(text, /Runtime\.evaluate exploded/);
+    assert.doesNotMatch(env.document.getElementById('session-plans-bar')!.textContent || '', /secret\.key/);
+  });
+
+  it('distinguishes no activity from a live shimmer activity source', () => {
+    const basis = openPlans(basisState({
+      agentStatus: 'idle',
+      agentActivityLive: false,
+      agentActivitySource: 'none',
+    }));
+    assert.ok(basis);
+    assert.match(basis!.textContent || '', /活动信号：无活动/);
+    assert.match(basis!.textContent || '', /活动信号来源：none/);
+    assert.match(basis!.textContent || '', /界面 agentStatus：idle/);
+    assert.equal(commandEmits(env.mockSocket).length, 0);
+
+    firePatch(env.mockSocket, {
+      agentStatus: 'thinking',
+      agentActivityLive: true,
+      agentActivitySource: 'shimmer',
+      agentActivityText: 'Planning next moves',
+    });
+    const liveText = basisText();
+    assert.match(liveText, /活动信号：有活动/);
+    assert.match(liveText, /活动信号来源：shimmer/);
+    assert.match(liveText, /界面 agentStatus：thinking/);
+    assert.doesNotMatch(liveText, /Planning next moves/);
+    assert.match(liveText, /Idle不是完成证明/);
+    assert.match(liveText, /任务完成：未知（未核对验收证据）/);
+    assert.equal(commandEmits(env.mockSocket).length, 0);
+  });
+
+  it('does not treat idle or waiting extractor as extraction failure', () => {
+    const basis = openPlans(basisState({
+      connected: false,
+      extractorStatus: 'idle',
+      lastExtractionAt: null,
+      messages: [planCard()],
+    }));
+    assert.ok(basis);
+    let text = basis!.textContent || '';
+    assert.match(text, /提取：idle/);
+    assert.match(text, /界面 agentStatus：idle/);
+    assert.doesNotMatch(text, /提取失败/);
+    assert.match(text, /依据缺失/);
+
+    firePatch(env.mockSocket, { connected: true, extractorStatus: 'waiting' });
+    text = basisText();
+    assert.match(text, /提取：waiting/);
+    assert.doesNotMatch(text, /提取失败/);
+    assert.match(text, /依据缺失/);
+  });
+
+  it('syncs CDP and relay socket changes into an open status basis', () => {
+    const basis = openPlans(basisState({ messages: [planCard()] }));
+    assert.ok(basis);
+    assert.match(basis!.textContent || '', /relay connected · CDP connected/);
+
+    env.mockSocket.fire('connection:status', { connected: false });
+    let text = basisText();
+    assert.match(text, /CDP disconnected/);
+    assert.match(text, /依据过期/);
+
+    env.mockSocket.connected = false;
+    env.mockSocket.fire('disconnect', 'transport close');
+    text = basisText();
+    assert.match(text, /relay reconnecting/);
+
+    env.mockSocket.fire('reconnect_failed');
+    text = basisText();
+    assert.match(text, /relay disconnected/);
+  });
+
+  it('refreshes an open basis from fresh to expired after 15s without a patch', async () => {
+    const basis = openPlans(basisState({ lastExtractionAt: Date.now() - 14_000 }));
+    assert.ok(basis);
+    assert.match(basis!.textContent || '', /观察新鲜/);
+    assert.match(env.document.getElementById('connection-text')!.textContent || '', /Connected/i);
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const text = basisText();
+    assert.match(text, /依据过期/);
+    assert.match(env.document.getElementById('connection-text')!.textContent || '', /Connected/i);
+    assert.equal(commandEmits(env.mockSocket).length, 0);
   });
 });
 
@@ -4360,5 +4668,281 @@ describe('web: viewport and CSS contracts', () => {
     const html = readFileSync(HTML_PATH, 'utf-8');
     assert.doesNotMatch(html, /user-scalable\s*=\s*no/i);
     assert.doesNotMatch(html, /maximum-scale\s*=\s*1/);
+  });
+});
+
+describe('web: supervision safety loop', () => {
+  let env: ReturnType<typeof createTestEnv>;
+
+  beforeEach(() => {
+    env = createTestEnv();
+  });
+
+  function grant(overrides: Record<string, unknown> = {}) {
+    return {
+      grantId: 'grant-1',
+      goal: 'Ship the fix',
+      planVersion: 'plan-v1',
+      authorizationVersion: 'auth-v1',
+      controlVersion: 'ctrl-v1',
+      operationsUsed: 1,
+      operationLimit: 10,
+      status: 'active',
+      pauseReasons: [],
+      writeComposerIds: ['composer-1'],
+      ...overrides,
+    };
+  }
+
+  function supervisorSnapshot(overrides: Record<string, unknown> = {}) {
+    return {
+      grant: grant(),
+      issues: [],
+      checks: [],
+      operations: [],
+      workspaceMatches: true,
+      observedAt: Date.now(),
+      ...overrides,
+    };
+  }
+
+  function readyState(overrides: Partial<CursorState> = {}): CursorState {
+    return {
+      ...patchBaseState(),
+      inputAvailable: true,
+      activeComposerId: 'composer-1',
+      activeWindowId: 'win-1',
+      windows: [
+        { id: 'win-1', title: 'Main', url: 'http://localhost' },
+        { id: 'win-2', title: 'Other', url: 'http://localhost/other' },
+      ],
+      chatTabs: [{ composerId: 'composer-1', title: 'Chat 1', isActive: true, isOpen: true, status: 'idle', selectorPath: '' }],
+      ...overrides,
+    };
+  }
+
+  function sendComposerText(text: string) {
+    const input = env.document.getElementById('message-input') as HTMLTextAreaElement;
+    input.value = text;
+    input.dispatchEvent(new env.window.Event('input', { bubbles: true }));
+    (env.document.getElementById('btn-send') as HTMLButtonElement).click();
+  }
+
+  it('does not lock a confirmed owner after supervision:overview', () => {
+    fireFullState(env.mockSocket, readyState());
+    fireOwnerOverview(env.mockSocket, []);
+    const send = env.document.getElementById('btn-send') as HTMLButtonElement;
+    const input = env.document.getElementById('message-input') as HTMLTextAreaElement;
+    input.value = 'owner still writes';
+    input.dispatchEvent(new env.window.Event('input', { bubbles: true }));
+    assert.equal(send.disabled, false);
+    send.click();
+    const payload = lastCommandPayload(env.mockSocket, 'command:send_message');
+    assert.equal(payload.text, 'owner still writes');
+  });
+
+  it('locks cursor writes after connect until supervision context is confirmed', () => {
+    fireFullState(env.mockSocket, readyState());
+    const input = env.document.getElementById('message-input') as HTMLTextAreaElement;
+    input.value = 'pending context';
+    input.dispatchEvent(new env.window.Event('input', { bubbles: true }));
+    assert.equal((env.document.getElementById('btn-send') as HTMLButtonElement).disabled, false);
+
+    env.mockSocket.emitted.length = 0;
+    env.mockSocket.fire('connect');
+    fireFullState(env.mockSocket, readyState());
+    assert.equal((env.document.getElementById('btn-send') as HTMLButtonElement).disabled, true);
+    sendComposerText('pending context');
+    assert.equal(commandEmits(env.mockSocket, 'command:send_message').length, 0);
+
+    fireOwnerOverview(env.mockSocket, []);
+    assert.equal((env.document.getElementById('btn-send') as HTMLButtonElement).disabled, false);
+    sendComposerText('pending context');
+    assert.equal(lastCommandPayload(env.mockSocket, 'command:send_message').text, 'pending context');
+  });
+
+  it('locks supervisor writes while the grant is paused', () => {
+    fireFullState(env.mockSocket, readyState());
+    env.mockSocket.fire('supervision:state', supervisorSnapshot({
+      grant: grant({ pauseReasons: ['human_takeover'] }),
+    }));
+    env.mockSocket.emitted.length = 0;
+    sendComposerText('paused');
+    assert.equal(commandEmits(env.mockSocket, 'command:send_message').length, 0);
+    assert.equal((env.document.getElementById('btn-send') as HTMLButtonElement).disabled, true);
+  });
+
+  it('clears and hides the supervision panel on disconnect', () => {
+    fireFullState(env.mockSocket, readyState());
+    env.mockSocket.fire('supervision:state', supervisorSnapshot({
+      checks: [{ checkId: 'c1', checkedAt: Date.now(), status: 'ok', summary: 'looks fine' }],
+      operations: [{ operationId: 'op-1', status: 'confirmed' }],
+    }));
+    const panel = env.document.getElementById('supervision-panel')!;
+    assert.equal(panel.classList.contains('hidden'), false);
+    assert.match(env.document.getElementById('supervision-summary')!.textContent || '', /Ship the fix/);
+    assert.match(env.document.getElementById('supervision-checks')!.textContent || '', /looks fine/);
+
+    env.mockSocket.connected = false;
+    env.mockSocket.fire('disconnect');
+    assert.equal(panel.classList.contains('hidden'), true);
+    assert.equal(env.document.getElementById('supervision-summary')!.textContent, '');
+    assert.equal(env.document.getElementById('supervision-issues')!.textContent, '');
+    assert.equal(env.document.getElementById('supervision-checks')!.textContent, '');
+    assert.equal(env.document.getElementById('supervision-operations')!.textContent, '');
+    const css = readFileSync(STYLES_PATH, 'utf-8');
+    assert.match(css, /\.supervision-panel\.hidden\s*\{/);
+  });
+
+  it('attaches grant versions and a matching issue to dangerous commands', async () => {
+    fireFullState(env.mockSocket, readyState());
+    env.mockSocket.fire('supervision:state', supervisorSnapshot({
+      issues: [{
+        issueId: 'issue-send',
+        status: 'pending',
+        decision: 'approved',
+        composerId: 'composer-1',
+        actionType: 'send_message',
+        actionId: 'act-send',
+        contentDigest: 'digest-send',
+      }],
+    }));
+    sendComposerText('supervised hello');
+    const payload = lastCommandPayload(env.mockSocket, 'command:send_message');
+    assert.equal(payload.planVersion, 'plan-v1');
+    assert.equal(payload.authorizationVersion, 'auth-v1');
+    assert.equal(payload.controlVersion, 'ctrl-v1');
+    assert.equal(payload.issueId, 'issue-send');
+    assert.equal(payload.actionId, 'act-send');
+    assert.equal(payload.contentDigest, 'digest-send');
+    assert.equal(payload.composerId, 'composer-1');
+  });
+
+  it('does not unlock unmatched writes from an approved issue of another action', () => {
+    fireFullState(env.mockSocket, readyState({
+      messages: [{
+        type: 'tool',
+        id: 'fetch1',
+        flatIndex: 0,
+        toolCallId: 'tc-fetch',
+        status: 'loading',
+        action: 'Fetch',
+        details: 'https://example.com',
+        actions: [
+          { label: 'Run', type: 'run', actionId: 'act_run' },
+          { label: 'Skip', type: 'skip', actionId: 'act_skip' },
+        ],
+      }],
+    }));
+    env.mockSocket.fire('supervision:state', supervisorSnapshot({
+      grant: grant({ pauseReasons: ['pending_issue'] }),
+      issues: [{
+        issueId: 'issue-run',
+        status: 'pending',
+        decision: 'approved',
+        composerId: 'composer-1',
+        actionType: 'run',
+        actionId: 'act_run',
+        contentDigest: 'digest-run',
+      }],
+    }));
+
+    env.mockSocket.emitted.length = 0;
+    sendComposerText('should stay locked');
+    assert.equal(commandEmits(env.mockSocket, 'command:send_message').length, 0);
+    assert.equal((env.document.getElementById('btn-send') as HTMLButtonElement).disabled, true);
+
+    const skip = [...env.document.querySelectorAll('.run-btn')].find((btn) => btn.textContent === 'Skip') as HTMLButtonElement;
+    const run = [...env.document.querySelectorAll('.run-btn')].find((btn) => btn.textContent === 'Run') as HTMLButtonElement;
+    assert.equal(skip.disabled, true);
+    skip.click();
+    assert.equal(commandEmits(env.mockSocket, 'command:click_action').length, 0);
+
+    assert.equal(run.disabled, false);
+    run.click();
+    const payload = lastCommandPayload(env.mockSocket, 'command:click_action');
+    assert.equal(payload.actionType, 'run');
+    assert.equal(payload.actionId, 'act_run');
+    assert.equal(payload.issueId, 'issue-run');
+    assert.equal(payload.contentDigest, 'digest-run');
+  });
+
+  it('does not emit supervisor new chat, tab, or window commands', () => {
+    fireFullState(env.mockSocket, readyState());
+    (env.document.getElementById('context-main') as HTMLButtonElement).click();
+    assert.equal(env.document.getElementById('drawer')!.classList.contains('hidden'), false);
+
+    env.mockSocket.fire('supervision:state', supervisorSnapshot());
+    env.mockSocket.emitted.length = 0;
+    (env.document.getElementById('btn-new-chat') as HTMLButtonElement).click();
+    const switchWin = env.document.querySelector('.window-head') as HTMLButtonElement | null;
+    switchWin?.click();
+    const switchTab = env.document.querySelector('.session-row') as HTMLButtonElement | null;
+    switchTab?.click();
+    assert.equal(commandEmits(env.mockSocket, 'command:new_chat').length, 0);
+    assert.equal(commandEmits(env.mockSocket, 'command:switch_window').length, 0);
+    assert.equal(commandEmits(env.mockSocket, 'command:switch_tab').length, 0);
+  });
+
+  it('shows Check/Request only for supervisors and hides them for owners', () => {
+    fireFullState(env.mockSocket, readyState({
+      pendingApprovals: [{
+        id: 'appr-1',
+        description: 'Allow network',
+        actions: [
+          { label: 'Accept', type: 'approve', actionId: 'act_approve' },
+          { label: 'Reject', type: 'reject', actionId: 'act_reject' },
+        ],
+      }],
+    }));
+    fireOwnerOverview(env.mockSocket, [{ grant: grant(), issues: [], checks: [], operations: [] }]);
+    const check = env.document.getElementById('btn-supervision-check') as HTMLButtonElement;
+    const request = env.document.getElementById('btn-supervision-request') as HTMLButtonElement;
+    assert.equal(check.classList.contains('hidden'), true);
+    assert.equal(request.classList.contains('hidden'), true);
+
+    env.mockSocket.fire('supervision:state', supervisorSnapshot());
+    assert.equal(check.classList.contains('hidden'), false);
+    assert.equal(request.classList.contains('hidden'), false);
+    assert.equal(check.disabled, false);
+    assert.equal(request.disabled, false);
+  });
+
+  it('lets an owner resume a pending_recovery grant', async () => {
+    fireFullState(env.mockSocket, readyState());
+    fireOwnerOverview(env.mockSocket, [{
+      grant: grant({ status: 'pending_recovery', pauseReasons: ['pending_recovery'] }),
+      issues: [],
+      checks: [],
+      operations: [],
+    }]);
+    const resume = env.document.querySelector('#supervision-owner-actions button') as HTMLButtonElement;
+    assert.ok(resume);
+    assert.equal(resume.textContent, 'Resume recovery');
+    resume.click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const calls = (env.window as unknown as { __fetchCalls: Array<{ url: string; init?: RequestInit }> }).__fetchCalls;
+    const posted = calls.filter((item) => item.url.includes('/api/supervision/grants/grant-1/resume-recovery'));
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].init?.method, 'POST');
+  });
+
+  it('lets an owner explicitly resume supervision after human takeover', async () => {
+    fireFullState(env.mockSocket, readyState());
+    fireOwnerOverview(env.mockSocket, [{
+      grant: grant({ status: 'active', pauseReasons: ['human_takeover'] }),
+      issues: [],
+      checks: [],
+      operations: [],
+    }]);
+    const resume = env.document.querySelector('#supervision-owner-actions button') as HTMLButtonElement;
+    assert.ok(resume);
+    assert.equal(resume.textContent, 'Resume supervision');
+    resume.click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const calls = (env.window as unknown as { __fetchCalls: Array<{ url: string; init?: RequestInit }> }).__fetchCalls;
+    const posted = calls.filter((item) => item.url.includes('/api/supervision/grants/grant-1/resume-supervision'));
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].init?.method, 'POST');
   });
 });

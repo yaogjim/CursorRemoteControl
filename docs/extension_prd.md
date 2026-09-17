@@ -85,6 +85,8 @@
 2. **HTTP 轮询** — 每 5 秒 `GET /health` 获取状态数据
 3. **stdout/stderr 解析** — 日志行管道到 LogOutputChannel
 
+详细健康响应额外提供进程级 `version`、`instanceId`、`startedAt`、`build` 和当前 `activeComposerId`，供核对运行实例而不是仅凭已安装版本判断。`build.scope = 'bundle'` 时摘要是启动时服务器 `bundle.mjs` 文件的 SHA-256，不包含独立客户端资源或选择器，也不是整个发布包的标识；源码或多文件编译运行时返回 `scope: 'unavailable', digest: null`，不以 Git HEAD 代替构建证据。身份在进程内保持固定，响应不带本机文件路径。现有详细健康访问边界不变：未鉴权的非回环客户端仍只收到最小健康响应。本批不改变服务启停、升级或观察者接管策略。
+
 服务器及其全部 Node.js 依赖通过 esbuild 打成单个 ESM 文件（`dist/server/bundle.mjs`）。扩展自身打成 `dist/extension.cjs`（CJS 格式，external: `vscode`）。
 
 ### 3.1 单例服务器模式

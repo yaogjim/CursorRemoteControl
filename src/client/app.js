@@ -198,6 +198,9 @@
   function bootstrap() {
 
   let state = { ...defaultState };
+  let supervisionState = null;
+  let supervisionOverview = null;
+  let supervisionContextPending = false;
   let capabilityState = null;
   let capabilityDiff = null;
   let adapterHistory = { activeBindings: {}, adapters: [], history: [] };
@@ -217,6 +220,7 @@
   let discoveredPlanNonce = '';
   let discoveredPlanSeq = 0;
   let discoveredPlanExpiryTimer = 0;
+  let planStatusBasisExpiryTimer = 0;
   let discoveredPlanScanInFlight = false;
   let discoveredPlanError = '';
   let discoveredPlanNotice = '';
@@ -275,6 +279,15 @@
   const $input = document.getElementById('message-input');
   const $btnSend = document.getElementById('btn-send');
   const $toastContainer = document.getElementById('toast-container');
+  const $supervisionPanel = document.getElementById('supervision-panel');
+  const $supervisionStatus = document.getElementById('supervision-status');
+  const $supervisionSummary = document.getElementById('supervision-summary');
+  const $btnSupervisionCheck = document.getElementById('btn-supervision-check');
+  const $btnSupervisionRequest = document.getElementById('btn-supervision-request');
+  const $supervisionIssues = document.getElementById('supervision-issues');
+  const $supervisionChecks = document.getElementById('supervision-checks');
+  const $supervisionOperations = document.getElementById('supervision-operations');
+  const $supervisionOwnerActions = document.getElementById('supervision-owner-actions');
 
   const $contextBar = document.getElementById('context-bar');
   const $contextMain = document.getElementById('context-main');
@@ -511,6 +524,9 @@
   let rejectInFlight = false;
   let rejectEnvelope = null;
   let qActionInFlight = false;
+  let capabilityDiscoveryInFlight = false;
+  let supervisionPostInFlight = false;
+  const mutationSubmitInFlight = new Set();
   const qEnvelopes = new Map();
   const genericActionInFlight = new Set();
   const genericActionEnvelopes = new Map();
@@ -523,6 +539,7 @@
     'send_message',
     'approve',
     'approve_all',
+    'reject',
     'new_chat',
     'set_mode',
     'set_model',
@@ -537,6 +554,24 @@
     'continue',
     'skip',
     'questionnaire_option',
+  ]);
+
+  const SUPERVISED_WRITE_ROUTES = new Set([
+    'send_message',
+    'approve',
+    'approve_all',
+    'reject',
+    'set_mode',
+    'set_model',
+    'set_plan_model',
+    'click_action',
+  ]);
+  const SUPERVISOR_DENIED_ROUTES = new Set([
+    'new_chat',
+    'switch_tab',
+    'switch_window',
+    'get_model_options',
+    'get_plan_model_options',
   ]);
 
   function socketRoute(eventName) {
@@ -557,6 +592,22 @@
     if (commandRequiresOperationId(eventName, body)) {
       if (typeof body.operationId !== 'string' || body.operationId.length === 0) {
         body.operationId = newOperationId();
+      }
+    }
+    const route = socketRoute(eventName);
+    const grant = supervisionState && supervisionState.grant;
+    if (grant && SUPERVISED_WRITE_ROUTES.has(route)) {
+      body.composerId = body.composerId || state.activeComposerId;
+      body.windowId = body.windowId || state.activeWindowId;
+      body.planVersion = grant.planVersion;
+      body.authorizationVersion = grant.authorizationVersion;
+      body.controlVersion = grant.controlVersion;
+      const actionType = route === 'click_action' ? body.actionType : route;
+      const approvedIssue = findMatchingApprovedIssue(body.composerId, actionType, body.actionId);
+      if (approvedIssue) {
+        body.issueId = approvedIssue.issueId;
+        if (!body.actionId && approvedIssue.actionId) body.actionId = approvedIssue.actionId;
+        body.contentDigest = approvedIssue.contentDigest;
       }
     }
     return body;
@@ -592,6 +643,8 @@
   }
 
   function emitCommand(eventName, payload) {
+    const blocked = cursorMutationBlockedReason(eventName, payload);
+    if (blocked) return null;
     const body = withCommandEnvelope(eventName, payload);
     socket.emit(eventName, body);
     return body;
@@ -621,6 +674,15 @@
    */
   function sendCommandAwaitResult(eventName, payload) {
     return new Promise((resolve) => {
+      const blocked = cursorMutationBlockedReason(eventName, payload);
+      if (blocked) {
+        resolve({
+          commandId: payload && payload.commandId,
+          ok: false,
+          error: blocked,
+        });
+        return;
+      }
       const body = withCommandEnvelope(eventName, payload);
       const commandId = body.commandId;
       const lateResult = lateCommandResults.get(commandId);
@@ -824,8 +886,12 @@
   }
 
   async function runCapabilityDiscovery() {
-    if (($btnCapabilityRefresh && $btnCapabilityRefresh.disabled)
-      || ($btnModeModelRefresh && $btnModeModelRefresh.disabled)) return;
+    if (capabilityDiscoveryInFlight) return;
+    if (supervisionContextPending || supervisionState) {
+      showToast('Capability discovery is outside this supervision grant', 'error');
+      return;
+    }
+    capabilityDiscoveryInFlight = true;
     setCapabilityRefreshBusy(true);
     setCapabilityRefreshStatus('Refreshing Cursor capabilities… this may open and close menus.');
     try {
@@ -857,7 +923,9 @@
     } catch {
       setCapabilityRefreshStatus('Capability refresh failed', true);
     } finally {
+      capabilityDiscoveryInFlight = false;
       setCapabilityRefreshBusy(false);
+      applySupervisionChrome();
     }
   }
 
@@ -950,6 +1018,7 @@
     renderMessages();
     renderApprovals();
     renderQuestionnaire();
+    renderSessionPlans();
   }
 
   window.addEventListener('online', tryReconnectSocket);
@@ -960,6 +1029,10 @@
   socket.on('connect', () => {
     socketPhase = 'connected';
     stateSnapshotFresh = false;
+    supervisionContextPending = true;
+    supervisionState = null;
+    supervisionOverview = null;
+    renderSupervision();
     if (!startupTiming.socketConnectedAt) startupTiming.socketConnectedAt = startupNow();
     capabilityLive = true;
     awaitingCapabilityFull = true;
@@ -973,6 +1046,10 @@
   socket.on('disconnect', (reason) => {
     socketPhase = reason === 'io client disconnect' ? 'disconnected' : 'reconnecting';
     stateSnapshotFresh = false;
+    supervisionContextPending = true;
+    supervisionState = null;
+    supervisionOverview = null;
+    renderSupervision();
     clearQuestionnaireSyncWait();
     clearStateFullWatchdog();
     failPendingCommands('Disconnected from relay');
@@ -1040,6 +1117,315 @@
     }
     applyStatePatch(patch);
   });
+
+  socket.on('supervision:state', (snapshot) => {
+    supervisionContextPending = false;
+    supervisionState = snapshot && typeof snapshot === 'object' ? snapshot : null;
+    supervisionOverview = null;
+    renderSupervision();
+    renderModeModel();
+    refreshInteractiveUi();
+  });
+
+  socket.on('supervision:overview', (overview) => {
+    supervisionContextPending = false;
+    supervisionOverview = overview && typeof overview === 'object' ? overview : null;
+    if (!supervisionState) {
+      renderSupervision();
+      renderModeModel();
+      refreshInteractiveUi();
+    }
+  });
+
+  async function postSupervision(path, body) {
+    const csrf = await getCsrfToken();
+    return fetch(path, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: Object.assign({ 'Content-Type': 'application/json', 'X-CSRF-Token': csrf }, getAuthHeaders()),
+      body: JSON.stringify(body || {}),
+    });
+  }
+
+  async function decideSupervisionIssue(issueId, decision) {
+    if (supervisionPostInFlight) return;
+    if (supervisionState) return;
+    supervisionPostInFlight = true;
+    try {
+      const res = await postSupervision(
+        '/api/supervision/issues/' + encodeURIComponent(issueId) + '/decision',
+        { decision: decision },
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        showToast(body.error || 'Decision was rejected', 'error');
+      }
+    } finally {
+      supervisionPostInFlight = false;
+    }
+  }
+
+  function currentIssueCandidate() {
+    const approval = Array.isArray(state.pendingApprovals) ? state.pendingApprovals[0] : null;
+    if (approval && Array.isArray(approval.actions)) {
+      const action = approval.actions.find((item) => item && hasOpaqueActionId(item.actionId));
+      if (action) return {
+        actionType: action.type,
+        actionId: action.actionId,
+        evidence: approval.description || action.label || 'Current approval requires a human decision',
+      };
+    }
+    const messages = Array.isArray(state.messages) ? state.messages.slice().reverse() : [];
+    for (const message of messages) {
+      const action = Array.isArray(message.actions)
+        ? message.actions.find((item) => item && hasOpaqueActionId(item.actionId) && DANGEROUS_ACTION_TYPES.has(item.type))
+        : null;
+      if (action) return {
+        actionType: action.type,
+        actionId: action.actionId,
+        evidence: action.label || 'Current Cursor action requires a human decision',
+      };
+    }
+    return null;
+  }
+
+  async function recordSupervisionCheck() {
+    if (supervisionPostInFlight) return;
+    if (!supervisionState || !supervisionState.grant) return;
+    supervisionPostInFlight = true;
+    try {
+      const status = state.connected && state.extractorStatus === 'ok' ? 'ok' : 'attention';
+      const res = await postSupervision('/api/supervision/checks', {
+        status: status,
+        summary: 'Browser check of connection, extraction, target and visible task state',
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        showToast(body.error || 'Active check was rejected', 'error');
+      }
+    } finally {
+      supervisionPostInFlight = false;
+    }
+  }
+
+  async function requestCurrentIssueDecision() {
+    if (supervisionPostInFlight) return;
+    const grant = supervisionState && supervisionState.grant;
+    const candidate = currentIssueCandidate();
+    if (!grant || !candidate) {
+      showToast('No current authorized action is available for a decision request', 'error');
+      return;
+    }
+    supervisionPostInFlight = true;
+    try {
+      const res = await postSupervision('/api/supervision/issues', {
+        composerId: state.activeComposerId,
+        actionType: candidate.actionType,
+        actionId: candidate.actionId,
+        planVersion: grant.planVersion,
+        authorizationVersion: grant.authorizationVersion,
+        contentDigest: candidate.actionId,
+        expiresAt: Date.now() + 10 * 60 * 1000,
+        evidence: candidate.evidence,
+        recommendation: 'Review the visible Cursor action and approve or reject this issue only.',
+        attemptedActions: [],
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        showToast(body.error || 'Decision request was rejected', 'error');
+      }
+    } finally {
+      supervisionPostInFlight = false;
+    }
+  }
+
+  async function resumeSupervisionRecovery(grantId) {
+    if (supervisionPostInFlight) return;
+    if (supervisionState || !grantId) return;
+    supervisionPostInFlight = true;
+    try {
+      const res = await postSupervision(
+        '/api/supervision/grants/' + encodeURIComponent(grantId) + '/resume-recovery',
+        {},
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        showToast(body.error || 'Resume recovery was rejected', 'error');
+      }
+    } finally {
+      supervisionPostInFlight = false;
+    }
+  }
+
+  async function resumeSupervisionAfterTakeover(grantId) {
+    if (supervisionPostInFlight) return;
+    if (supervisionState || !grantId) return;
+    supervisionPostInFlight = true;
+    try {
+      const res = await postSupervision(
+        '/api/supervision/grants/' + encodeURIComponent(grantId) + '/resume-supervision',
+        {},
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        showToast(body.error || 'Resume supervision was rejected', 'error');
+      }
+    } finally {
+      supervisionPostInFlight = false;
+    }
+  }
+
+  if ($btnSupervisionCheck) {
+    $btnSupervisionCheck.addEventListener('click', () => { void recordSupervisionCheck(); });
+  }
+  if ($btnSupervisionRequest) {
+    $btnSupervisionRequest.addEventListener('click', () => { void requestCurrentIssueDecision(); });
+  }
+
+  function clearSupervisionPanelContent() {
+    if ($supervisionStatus) $supervisionStatus.textContent = '';
+    if ($supervisionSummary) $supervisionSummary.textContent = '';
+    if ($supervisionIssues) $supervisionIssues.textContent = '';
+    if ($supervisionChecks) $supervisionChecks.textContent = '';
+    if ($supervisionOperations) $supervisionOperations.textContent = '';
+    if ($supervisionOwnerActions) $supervisionOwnerActions.textContent = '';
+    if ($btnSupervisionCheck) {
+      $btnSupervisionCheck.classList.add('hidden');
+      $btnSupervisionCheck.disabled = true;
+    }
+    if ($btnSupervisionRequest) {
+      $btnSupervisionRequest.classList.add('hidden');
+      $btnSupervisionRequest.disabled = true;
+    }
+  }
+
+  function applySupervisionChrome() {
+    const blockedNav = supervisionContextPending || !!supervisionState;
+    if ($btnNewChat) {
+      $btnNewChat.disabled = blockedNav;
+      $btnNewChat.title = supervisionContextPending
+        ? 'Waiting to confirm supervision context.'
+        : (supervisionState ? 'New chat is outside this supervision grant' : '');
+    }
+    if ($btnCapabilityRefresh && !capabilityDiscoveryInFlight) {
+      $btnCapabilityRefresh.disabled = blockedNav;
+      $btnCapabilityRefresh.title = blockedNav
+        ? 'Capability discovery is outside this supervision grant'
+        : 'Opens Cursor mode and model menus to rediscover capabilities. Never runs automatically.';
+    }
+    if ($btnModeModelRefresh && !capabilityDiscoveryInFlight) {
+      $btnModeModelRefresh.disabled = blockedNav;
+    }
+  }
+
+  function renderSupervision() {
+    if (!$supervisionPanel) return;
+    const ownerSnapshots = supervisionOverview && Array.isArray(supervisionOverview.grants)
+      ? supervisionOverview.grants
+      : [];
+    const snapshots = supervisionState ? [supervisionState] : ownerSnapshots;
+    if (snapshots.length === 0) {
+      $supervisionPanel.classList.add('hidden');
+      clearSupervisionPanelContent();
+      applySupervisionChrome();
+      return;
+    }
+    $supervisionPanel.classList.remove('hidden');
+    const grants = snapshots.map((snapshot) => snapshot && snapshot.grant).filter(Boolean);
+    const paused = grants.filter((grant) => grant.status !== 'active' || (grant.pauseReasons || []).length > 0);
+    $supervisionStatus.textContent = paused.length > 0 ? 'Paused or awaiting recovery' : 'Active';
+    $supervisionSummary.textContent = grants.map((grant) => {
+      const reasons = Array.isArray(grant.pauseReasons) && grant.pauseReasons.length > 0
+        ? ' · pauses: ' + grant.pauseReasons.join(', ')
+        : '';
+      return grant.goal + ' · plan ' + grant.planVersion + ' · authorization ' + grant.authorizationVersion
+        + ' · operations ' + grant.operationsUsed + '/' + grant.operationLimit + reasons;
+    }).join(' | ');
+
+    const isSupervisor = !!supervisionState;
+    const grant = supervisionState && supervisionState.grant;
+    if ($btnSupervisionCheck) {
+      $btnSupervisionCheck.classList.toggle('hidden', !isSupervisor);
+      $btnSupervisionCheck.disabled = !isSupervisor || !grant;
+    }
+    if ($btnSupervisionRequest) {
+      const canRequest = isSupervisor && !!grant && !!currentIssueCandidate();
+      $btnSupervisionRequest.classList.toggle('hidden', !isSupervisor);
+      $btnSupervisionRequest.disabled = !canRequest;
+    }
+
+    if ($supervisionOwnerActions) {
+      $supervisionOwnerActions.textContent = '';
+      if (!isSupervisor) {
+        grants.forEach((item) => {
+          if (!item) return;
+          if (item.status === 'pending_recovery') {
+            const resume = document.createElement('button');
+            resume.type = 'button';
+            resume.textContent = 'Resume recovery';
+            resume.setAttribute('aria-label', 'Resume recovery for grant ' + item.grantId);
+            resume.dataset.grantId = item.grantId;
+            resume.addEventListener('click', () => { void resumeSupervisionRecovery(item.grantId); });
+            $supervisionOwnerActions.appendChild(resume);
+          }
+          if (item.status === 'active' && Array.isArray(item.pauseReasons) && item.pauseReasons.includes('human_takeover')) {
+            const resume = document.createElement('button');
+            resume.type = 'button';
+            resume.textContent = 'Resume supervision';
+            resume.setAttribute('aria-label', 'Resume supervision after human takeover for grant ' + item.grantId);
+            resume.dataset.grantId = item.grantId;
+            resume.addEventListener('click', () => { void resumeSupervisionAfterTakeover(item.grantId); });
+            $supervisionOwnerActions.appendChild(resume);
+          }
+        });
+      }
+    }
+
+    $supervisionIssues.textContent = '';
+    snapshots.forEach((snapshot) => {
+      (Array.isArray(snapshot.issues) ? snapshot.issues : []).forEach((issue) => {
+        const row = document.createElement('div');
+        row.className = 'supervision-issue';
+        const text = document.createElement('div');
+        text.textContent = 'Issue ' + String(issue.issueId || '').slice(0, 12)
+          + ' · ' + issue.actionType + ' · ' + issue.status + '/' + (issue.decision || 'pending')
+          + (issue.evidence ? ' · ' + issue.evidence : '')
+          + (issue.recommendation ? ' · recommendation: ' + issue.recommendation : '')
+          + ' · notification: ' + (issue.notificationStatus || 'unknown');
+        row.appendChild(text);
+        if (!supervisionState && issue.status === 'pending' && issue.decision === 'pending') {
+          const actions = document.createElement('div');
+          actions.className = 'supervision-issue-actions';
+          const approve = document.createElement('button');
+          approve.type = 'button';
+          approve.textContent = 'Approve this issue once';
+          approve.setAttribute('aria-label', 'Approve issue ' + issue.issueId + ' once');
+          approve.addEventListener('click', () => { void decideSupervisionIssue(issue.issueId, 'approved'); });
+          const reject = document.createElement('button');
+          reject.type = 'button';
+          reject.textContent = 'Reject';
+          reject.setAttribute('aria-label', 'Reject issue ' + issue.issueId);
+          reject.addEventListener('click', () => { void decideSupervisionIssue(issue.issueId, 'rejected'); });
+          actions.appendChild(approve);
+          actions.appendChild(reject);
+          row.appendChild(actions);
+        }
+        $supervisionIssues.appendChild(row);
+      });
+    });
+
+    const checks = snapshots.flatMap((snapshot) => Array.isArray(snapshot.checks) ? snapshot.checks : []);
+    const latest = checks.length > 0 ? checks[checks.length - 1] : null;
+    $supervisionChecks.textContent = latest
+      ? 'Last active check: ' + new Date(latest.checkedAt).toLocaleString() + ' · ' + latest.status + ' · ' + latest.summary
+      : 'No active supervisor check has been recorded.';
+    const operations = snapshots.flatMap((snapshot) => Array.isArray(snapshot.operations) ? snapshot.operations : []);
+    const lastOperation = operations.length > 0 ? operations[operations.length - 1] : null;
+    $supervisionOperations.textContent = lastOperation
+      ? 'Last operation: ' + lastOperation.operationId + ' · ' + lastOperation.status
+      : 'No supervised operation receipt has been recorded.';
+    applySupervisionChrome();
+  }
 
   const CAPABILITY_MUTATION_STATES = new Set(['ok', 'changed']);
 
@@ -1304,13 +1690,30 @@
   });
 
   $btnNewChat.addEventListener('click', () => {
-    emitCommand('command:new_chat', {});
-    showToast('Creating new chat...', 'success');
+    if (mutationSubmitInFlight.has('new_chat')) return;
+    const blocked = cursorMutationBlockedReason('command:new_chat', {});
+    if (blocked) {
+      showToast(blocked, 'error');
+      return;
+    }
+    mutationSubmitInFlight.add('new_chat');
+    try {
+      const body = emitCommand('command:new_chat', {});
+      if (body) showToast('Creating new chat...', 'success');
+    } finally {
+      mutationSubmitInFlight.delete('new_chat');
+    }
   });
 
   if ($btnSystem) $btnSystem.addEventListener('click', openSystemPanel);
   if ($systemPanelClose) $systemPanelClose.addEventListener('click', closeSystemPanel);
-  $contextMain.addEventListener('click', openDrawer);
+  $contextMain.addEventListener('click', () => {
+    if (supervisionContextPending || supervisionState) {
+      showToast('Session and window switching is outside this supervision grant', 'error');
+      return;
+    }
+    openDrawer();
+  });
   $drawerClose.addEventListener('click', closeDrawer);
   $drawerOverlay.addEventListener('click', closeDrawer);
   if ($questionnaireTrigger) $questionnaireTrigger.addEventListener('click', openQuestionnaireSheet);
@@ -1352,6 +1755,11 @@
     if (sendInFlight || !isSocketLive()) return;
     const text = $input.value.trim();
     if (!text) return;
+    const blocked = cursorMutationBlockedReason('command:send_message', { text });
+    if (blocked) {
+      showToast(blocked, 'error');
+      return;
+    }
     sendEnvelope = reuseEnvelope('command:send_message', { text }, sendEnvelope);
     sendInFlight = true;
     renderInputState();
@@ -1384,6 +1792,8 @@
       if (rejectInFlight || approvalInFlight) return;
       const action = approval.actions.find(a => a.type === 'reject' && hasOpaqueActionId(a.actionId));
       if (!action) { showToast('Approval authorization is unavailable; refresh CursorRemote', 'error'); return; }
+      const blocked = cursorMutationBlockedReason('command:reject', { approvalId: approval.id, actionId: action.actionId });
+      if (blocked) { showToast(blocked, 'error'); return; }
       rejectEnvelope = reuseEnvelope('command:reject', { approvalId: approval.id, actionId: action.actionId }, rejectEnvelope);
       rejectInFlight = true;
       renderApprovals();
@@ -1403,6 +1813,8 @@
     const action = approval.actions.find(a => (a.type === 'approve' || a.type === 'approve_all') && hasOpaqueActionId(a.actionId));
     if (!action) { showToast('Approval authorization is unavailable; refresh CursorRemote', 'error'); return; }
     const eventName = action.type === 'approve_all' ? 'command:approve_all' : 'command:approve';
+    const blocked = cursorMutationBlockedReason(eventName, { approvalId: approval.id, actionId: action.actionId });
+    if (blocked) { showToast(blocked, 'error'); return; }
     approvalEnvelope = reuseEnvelope(eventName, { approvalId: approval.id, actionId: action.actionId }, approvalEnvelope);
     approvalInFlight = true;
     renderApprovals();
@@ -1429,6 +1841,11 @@
     }
     if (qActionInFlight) return;
     if (!hasOpaqueActionId(actionId) || typeof actionType !== 'string' || actionType.length === 0) return;
+    const blocked = cursorMutationBlockedReason('command:click_action', { actionId, actionType });
+    if (blocked) {
+      showToast(blocked, 'error');
+      return;
+    }
     const payload = { actionId, actionType };
     const previous = qEnvelopes.get(actionId);
     const envelope = reuseEnvelope('command:click_action', payload, previous);
@@ -1470,6 +1887,7 @@
     renderApprovals();
     renderQuestionnaire();
     renderInputState();
+    renderSupervision();
     renderModeModel();
     syncPlanModalFromState();
   }
@@ -1524,6 +1942,18 @@
     }
     if (has('messages') || has('activeComposerId') || has('activeWindowId')) {
       if (has('messages')) renderMessages();
+    }
+    if (
+      has('connected') ||
+      has('extractorStatus') ||
+      has('lastExtractionAt') ||
+      has('agentStatus') ||
+      has('agentActivityLive') ||
+      has('agentActivitySource') ||
+      has('messages') ||
+      has('activeComposerId') ||
+      has('activeWindowId')
+    ) {
       renderSessionPlans();
     }
     if (has('pendingApprovals') || has('messages')) renderApprovals();
@@ -1881,6 +2311,219 @@
     return { windowId, composerId };
   }
 
+  const PLAN_FAILURE_CODES = new Set([
+    'session', 'window', 'connection', 'expired', 'extraction', 'auth',
+    'busy', 'invalid', 'plan', 'file', 'unknown',
+  ]);
+  const PLAN_FAILURE_STAGES = new Set([
+    'validate', 'guard', 'discover', 'resolve', 'read', 'emit',
+  ]);
+  const PLAN_FAILURE_CODE_LABELS = {
+    session: '会话不匹配',
+    window: '窗口不匹配',
+    connection: '连接不可用',
+    expired: '已失效',
+    extraction: '提取失败',
+    auth: '未授权',
+    busy: '正在处理',
+    invalid: '请求无效',
+    plan: '计划无法确认',
+    file: '文件读取失败',
+    unknown: '原因未知',
+  };
+  const PLAN_FAILURE_STAGE_LABELS = {
+    validate: '校验',
+    guard: '守卫',
+    discover: '发现',
+    resolve: '解析',
+    read: '读取',
+    emit: '发出',
+  };
+
+  const PLAN_DIAGNOSTIC_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+  function isSafePlanDiagnosticId(value) {
+    return typeof value === 'string'
+      && value.length > 0
+      && value.length <= 128
+      && value === value.trim()
+      && !value.includes('..')
+      && !value.includes('/')
+      && !value.includes('\\')
+      && PLAN_DIAGNOSTIC_ID_RE.test(value);
+  }
+
+  function formatPlanTargetIds(target) {
+    if (!target || typeof target !== 'object') return '';
+    const parts = [];
+    if (isSafePlanDiagnosticId(target.windowId)) parts.push(`窗口 ${target.windowId}`);
+    if (isSafePlanDiagnosticId(target.composerId)) parts.push(`会话 ${target.composerId}`);
+    if (isSafePlanDiagnosticId(target.planId)) parts.push(`计划 ${target.planId}`);
+    return parts.join(' · ');
+  }
+
+  function sanitizeClientPlanFailure(value, fallbackCommandId) {
+    if (!value || typeof value !== 'object') return null;
+    if (!PLAN_FAILURE_CODES.has(value.code) || !PLAN_FAILURE_STAGES.has(value.stage)) return null;
+    const commandId = isSafePlanDiagnosticId(value.commandId)
+      ? value.commandId
+      : (isSafePlanDiagnosticId(fallbackCommandId) ? fallbackCommandId : '');
+    const requested = {};
+    const rawRequested = value.requested && typeof value.requested === 'object' ? value.requested : {};
+    if (isSafePlanDiagnosticId(rawRequested.windowId)) requested.windowId = rawRequested.windowId;
+    if (isSafePlanDiagnosticId(rawRequested.composerId)) requested.composerId = rawRequested.composerId;
+    if (isSafePlanDiagnosticId(rawRequested.planId)) requested.planId = rawRequested.planId;
+    return {
+      code: value.code,
+      stage: value.stage,
+      commandId,
+      requested: Object.keys(requested).length ? requested : undefined,
+    };
+  }
+
+  function formatPlanDiagnosticError(error, failure, fallbackRequested) {
+    const lines = [];
+    if (failure && failure.code && failure.stage) {
+      const codeLabel = PLAN_FAILURE_CODE_LABELS[failure.code];
+      const stageLabel = PLAN_FAILURE_STAGE_LABELS[failure.stage];
+      const codeText = codeLabel ? `${failure.code}（${codeLabel}）` : failure.code;
+      const stageText = stageLabel ? `${failure.stage}（${stageLabel}）` : failure.stage;
+      lines.push(`失败码：${codeText} · 阶段：${stageText}`);
+    }
+    if (failure && failure.commandId) lines.push(`命令：${failure.commandId}`);
+    const requestedText = formatPlanTargetIds((failure && failure.requested) || fallbackRequested);
+    if (requestedText) lines.push(`请求目标：${requestedText}`);
+    if (error) lines.push(error);
+    return lines.join('\n');
+  }
+
+  function appendPlanStatus(parent, id, text, extraClass) {
+    const el = document.createElement('div');
+    el.className = extraClass ? `session-plan-chip-status ${extraClass}` : 'session-plan-chip-status';
+    if (id) el.id = id;
+    el.textContent = text;
+    parent.appendChild(el);
+    return el;
+  }
+
+  const PLAN_STATUS_BASIS_STALE_MS = 15_000;
+  const PLAN_STATUS_SOCKET_VALUES = new Set(['connected', 'connecting', 'reconnecting', 'disconnected']);
+  const PLAN_STATUS_CDP_VALUES = new Set(['connected', 'disconnected']);
+  const PLAN_STATUS_EXTRACTOR_VALUES = new Set(['idle', 'waiting', 'ok', 'stale']);
+  const PLAN_STATUS_AGENT_VALUES = new Set([
+    'idle', 'thinking', 'generating', 'running_tool', 'waiting_approval', 'error',
+  ]);
+  const PLAN_STATUS_ACTIVITY_SOURCES = new Set([
+    'none', 'shimmer', 'loading_tool', 'loading_indicator', 'tail_thought',
+  ]);
+
+  function boundedPlanStatusValue(value, allowed) {
+    return allowed.has(value) ? value : 'unknown';
+  }
+
+  function planStatusObservationKind(now) {
+    const extractor = boundedPlanStatusValue(state.extractorStatus || 'idle', PLAN_STATUS_EXTRACTOR_VALUES);
+    if (extractor !== 'ok') return 'missing';
+    const extractedAt = state.lastExtractionAt;
+    if (!isValidPlanTime(extractedAt) || extractedAt > now) return 'missing';
+    if (now - extractedAt > PLAN_STATUS_BASIS_STALE_MS) return 'expired';
+    const layers = connectionLayers();
+    if (!stateSnapshotFresh || layers.socket !== 'connected' || layers.cdp !== 'connected') {
+      return 'expired';
+    }
+    return 'fresh';
+  }
+
+  function buildPlanStatusBasisSection() {
+    const box = document.createElement('div');
+    box.className = 'plan-modal-status';
+    box.id = 'plan-status-basis';
+    const now = Date.now();
+    const layers = connectionLayers();
+    const socket = boundedPlanStatusValue(layers.socket, PLAN_STATUS_SOCKET_VALUES);
+    const cdp = boundedPlanStatusValue(layers.cdp, PLAN_STATUS_CDP_VALUES);
+    const extractor = boundedPlanStatusValue(state.extractorStatus || 'idle', PLAN_STATUS_EXTRACTOR_VALUES);
+    const agentStatus = boundedPlanStatusValue(state.agentStatus || 'idle', PLAN_STATUS_AGENT_VALUES);
+    const activitySource = boundedPlanStatusValue(
+      state.agentActivitySource || 'none',
+      PLAN_STATUS_ACTIVITY_SOURCES,
+    );
+    const kind = planStatusObservationKind(now);
+    const freshnessLabel = kind === 'expired'
+      ? '依据过期'
+      : kind === 'missing'
+        ? '依据缺失'
+        : '观察新鲜（Connected 不是可信证明）';
+    const extractorLabel = extractor === 'stale' ? `${extractor}（提取失败）` : extractor;
+    const rows = [
+      ['连接', `relay ${socket} · CDP ${cdp}`],
+      ['提取', extractorLabel],
+      ['观察新鲜度', freshnessLabel],
+      ['快照记录的最近成功观察时间', `${formatPlanTime(state.lastExtractionAt)}（抽取时间，不是任务进展时间）`],
+      ['界面 agentStatus', agentStatus],
+      ['活动信号', state.agentActivityLive ? '有活动' : '无活动'],
+      ['活动信号来源', activitySource],
+    ];
+    rows.forEach(([label, value]) => {
+      const row = document.createElement('div');
+      row.textContent = `${label}：${value}`;
+      box.appendChild(row);
+    });
+    [
+      'Idle不是完成证明',
+      '任务完成：未知（未核对验收证据）',
+      '监督者主动检查：未启用',
+      '观察时间来自网页最近取得的状态快照，并非持续提取心跳',
+      '依据过期不代表服务端停止提取',
+    ].forEach((line) => {
+      const row = document.createElement('div');
+      row.textContent = line;
+      box.appendChild(row);
+    });
+    if (kind === 'fresh' && isValidPlanTime(state.lastExtractionAt)) {
+      if (planStatusBasisExpiryTimer) {
+        clearTimeout(planStatusBasisExpiryTimer);
+        planStatusBasisExpiryTimer = 0;
+      }
+      const delay = Math.max(0, Math.min(
+        state.lastExtractionAt + PLAN_STATUS_BASIS_STALE_MS - now,
+        2147483647,
+      )) + 200;
+      const timer = setTimeout(() => {
+        planStatusBasisExpiryTimer = 0;
+        renderSessionPlans();
+      }, delay);
+      if (timer && typeof timer.unref === 'function') timer.unref();
+      planStatusBasisExpiryTimer = timer;
+    } else if (planStatusBasisExpiryTimer) {
+      clearTimeout(planStatusBasisExpiryTimer);
+      planStatusBasisExpiryTimer = 0;
+    }
+    return box;
+  }
+
+  function buildPlanTaskBasisSection(fullData) {
+    const box = document.createElement('div');
+    box.className = 'plan-modal-status';
+    box.id = 'plan-task-basis';
+    const bodyPresent = !!(fullData && typeof fullData.body === 'string' && fullData.body.trim());
+    const rows = [
+      ['依据范围', bodyPresent
+        ? '单次文件快照，不是完整任务或会话'
+        : '未取得计划文件快照；以下摘要不代表完整任务或会话'],
+      ['目标', '未知（未结构化取得）'],
+      ['约束', '未知（未结构化取得）'],
+      ['验收条件', '未知（未结构化取得）'],
+      ['关键决策', '未知（未结构化取得）'],
+      ['计划正文', bodyPresent ? '本次快照已读取' : '缺失'],
+    ];
+    rows.forEach(([label, value]) => {
+      const row = document.createElement('div');
+      row.textContent = `${label}：${value}`;
+      box.appendChild(row);
+    });
+    return box;
+  }
+
   /** The Plans entry stays discoverable even with zero plan cards, as long as the target is known. */
   function plansEntryAvailable() {
     return !!planSessionTarget();
@@ -2042,7 +2685,8 @@
     discoveredPlanScanInFlight = false;
     if (!result.ok || !result.data) {
       const rawError = typeof result.error === 'string' && result.error.trim() ? result.error.trim() : '';
-      discoveredPlanError = rawError || '历史计划查找失败';
+      const failure = sanitizeClientPlanFailure(result.failure, result.commandId);
+      discoveredPlanError = formatPlanDiagnosticError(rawError || '历史计划查找失败', failure, target);
       renderSessionPlans();
       return;
     }
@@ -2090,31 +2734,33 @@
     hint.textContent = '将在 Cursor 内临时滚动当前会话；历史扫描有界，可能不完整。';
     wrap.appendChild(hint);
 
+    const currentTarget = planSessionTarget();
+    const currentText = formatPlanTargetIds(currentTarget);
+    if (currentText) {
+      appendPlanStatus(wrap, 'plan-discovery-current-target', `当前目标：${currentText}`);
+    }
+
     if (discoveredPlanRefs) {
-      const meta = document.createElement('div');
-      meta.className = 'session-plan-chip-status';
-      meta.id = 'plan-discovery-meta';
-      meta.textContent = `发现时间：${formatPlanTime(discoveredPlanRefs.observedAt)}；范围：partial`
-        + `${discoveredPlanRefs.reachedStart ? '（已到会话起点）' : '（未到会话起点）'}`;
-      wrap.appendChild(meta);
+      const resultText = formatPlanTargetIds(discoveredPlanRefs);
+      if (resultText) {
+        appendPlanStatus(wrap, 'plan-discovery-result-target', `结果目标：${resultText}`);
+      }
+      const reached = discoveredPlanRefs.reachedStart
+        ? '到当前滚动容器顶部'
+        : '未到当前滚动容器顶部';
+      appendPlanStatus(
+        wrap,
+        'plan-discovery-meta',
+        `发现时间：${formatPlanTime(discoveredPlanRefs.observedAt)}；范围：partial（${reached}）`,
+      );
       if (discoveredPlanRefs.plans.length === 0) {
-        const empty = document.createElement('div');
-        empty.className = 'session-plan-chip-status';
-        empty.id = 'plan-discovery-empty';
-        empty.textContent = '本次有界扫描未发现计划，这不代表当前会话没有计划。';
-        wrap.appendChild(empty);
+        appendPlanStatus(wrap, 'plan-discovery-empty', '本次有界扫描未发现计划，这不代表当前会话没有计划。');
       }
     }
     if (discoveredPlanError) {
-      const err = document.createElement('div');
-      err.className = 'session-plan-chip-status plan-modal-status-error';
-      err.textContent = discoveredPlanError;
-      wrap.appendChild(err);
+      appendPlanStatus(wrap, 'plan-discovery-error', discoveredPlanError, 'plan-modal-status-error');
     } else if (discoveredPlanNotice) {
-      const notice = document.createElement('div');
-      notice.className = 'session-plan-chip-status';
-      notice.textContent = discoveredPlanNotice;
-      wrap.appendChild(notice);
+      appendPlanStatus(wrap, '', discoveredPlanNotice);
     }
     return wrap;
   }
@@ -2219,6 +2865,10 @@
     const discoverable = plansEntryAvailable();
     const plans = sessionPlanMessages();
     if (!discoverable && plans.length === 0) {
+      if (planStatusBasisExpiryTimer) {
+        clearTimeout(planStatusBasisExpiryTimer);
+        planStatusBasisExpiryTimer = 0;
+      }
       bar.classList.add('hidden');
       itemsEl.innerHTML = '';
       sessionPlansOpen = false;
@@ -2245,6 +2895,7 @@
       bar.classList.remove('hidden');
     }
     itemsEl.innerHTML = '';
+    itemsEl.appendChild(buildPlanStatusBasisSection());
     if (discoverable) itemsEl.appendChild(buildPlanDiscoverySection());
     plans.forEach((plan) => {
       const btn = document.createElement('button');
@@ -2829,6 +3480,11 @@
     }
     if (genericActionInFlight.has(actionId)) return false;
     const payload = { actionId, actionType };
+    const blocked = cursorMutationBlockedReason('command:click_action', payload);
+    if (blocked) {
+      showToast(blocked, 'error');
+      return false;
+    }
     const envelope = reuseEnvelope(
       'command:click_action',
       payload,
@@ -3045,7 +3701,7 @@
       ['内容版本', metadata.version],
       ['读取时间', formatPlanTime(metadata.observedAt)],
       ['文件修改时间（非批准时间）', formatPlanTime(metadata.updatedAt)],
-      ['完整性', '读取时完整快照，非持续实时，也不代表完整会话或用户授权'],
+      ['完整性', '读取时完整快照，非持续实时，不是完整任务或会话，也不代表用户授权'],
     ];
     rows.forEach(([label, value]) => {
       const row = document.createElement('div');
@@ -3089,6 +3745,7 @@
     const wrap = document.createElement('div');
     if (modal && modal.fullData) {
       wrap.appendChild(buildPlanMetadataSection(modal.fullData.metadata));
+      wrap.appendChild(buildPlanTaskBasisSection(modal.fullData));
       wrap.appendChild(buildPlanReReadButton());
       wrap.appendChild(buildPlanFullContent(modal.fullData));
       return wrap;
@@ -3109,6 +3766,7 @@
       stale.textContent = '计划摘要已变化，旧全文已清除。请重新读取以载入当前快照。';
       wrap.appendChild(stale);
     }
+    wrap.appendChild(buildPlanTaskBasisSection(null));
     if (modal && !modal.loading) wrap.appendChild(buildPlanReReadButton());
     wrap.appendChild(buildPlanSummaryContent(msg, '会话摘要（并非计划文件全文）。'));
     return wrap;
@@ -3159,7 +3817,8 @@
     if (!result.ok || !result.data) {
       modal.attempted = !result.outcomeUnknown;
       const rawError = typeof result.error === 'string' && result.error.trim() ? result.error.trim() : '';
-      modal.error = rawError || '读取计划文件失败';
+      const failure = sanitizeClientPlanFailure(result.failure, result.commandId);
+      modal.error = formatPlanDiagnosticError(rawError || '读取计划文件失败', failure, target);
       renderPlanModal(msg);
       return;
     }
@@ -3257,31 +3916,47 @@
   }
 
   async function openPlanModelPicker(msg) {
+    if (mutationSubmitInFlight.has('get_plan_model_options')) return;
     if (!hasOpaqueActionId(msg.modelActionId)) {
       if (msg.model) showToast(`Plan model: ${msg.model}`, 'success');
       else showToast('Plan model capability is unavailable; refresh CursorRemote', 'error');
       return;
     }
-
-    const commandId = newCommandId();
-    const result = await sendCommandAwaitResult('command:get_plan_model_options', {
-      commandId,
-      type: 'get_plan_model_options',
+    const blocked = cursorMutationBlockedReason('command:get_plan_model_options', {
+      actionId: msg.modelActionId,
+    }) || supervisionWriteDisabledReason({
+      actionType: 'set_plan_model',
       actionId: msg.modelActionId,
     });
-
-    const options = Array.isArray(result.data?.options) ? result.data.options : [];
-    if (!result.ok || options.length === 0) {
-      if (!result.ok) showToast(result.error || 'Could not load plan models', 'error');
+    if (blocked) {
+      showToast(blocked, 'error');
       return;
     }
 
-    activePlanModelContext = {
-      actionId: msg.modelActionId,
-      title: msg.title || 'Plan',
-      options,
-    };
-    openSheet('plan-model');
+    mutationSubmitInFlight.add('get_plan_model_options');
+    try {
+      const commandId = newCommandId();
+      const result = await sendCommandAwaitResult('command:get_plan_model_options', {
+        commandId,
+        type: 'get_plan_model_options',
+        actionId: msg.modelActionId,
+      });
+
+      const options = Array.isArray(result.data?.options) ? result.data.options : [];
+      if (!result.ok || options.length === 0) {
+        if (!result.ok) showToast(result.error || 'Could not load plan models', 'error');
+        return;
+      }
+
+      activePlanModelContext = {
+        actionId: msg.modelActionId,
+        title: msg.title || 'Plan',
+        options,
+      };
+      openSheet('plan-model');
+    } finally {
+      mutationSubmitInFlight.delete('get_plan_model_options');
+    }
   }
 
   function buildPlanCard(msg, opts) {
@@ -3403,7 +4078,18 @@
         chev.textContent = '\u25BE';
         pill.appendChild(lab);
         pill.appendChild(chev);
-        pill.addEventListener('click', () => { void openPlanModelPicker(msg); });
+        const planModelReason = supervisionWriteDisabledReason({
+          actionType: 'set_plan_model',
+          actionId: msg.modelActionId,
+        }) || cursorMutationBlockedReason('command:get_plan_model_options', {
+          actionId: msg.modelActionId,
+        });
+        if (planModelReason) {
+          pill.disabled = true;
+          pill.title = planModelReason;
+        } else {
+          pill.addEventListener('click', () => { void openPlanModelPicker(msg); });
+        }
         center.appendChild(pill);
       } else if (msg.model) {
         const badge = document.createElement('span');
@@ -3422,9 +4108,16 @@
           btn.type = 'button';
           btn.className = 'plan-btn plan-btn-build';
           btn.textContent = buildAct.label || 'Build';
+          const supervisionReason = supervisionWriteDisabledReason({
+            actionType: 'build',
+            actionId: buildAct.actionId,
+          });
           if (!hasOpaqueActionId(buildAct.actionId)) {
             btn.disabled = true;
             btn.title = 'Action authorization is unavailable; refresh CursorRemote';
+          } else if (supervisionReason) {
+            btn.disabled = true;
+            btn.title = supervisionReason;
           } else if (genericActionInFlight.has(buildAct.actionId) || !isSocketLive()) {
             btn.disabled = true;
           } else {
@@ -3503,9 +4196,16 @@
         : action.type === 'allow' ? 'run-btn run-btn-allow'
         : 'run-btn run-btn-skip';
       btn.textContent = action.label;
+      const supervisionReason = supervisionWriteDisabledReason({
+        actionType: action.type,
+        actionId: action.actionId,
+      });
       if (!hasOpaqueActionId(action.actionId)) {
         btn.disabled = true;
         btn.title = 'Action authorization is unavailable; refresh CursorRemote';
+      } else if (supervisionReason) {
+        btn.disabled = true;
+        btn.title = supervisionReason;
       } else if (genericActionInFlight.has(action.actionId) || !isSocketLive()) {
         btn.disabled = true;
       } else {
@@ -3811,6 +4511,15 @@
       const approveAction = approval.actions.find(a => (a.type === 'approve' || a.type === 'approve_all') && hasOpaqueActionId(a.actionId));
       const rejectAction = approval.actions.find(a => a.type === 'reject' && hasOpaqueActionId(a.actionId));
       const live = isSocketLive();
+      const approveReason = approveAction
+        ? supervisionWriteDisabledReason({
+          actionType: approveAction.type === 'approve_all' ? 'approve_all' : 'approve',
+          actionId: approveAction.actionId,
+        })
+        : supervisionWriteDisabledReason({ actionType: 'approve' });
+      const rejectReason = rejectAction
+        ? supervisionWriteDisabledReason({ actionType: 'reject', actionId: rejectAction.actionId })
+        : supervisionWriteDisabledReason({ actionType: 'reject' });
       const card = findApprovalCard(approval);
       const fallback = approvalNeedsFallback(approval, card);
 
@@ -3822,8 +4531,10 @@
       $btnApprove.classList.toggle('hidden', !fallback);
       $btnReject.classList.toggle('hidden', !fallback);
 
-      $btnApprove.disabled = !live || approvalInFlight || rejectInFlight || !approveAction || !fallback;
-      $btnReject.disabled = !live || approvalInFlight || rejectInFlight || !rejectAction || !fallback;
+      $btnApprove.disabled = !live || !!approveReason || approvalInFlight || rejectInFlight || !approveAction || !fallback;
+      $btnReject.disabled = !live || !!rejectReason || approvalInFlight || rejectInFlight || !rejectAction || !fallback;
+      $btnApprove.title = approveReason;
+      $btnReject.title = rejectReason;
       if (approveAction) $btnApprove.textContent = approveAction.label || 'Accept';
       if (rejectAction) $btnReject.textContent = rejectAction.label || 'Reject';
 
@@ -3863,9 +4574,19 @@
     $questionnaireStepper.textContent = stepperText;
     if ($questionnaireTriggerLabel) $questionnaireTriggerLabel.textContent = stepperText;
     var live = isSocketLive();
+    var skipReason = supervisionWriteDisabledReason({
+      actionType: 'skip',
+      actionId: q.skipActionId,
+    });
+    var continueReason = supervisionWriteDisabledReason({
+      actionType: 'continue',
+      actionId: q.continueActionId,
+    });
     var qBusy = qActionInFlight || !live || refreshing;
-    $btnQSkip.disabled = qBusy || !hasOpaqueActionId(q.skipActionId);
-    $btnQContinue.disabled = qBusy || q.continueDisabled || !hasOpaqueActionId(q.continueActionId);
+    $btnQSkip.disabled = qBusy || !!skipReason || !hasOpaqueActionId(q.skipActionId);
+    $btnQContinue.disabled = qBusy || !!continueReason || q.continueDisabled || !hasOpaqueActionId(q.continueActionId);
+    $btnQSkip.title = skipReason;
+    $btnQContinue.title = continueReason;
 
     var activeQuestionNumber = '';
     var focusedLetter = '';
@@ -3926,6 +4647,14 @@
           optBtn.disabled = true;
           optBtn.title = 'Action authorization is unavailable; refresh CursorRemote';
         }
+        var optReason = supervisionWriteDisabledReason({
+          actionType: 'questionnaire_option',
+          actionId: opt.actionId,
+        });
+        if (optReason) {
+          optBtn.disabled = true;
+          optBtn.title = optReason;
+        }
         if (qBusy) optBtn.disabled = true;
         optBtn.dataset.questionNumber = question.number;
         optBtn.dataset.letter = opt.letter;
@@ -3933,6 +4662,10 @@
         optBtn.addEventListener('click', function() {
           if (!hasOpaqueActionId(this.dataset.actionId)) return;
           if (!isSocketLive() || qActionInFlight || questionnaireNullHoldTimer || questionnaireAwaitingSnapshot) return;
+          if (supervisionWriteDisabledReason({
+            actionType: 'questionnaire_option',
+            actionId: this.dataset.actionId,
+          })) return;
           questionnaireOptimistic[this.dataset.questionNumber] = this.dataset.letter;
           var siblings = this.parentNode.querySelectorAll('.questionnaire-option');
           for (var sib = 0; sib < siblings.length; sib++) {
@@ -3960,9 +4693,67 @@
     fireNotification('Agent has questions for you', 'cursor-questionnaire');
   }
 
+  function findMatchingApprovedIssue(composerId, actionType, actionId) {
+    if (!supervisionState || !Array.isArray(supervisionState.issues) || !actionType) return null;
+    return supervisionState.issues.find((issue) => {
+      if (!issue || issue.status !== 'pending' || issue.decision !== 'approved') return false;
+      if (issue.composerId !== composerId) return false;
+      if (issue.actionType !== actionType) return false;
+      if (actionId && issue.actionId !== actionId) return false;
+      return true;
+    }) || null;
+  }
+
+  function isCursorWriteRoute(route) {
+    return SUPERVISED_WRITE_ROUTES.has(route) || SUPERVISOR_DENIED_ROUTES.has(route);
+  }
+
+  function cursorMutationBlockedReason(eventName, payload) {
+    const route = socketRoute(eventName);
+    if (supervisionContextPending && isCursorWriteRoute(route)) {
+      return 'Waiting to confirm supervision context.';
+    }
+    if (!supervisionState) return '';
+    if (SUPERVISOR_DENIED_ROUTES.has(route)) {
+      return 'This action is outside this supervision grant';
+    }
+    if (SUPERVISED_WRITE_ROUTES.has(route)) {
+      return supervisionWriteDisabledReason({
+        actionType: route === 'click_action' ? (payload && payload.actionType) : route,
+        actionId: payload && payload.actionId,
+        composerId: (payload && payload.composerId) || state.activeComposerId,
+      });
+    }
+    return '';
+  }
+
+  function supervisionWriteDisabledReason(context) {
+    if (supervisionContextPending) return 'Waiting to confirm supervision context.';
+    const snapshot = supervisionState;
+    const grant = snapshot && snapshot.grant;
+    if (!grant) return '';
+    if (grant.status !== 'active') return 'Supervision is awaiting recovery or no longer active.';
+    if (snapshot.workspaceMatches === false) return 'The observed workspace no longer matches this authorization.';
+    const reasons = Array.isArray(grant.pauseReasons) ? grant.pauseReasons : [];
+    const blocking = reasons.filter((reason) => reason !== 'pending_issue');
+    if (blocking.length > 0) return 'Supervision is paused: ' + blocking.join(', ');
+    if (reasons.includes('pending_issue')) {
+      const actionType = context && context.actionType;
+      if (!actionType) return 'An issue is waiting for a bound human decision.';
+      const composerId = (context && context.composerId) || state.activeComposerId;
+      const approved = findMatchingApprovedIssue(composerId, actionType, context && context.actionId);
+      if (!approved) return 'An issue is waiting for a bound human decision.';
+    }
+    return '';
+  }
+
   function renderInputState() {
-    $input.disabled = isSocketLive() ? !state.inputAvailable : false;
+    const supervisionReason = supervisionWriteDisabledReason({ actionType: 'send_message' });
+    $input.disabled = isSocketLive() ? (!state.inputAvailable || !!supervisionReason) : false;
+    $input.title = supervisionReason;
+    $btnSend.title = supervisionReason;
     $btnSend.disabled = !isSocketLive() || sendInFlight || !$input.value.trim() || $input.disabled;
+    applySupervisionChrome();
   }
 
   function isClientForeground() {
@@ -4102,12 +4893,26 @@
 
       // Click to switch window (only for non-active windows)
       if (!isActive) {
+        head.disabled = supervisionContextPending || !!supervisionState;
         head.addEventListener('click', () => {
-          emitCommand('command:switch_window', {
-            windowId: win.id,
-          });
-          showToast('Switching window...', 'success');
-          closeDrawer();
+          if (mutationSubmitInFlight.has('switch_window')) return;
+          const blocked = cursorMutationBlockedReason('command:switch_window', { windowId: win.id });
+          if (blocked) {
+            showToast(blocked, 'error');
+            return;
+          }
+          mutationSubmitInFlight.add('switch_window');
+          try {
+            const body = emitCommand('command:switch_window', {
+              windowId: win.id,
+            });
+            if (body) {
+              showToast('Switching window...', 'success');
+              closeDrawer();
+            }
+          } finally {
+            mutationSubmitInFlight.delete('switch_window');
+          }
         });
       }
 
@@ -4137,6 +4942,7 @@
           const statusText = getStatusText(tab.status);
           const availabilityLabel = tab.isActive ? 'Current' : (isOpen ? 'Open' : 'History');
           row.setAttribute('aria-label', `${tab.title || 'Untitled Chat'}, ${availabilityLabel}`);
+          row.disabled = supervisionContextPending || !!supervisionState;
           
           row.innerHTML = `
             ${statusDot}
@@ -4151,10 +4957,21 @@
           `;
 
           row.addEventListener('click', () => {
-            emitCommand('command:switch_tab', {
-              tabTitle: tab.title,
-            });
-            closeDrawer();
+            if (mutationSubmitInFlight.has('switch_tab')) return;
+            const blocked = cursorMutationBlockedReason('command:switch_tab', { tabTitle: tab.title });
+            if (blocked) {
+              showToast(blocked, 'error');
+              return;
+            }
+            mutationSubmitInFlight.add('switch_tab');
+            try {
+              const body = emitCommand('command:switch_tab', {
+                tabTitle: tab.title,
+              });
+              if (body) closeDrawer();
+            } finally {
+              mutationSubmitInFlight.delete('switch_tab');
+            }
           });
 
           sessList.appendChild(row);
@@ -4297,8 +5114,10 @@
   function renderModeModel() {
     const statusLabel = capabilityStatusState();
     const completeness = capabilityModelCompleteness();
-    const modeEnabled = isModeMutationEnabled();
-    const modelEnabled = isModelMutationEnabled();
+    const modeSupervisionReason = supervisionWriteDisabledReason({ actionType: 'set_mode' });
+    const modelSupervisionReason = supervisionWriteDisabledReason({ actionType: 'set_model' });
+    const modeEnabled = isModeMutationEnabled() && !modeSupervisionReason;
+    const modelEnabled = isModelMutationEnabled() && !modelSupervisionReason;
 
     const currentMode = observedModes().find((mode) => mode.current)
       || observedModes().find((mode) => mode.id === state.mode?.current);
@@ -4313,12 +5132,12 @@
     $pillMode.setAttribute('aria-label', modeEnabled ? 'Select mode' : `Mode ${statusLabel}`);
     $pillModel.setAttribute('aria-label', modelEnabled ? 'Select model' : `Model ${statusLabel}, completeness ${completeness}`);
 
-    $pillMode.title = modeEnabled
+    $pillMode.title = modeSupervisionReason || (modeEnabled
       ? `Mode capability: ${statusLabel}`
-      : `Mode capability: ${statusLabel} — unavailable`;
-    $pillModel.title = modelEnabled
+      : `Mode capability: ${statusLabel} — unavailable`);
+    $pillModel.title = modelSupervisionReason || (modelEnabled
       ? `Model capability: ${statusLabel}`
-      : `Model capability: ${statusLabel}/${completeness} — unavailable`;
+      : `Model capability: ${statusLabel}/${completeness} — unavailable`);
     $pillModeIcon.textContent = modeIcon;
     $pillModeText.textContent = modeLabel;
     $pillModelText.textContent = modelLabel;
@@ -4350,6 +5169,7 @@
 
     if (activeSheet === 'mode' && !modeEnabled) closeSheet();
     else if (activeSheet === 'model' && !modelEnabled) closeSheet();
+    applySupervisionChrome();
   }
 
   renderAll();
@@ -4357,6 +5177,9 @@
   // --- Bottom sheet logic ---
 
   function openSheet(type) {
+    if (type === 'mode' && supervisionWriteDisabledReason({ actionType: 'set_mode' })) return;
+    if (type === 'model' && supervisionWriteDisabledReason({ actionType: 'set_model' })) return;
+    if (type === 'plan-model' && supervisionWriteDisabledReason({ actionType: 'set_plan_model' })) return;
     if (type === 'mode' && !isModeMutationEnabled()) return;
     if (type === 'model' && !isModelMutationEnabled()) return;
     closeTransientUi('sheet');
@@ -4439,10 +5262,23 @@
       btn.appendChild(right);
 
       btn.addEventListener('click', () => {
+        if (mutationSubmitInFlight.has('set_mode')) return;
         if (!isModeMutationEnabled()) return;
-        emitCommand('command:set_mode', { modeId: m.id });
-        closeSheet();
-        showToast(`Mode: ${m.label || m.id}`, 'success');
+        const blocked = cursorMutationBlockedReason('command:set_mode', { modeId: m.id });
+        if (blocked) {
+          showToast(blocked, 'error');
+          return;
+        }
+        mutationSubmitInFlight.add('set_mode');
+        try {
+          const body = emitCommand('command:set_mode', { modeId: m.id });
+          if (body) {
+            closeSheet();
+            showToast(`Mode: ${m.label || m.id}`, 'success');
+          }
+        } finally {
+          mutationSubmitInFlight.delete('set_mode');
+        }
       });
       $sheetModeList.appendChild(btn);
     });
@@ -4450,6 +5286,18 @@
 
   async function fetchModelOptions() {
     if (!isModelMutationEnabled()) return null;
+    if (supervisionContextPending || supervisionState) {
+      const observed = selectableComposerModels().map((model) => ({
+        id: model.id,
+        label: model.label || model.id,
+        selected: !!model.selected,
+      }));
+      if (observed.length > 0) {
+        cachedModelOptions = observed;
+        return observed;
+      }
+      return cachedModelOptions;
+    }
     const commandId = newCommandId();
     const result = await sendCommandAwaitResult('command:get_model_options', {
       commandId,
@@ -4494,10 +5342,23 @@
 
       btn.innerHTML = inner;
       btn.addEventListener('click', () => {
+        if (mutationSubmitInFlight.has('set_model')) return;
         if (!isModelMutationEnabled()) return;
-        emitCommand('command:set_model', { modelId: opt.id });
-        closeSheet();
-        showToast(`Model: ${opt.label}`, 'success');
+        const blocked = cursorMutationBlockedReason('command:set_model', { modelId: opt.id });
+        if (blocked) {
+          showToast(blocked, 'error');
+          return;
+        }
+        mutationSubmitInFlight.add('set_model');
+        try {
+          const body = emitCommand('command:set_model', { modelId: opt.id });
+          if (body) {
+            closeSheet();
+            showToast(`Model: ${opt.label}`, 'success');
+          }
+        } finally {
+          mutationSubmitInFlight.delete('set_model');
+        }
       });
       $sheetModelList.appendChild(btn);
     });
@@ -4525,19 +5386,33 @@
         `<span class="sheet-item-label">${escapeHtml(opt.label)}</span>` +
         `<span class="sheet-item-right">${opt.selected ? '<span class="sheet-item-check">\u2713</span>' : ''}</span>`;
       btn.addEventListener('click', async () => {
+        if (mutationSubmitInFlight.has('set_plan_model')) return;
         if (!hasOpaqueActionId(ctx.actionId) || !opt.id) return;
-        const result = await sendCommandAwaitResult('command:set_plan_model', {
-          commandId: newCommandId(),
-          type: 'set_plan_model',
+        const blocked = cursorMutationBlockedReason('command:set_plan_model', {
           actionId: ctx.actionId,
           planModelId: opt.id,
         });
-        if (!result.ok) {
-          showToast(result.error || 'Could not set plan model', 'error');
+        if (blocked) {
+          showToast(blocked, 'error');
           return;
         }
-        closeSheet();
-        showToast(`Plan model: ${opt.label}`, 'success');
+        mutationSubmitInFlight.add('set_plan_model');
+        try {
+          const result = await sendCommandAwaitResult('command:set_plan_model', {
+            commandId: newCommandId(),
+            type: 'set_plan_model',
+            actionId: ctx.actionId,
+            planModelId: opt.id,
+          });
+          if (!result.ok) {
+            showToast(result.error || 'Could not set plan model', 'error');
+            return;
+          }
+          closeSheet();
+          showToast(`Plan model: ${opt.label}`, 'success');
+        } finally {
+          mutationSubmitInFlight.delete('set_plan_model');
+        }
       });
       $sheetPlanModelList.appendChild(btn);
     });

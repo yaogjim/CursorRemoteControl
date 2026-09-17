@@ -8,6 +8,7 @@ import type {
   ModeInfo,
   ModelInfo,
   SelectorConfig,
+  WorkspaceIdentity,
 } from './types.js';
 import { applyDerivedActivityToState } from './activity-derive.js';
 
@@ -83,6 +84,28 @@ export function extractionFunction(
   function projectNameFromTitle(title: string): string {
     const idx = title.indexOf(' [');
     return (idx >= 0 ? title.substring(0, idx) : title).trim();
+  }
+  function readWorkspaceIdentity(): WorkspaceIdentity | null {
+    try {
+      const root = globalThis as unknown as {
+        vscode?: { context?: { configuration?: () => { workspace?: {
+          id?: unknown;
+          uri?: { scheme?: unknown; authority?: unknown; path?: unknown };
+        } } } };
+      };
+      const ws = root.vscode?.context?.configuration?.().workspace;
+      const id = ws?.id;
+      const scheme = ws?.uri?.scheme;
+      const authority = ws?.uri?.authority;
+      const path = ws?.uri?.path;
+      if (typeof id !== 'string' || id.length === 0 || id.length > 128 || id.includes('\0')) return null;
+      if (typeof scheme !== 'string' || scheme.length === 0 || scheme.length > 32 || scheme.includes('\0')) return null;
+      if (typeof authority !== 'string' || authority.length > 256 || authority.includes('\0')) return null;
+      if (typeof path !== 'string' || path.length === 0 || path.length > 4096 || path.includes('\0')) return null;
+      return { id, uri: { scheme, authority, path } };
+    } catch {
+      return null;
+    }
   }
   function findFirst(selectors: string[]): Element | null {
     for (const sel of selectors) {
@@ -2063,6 +2086,7 @@ export function extractionFunction(
       activeWindowId: '',
       composerQueue: { items: queueItems, ...(queueLabel ? { queueLabel } : {}) },
       questionnaire,
+      _workspaceIdentity: readWorkspaceIdentity(),
       _rawSignals,
     };
   } catch {

@@ -61,6 +61,30 @@ describe('CommandExecutor per-window serial queue', () => {
     assert.ok(bStart < aEnd, 'second window should start before the first window finishes');
   });
 
+  it('uses one submit gesture when supervisory retries are disabled', async () => {
+    const keys: Array<{ key: string; modifiers?: number }> = [];
+    const client = {
+      isConnected: () => true,
+      evaluate: async () => ({ ok: true, info: 'textarea' }),
+      pressKey: async (key: string, _code: string, _keyCode: number, modifiers?: number) => {
+        keys.push({ key, modifiers });
+      },
+      typeText: async () => undefined,
+    } as unknown as CdpClient;
+    const executor = new CommandExecutor({
+      chatInput: { strategies: ['textarea'] },
+    } as SelectorConfig);
+    executor.setClient(client);
+
+    const result = await executor.sendMessage('cmd-send-once', 'hello', {
+      retry: false,
+      humanInitiated: false,
+    });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(keys.filter((entry) => entry.key === 'Enter'), [{ key: 'Enter', modifiers: undefined }]);
+  });
+
   it('keeps the existing not-connected result without queueing work', async () => {
     const executor = new CommandExecutor({} as SelectorConfig);
     const result = await executor.clickAction('cmd-x', '#x');
@@ -129,6 +153,23 @@ describe('CommandExecutor registered action boundary', () => {
     const firstResult = await first;
     assert.equal(firstResult.ok, true);
     assert.equal(second.error, 'action_consumed');
+  });
+
+  it('releases a registered action when the final dispatch guard rejects it', async () => {
+    let evaluations = 0;
+    const { executor, action, registry } = registeredExecutor({
+      evaluate: async () => { evaluations += 1; return { ok: true }; },
+    });
+    const result = await executor.clickRegisteredAction(
+      'cmd-guard-denied',
+      action.actionId,
+      { actionType: 'approve' },
+      { beforeDispatch: () => { throw new Error('scope changed'); }, retry: false, humanInitiated: false },
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? '', /scope changed/);
+    assert.equal(evaluations, 0);
+    assert.equal(registry.public(action.actionId)?.executable, true);
   });
 
   it('cancels a queued action when the target generation changes', async () => {

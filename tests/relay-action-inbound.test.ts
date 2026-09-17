@@ -95,6 +95,7 @@ interface PlanDiscoveryFixture {
 type ExecutorOptions = {
   gate?: Promise<void>;
   planFileName?: string;
+  planPlansRoot?: string;
   plans?: PlanDiscoveryFixture[];
   reachedStart?: boolean;
 };
@@ -131,7 +132,15 @@ function mockExecutor(calls: ExecutorCall[], opts: ExecutorOptions = {}): Comman
       calls.push({ method: 'resolvePlanFile', commandId, expected });
       if (opts.gate) await opts.gate;
       if (!isCurrent()) return { commandId, ok: false, error: '读取目标已失效' };
-      return { commandId, ok: true, data: { fileName: opts.planFileName || 'resolved.plan.md', observedAt: Date.now() } };
+      return {
+        commandId,
+        ok: true,
+        data: {
+          fileName: opts.planFileName || 'resolved.plan.md',
+          observedAt: Date.now(),
+          ...(opts.planPlansRoot ? { plansRoot: opts.planPlansRoot } : {}),
+        },
+      };
     },
     clickRegisteredAction: async (commandId: string, actionId: string, expected?: unknown) => {
       if (opts.gate) await opts.gate;
@@ -310,6 +319,43 @@ async function emitCommand(
   return result;
 }
 
+type PlanFailureWire = {
+  code: string;
+  stage: string;
+  commandId: string;
+  requested?: { windowId?: string; composerId?: string; planId?: string };
+};
+
+function planFailureOf(result: CommandResult): PlanFailureWire {
+  const failure = (result as CommandResult & { failure?: PlanFailureWire }).failure;
+  assert.ok(failure, `expected structured plan failure, error=${result.error ?? ''}`);
+  return failure;
+}
+
+function assertPlanFailure(
+  result: CommandResult,
+  expected: { commandId: string; code: string; stage: string; requested?: PlanFailureWire['requested'] },
+): PlanFailureWire {
+  assert.equal(result.ok, false);
+  assert.equal(result.data, undefined);
+  assert.equal(typeof result.error, 'string');
+  assert.ok((result.error as string).length > 0, 'generic error string must remain for compatibility');
+  const failure = planFailureOf(result);
+  assert.equal(failure.code, expected.code);
+  assert.equal(failure.stage, expected.stage);
+  assert.equal(failure.commandId, expected.commandId);
+  if (expected.requested) assert.deepEqual(failure.requested, expected.requested);
+  const serialized = JSON.stringify(result);
+  assert.doesNotMatch(serialized, /\/Users\//);
+  assert.doesNotMatch(serialized, /\.cursor\/plans/);
+  assert.equal(serialized.includes('botToken'), false);
+  assert.equal('activeWindowId' in failure, false);
+  assert.equal('activeTargetId' in failure, false);
+  assert.equal('path' in failure, false);
+  assert.equal('fileName' in failure, false);
+  return failure;
+}
+
 function stateWithPlan(id = 'plan-current', label = 'current_plan.plan.md'): CursorState {
   return {
     connected: true,
@@ -365,7 +411,7 @@ describe('socket inbound protocol helpers', () => {
     assert.equal(socketCommandRequiresOperationId('approve_all'), true);
     assert.equal(socketCommandRequiresOperationId('new_chat'), true);
     assert.equal(socketCommandRequiresOperationId('set_plan_model'), true);
-    assert.equal(socketCommandRequiresOperationId('reject'), false);
+    assert.equal(socketCommandRequiresOperationId('reject'), true);
     assert.equal(socketCommandRequiresOperationId('click_action', 'run'), true);
     assert.equal(socketCommandRequiresOperationId('click_action', 'continue'), true);
     assert.equal(socketCommandRequiresOperationId('click_action', 'skip'), true);
@@ -552,6 +598,104 @@ describe('Relay inbound action protocol', () => {
     assert.equal((result.data as { metadata: { fileName: string } }).metadata.fileName, 'resolved.plan.md');
   });
 
+  it('reads a workspace plan from the resolved root and never leaks that path', async () => {
+    const workspacePath = join(dir, 'cursorremote');
+    const plansRoot = join(workspacePath, '.cursor', 'plans');
+    mkdirSync(plansRoot, { recursive: true });
+    writeFileSync(join(plansRoot, 'workspace.plan.md'), '# 工作区计划正文');
+    const manager = new StateManager(0);
+    manager.onConnectionChanged(true);
+    manager.onExtraction(stateWithPlan('plan-current', 'Created Plan'));
+    const calls: ExecutorCall[] = [];
+    const { origin } = await startRelay(calls, {
+      planFileName: 'workspace.plan.md',
+      planPlansRoot: plansRoot,
+    }, manager);
+    const { sid } = await connectSocket(origin);
+    const result = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-workspace-full',
+      planId: 'plan-current',
+      windowId: 'target-a',
+      composerId: 'composer-current',
+      fileName: 'forged.plan.md',
+      path: '/etc/passwd',
+      plansRoot: '/etc',
+    });
+    assert.equal(result.ok, true, result.error);
+    const data = result.data as { body: string; metadata: Record<string, unknown> };
+    assert.equal(data.body, '# 工作区计划正文');
+    assert.equal(data.metadata.fileName, 'workspace.plan.md');
+    assert.equal(data.metadata.source, 'cursor_plan_file');
+    assert.equal('plansRoot' in data.metadata, false);
+    assert.equal('path' in data.metadata, false);
+    assert.equal('root' in data.metadata, false);
+    const serialized = JSON.stringify(result);
+    assert.equal(serialized.includes(plansRoot), false);
+    assert.equal(serialized.includes(workspacePath), false);
+    assert.equal(serialized.includes('/etc/passwd'), false);
+    assert.deepEqual(calls, [{ method: 'resolvePlanFile', commandId: 'cmd-workspace-full', expected: {
+      windowId: 'target-a', composerId: 'composer-current', planId: 'plan-current', toolCallId: 'tc-current-plan',
+    } }]);
+  });
+
+  it('does not leak a workspace root when the resolved plan file cannot be read', async () => {
+    const workspacePath = join(dir, 'missing-workspace');
+    const plansRoot = join(workspacePath, '.cursor', 'plans');
+    const manager = new StateManager(0);
+    manager.onConnectionChanged(true);
+    manager.onExtraction(stateWithPlan('plan-current', 'Created Plan'));
+    const calls: ExecutorCall[] = [];
+    const { origin } = await startRelay(calls, {
+      planFileName: 'missing.plan.md',
+      planPlansRoot: plansRoot,
+    }, manager);
+    const { sid } = await connectSocket(origin);
+    const result = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-workspace-missing',
+      planId: 'plan-current',
+      windowId: 'target-a',
+      composerId: 'composer-current',
+      plansRoot,
+      path: workspacePath,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.data, undefined);
+    assert.match(result.error ?? '', /not found|not safe|could not be read/i);
+    const serialized = JSON.stringify(result);
+    assert.equal(serialized.includes(plansRoot), false);
+    assert.equal(serialized.includes(workspacePath), false);
+    assert.equal((result.error ?? '').includes('.cursor/plans'), false);
+  });
+
+  it('ignores a client-supplied plansRoot when the current plan already has a file name', async () => {
+    writeFileSync(join(dir, '.cursor', 'plans', 'current_plan.plan.md'), '# Home plan body');
+    const outsider = join(dir, 'outsider', '.cursor', 'plans');
+    mkdirSync(outsider, { recursive: true });
+    writeFileSync(join(outsider, 'current_plan.plan.md'), '# SECRET_SHOULD_NOT_LEAK');
+    const manager = new StateManager(0);
+    manager.onConnectionChanged(true);
+    manager.onExtraction(stateWithPlan());
+    const calls: ExecutorCall[] = [];
+    const { origin } = await startRelay(calls, undefined, manager);
+    const { sid } = await connectSocket(origin);
+    const result = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-client-root',
+      planId: 'plan-current',
+      windowId: 'target-a',
+      composerId: 'composer-current',
+      plansRoot: outsider,
+      path: join(outsider, 'current_plan.plan.md'),
+    });
+    assert.equal(result.ok, true, result.error);
+    const data = result.data as { body: string; metadata: Record<string, unknown> };
+    assert.equal(data.body, '# Home plan body');
+    assert.equal(data.metadata.fileName, 'current_plan.plan.md');
+    assert.equal('plansRoot' in data.metadata, false);
+    assert.equal(JSON.stringify(result).includes('SECRET_SHOULD_NOT_LEAK'), false);
+    assert.equal(JSON.stringify(result).includes(outsider), false);
+    assert.equal(calls.length, 0);
+  });
+
   it('discards plan resolution after the session changes while awaiting the UI', async () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -573,6 +717,165 @@ describe('Relay inbound action protocol', () => {
     assert.equal(result.ok, false);
     assert.equal(result.data, undefined);
     assert.match(result.error ?? '', /无法确认|失效/);
+  });
+
+  it('reports expired when the plan fingerprint changes during get_plan_full', async () => {
+    const gate = deferred();
+    const manager = new StateManager(0);
+    manager.onConnectionChanged(true);
+    manager.onExtraction(stateWithPlan('plan-current', 'Created Plan'));
+    const calls: ExecutorCall[] = [];
+    const { origin } = await startRelay(calls, { gate: gate.promise }, manager);
+    const { sid } = await connectSocket(origin);
+    const requested = { windowId: 'target-a', composerId: 'composer-current', planId: 'plan-current' };
+    await postCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-plan-fingerprint', ...requested,
+    });
+    try {
+      for (let i = 0; calls.length === 0 && i < 50; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(calls.length, 1);
+      const next = stateWithPlan('plan-current', 'Created Plan');
+      next.messages[0] = { ...next.messages[0], todosCompleted: 1, todosTotal: 3, title: 'Plan updated' };
+      manager.onExtraction(next);
+    } finally { gate.resolve(); }
+    const [result] = await collectResults(origin, sid, 1);
+    assert.match(result.error ?? '', /无法确认|失效/);
+    assertPlanFailure(result, {
+      commandId: 'cmd-plan-fingerprint', code: 'expired', stage: 'guard', requested,
+    });
+    assert.equal(calls.some((call) => call.method === 'resolvePlanFile'), true);
+  });
+
+  it('get_plan_full 守卫失败带稳定结构化原因且保留通用 error', async () => {
+    const manager = new StateManager(0);
+    manager.onConnectionChanged(true);
+    manager.onExtraction(stateWithPlan());
+    const calls: ExecutorCall[] = [];
+    const { origin } = await startRelay(calls, undefined, manager);
+    const { sid } = await connectSocket(origin);
+    const requested = { windowId: 'target-a', composerId: 'composer-current', planId: 'plan-current' };
+
+    const missing = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-plan-missing-target', planId: 'plan-current',
+    });
+    assert.match(missing.error ?? '', /读取计划需要明确/);
+    assertPlanFailure(missing, {
+      commandId: 'cmd-plan-missing-target', code: 'invalid', stage: 'validate',
+      requested: { planId: 'plan-current' },
+    });
+
+    const foreignWindow = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-plan-window', ...requested, windowId: 'target-b',
+    });
+    assert.match(foreignWindow.error ?? '', /无法确认|失效/);
+    assertPlanFailure(foreignWindow, {
+      commandId: 'cmd-plan-window', code: 'window', stage: 'guard',
+      requested: { windowId: 'target-b', composerId: 'composer-current', planId: 'plan-current' },
+    });
+    assert.equal(JSON.stringify(foreignWindow).includes('target-a'), false, 'must not leak the other window id');
+
+    const foreignComposer = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-plan-session', ...requested, composerId: 'composer-other',
+    });
+    assertPlanFailure(foreignComposer, {
+      commandId: 'cmd-plan-session', code: 'session', stage: 'guard',
+      requested: { windowId: 'target-a', composerId: 'composer-other', planId: 'plan-current' },
+    });
+
+    const missingPlan = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-plan-absent', ...requested, planId: 'plan-forged',
+    });
+    assert.match(missingPlan.error ?? '', /当前会话/);
+    assertPlanFailure(missingPlan, {
+      commandId: 'cmd-plan-absent', code: 'plan', stage: 'guard',
+      requested: { windowId: 'target-a', composerId: 'composer-current', planId: 'plan-forged' },
+    });
+
+    manager.getCurrentState().lastExtractionAt = Date.now() - 60_000;
+    const stale = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-plan-expired', ...requested,
+    });
+    assertPlanFailure(stale, {
+      commandId: 'cmd-plan-expired', code: 'expired', stage: 'guard', requested,
+    });
+
+    manager.getCurrentState().lastExtractionAt = Date.now();
+    manager.onExtractionFailure('selector miss');
+    const extraction = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-plan-extraction', ...requested,
+    });
+    assertPlanFailure(extraction, {
+      commandId: 'cmd-plan-extraction', code: 'extraction', stage: 'guard', requested,
+    });
+
+    manager.onExtraction(stateWithPlan());
+    manager.onConnectionChanged(false);
+    const disconnected = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-plan-connection', ...requested,
+    });
+    assertPlanFailure(disconnected, {
+      commandId: 'cmd-plan-connection', code: 'connection', stage: 'guard', requested,
+    });
+
+    manager.onConnectionChanged(true);
+    manager.onExtraction(stateWithPlan('plan-current', 'missing-on-disk.plan.md'));
+    const fileMiss = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-plan-file', ...requested,
+    });
+    assert.match(fileMiss.error ?? '', /not found|could not be read/);
+    assertPlanFailure(fileMiss, {
+      commandId: 'cmd-plan-file', code: 'file', stage: 'read', requested,
+    });
+    assert.equal(calls.length, 0);
+  });
+
+  it('refuses a legacy summary-only plan card without resolving a file or reading disk', async () => {
+    writeFileSync(join(dir, '.cursor', 'plans', 'Build Plan in Parallel.plan.md'), '# decoy body must not be returned');
+    writeFileSync(join(dir, '.cursor', 'plans', 'current_plan.plan.md'), '# another decoy');
+    const manager = new StateManager(0);
+    manager.onConnectionChanged(true);
+    const state = stateWithPlan('plan-executing', 'Build Plan in Parallel');
+    state.messages[0] = {
+      type: 'plan',
+      id: 'plan-executing',
+      flatIndex: 0,
+      label: 'Build Plan in Parallel',
+      title: 'Build Plan in Parallel',
+      todosCompleted: 0,
+      todosTotal: 0,
+    };
+    manager.onExtraction(state);
+    const calls: ExecutorCall[] = [];
+    const { origin } = await startRelay(calls, undefined, manager);
+    const { sid } = await connectSocket(origin);
+    const requested = {
+      windowId: 'target-a',
+      composerId: 'composer-current',
+      planId: 'plan-executing',
+    };
+    const result = await emitCommand(origin, sid, 'command:get_plan_full', {
+      commandId: 'cmd-plan-summary-only',
+      ...requested,
+      fileName: 'Build Plan in Parallel.plan.md',
+      planLabel: 'Build Plan in Parallel.plan.md',
+      toolCallId: 'tc-forged',
+    });
+    assert.match(result.error ?? '', /缺少可核对的文件关联/);
+    assert.match(result.error ?? '', /无法读取全文/);
+    assert.match(result.error ?? '', /创建计划记录/);
+    assert.match(result.error ?? '', /不保证一定存在创建记录/);
+    assert.match(result.error ?? '', /当前会话/);
+    assertPlanFailure(result, {
+      commandId: 'cmd-plan-summary-only',
+      code: 'plan',
+      stage: 'resolve',
+      requested,
+    });
+    assert.equal(calls.length, 0, 'must not call resolvePlanFile without a server-observed toolCallId');
+    const serialized = JSON.stringify(result);
+    assert.doesNotMatch(serialized, /decoy body/);
+    assert.doesNotMatch(serialized, /Build Plan in Parallel\.plan\.md/);
+    assert.equal(serialized.includes('tc-forged'), false);
   });
 
   it('forwards click_action with actionId and validated actionType', async () => {
@@ -1095,6 +1398,34 @@ describe('Relay history plan discovery and plan-ref reads', () => {
     assert.equal(result.data, undefined);
   });
 
+  it('A→B→A during in-flight discover reports expired, not unknown', async () => {
+    const calls: ExecutorCall[] = [];
+    const { bridge, live } = mutableBridge();
+    const manager = freshManager();
+    const gate = deferred();
+    const { origin } = await startRelay(calls, { gate: gate.promise }, manager, bridge);
+    const { sid } = await connectSocket(origin);
+
+    await postCommand(origin, sid, 'command:discover_plans', discoverPayload('cmd-discover-aba'));
+    for (let i = 0; calls.length === 0 && i < 100; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(calls.length, 1);
+    live.targetId = 'target-b';
+    manager.updateWindows([], 'target-b');
+    live.targetId = 'target-a';
+    manager.updateWindows([], 'target-a');
+    gate.resolve();
+    const [result] = await collectResults(origin, sid, 1);
+    assert.equal(result.commandId, 'cmd-discover-aba');
+    assert.equal(result.ok, false);
+    assert.equal(result.data, undefined);
+    assertPlanFailure(result, {
+      commandId: 'cmd-discover-aba',
+      code: 'expired',
+      stage: 'guard',
+      requested: { windowId: 'target-a', composerId: 'composer-current' },
+    });
+  });
+
   it('refuses discovery for a foreign, missing, or unknown target without issuing refs', async () => {
     const calls: ExecutorCall[] = [];
     const { origin } = await startRelay(calls);
@@ -1123,6 +1454,85 @@ describe('Relay history plan discovery and plan-ref reads', () => {
     const valid = await emitCommand(origin, sid, 'command:discover_plans', discoverPayload('cmd-discover-valid'));
     assert.equal(valid.ok, true, valid.error);
     assert.equal(discoveryData(valid).plans.length, 2);
+  });
+
+  it('discover_plans 守卫失败带稳定结构化原因且不泄漏其他目标', async () => {
+    const manager = freshManager();
+    const calls: ExecutorCall[] = [];
+    const { origin } = await startRelay(calls, {}, manager);
+    const { sid } = await connectSocket(origin);
+    const requested = { windowId: 'target-a', composerId: 'composer-current' };
+
+    const missing = await emitCommand(origin, sid, 'command:discover_plans', {
+      commandId: 'cmd-discover-invalid', type: 'discover_plans',
+    });
+    assert.match(missing.error ?? '', /查找计划需要明确/);
+    assertPlanFailure(missing, {
+      commandId: 'cmd-discover-invalid', code: 'invalid', stage: 'validate',
+    });
+
+    const foreignWindow = await emitCommand(origin, sid, 'command:discover_plans', {
+      commandId: 'cmd-discover-window', type: 'discover_plans',
+      windowId: 'target-b', composerId: 'composer-current',
+    });
+    assert.match(foreignWindow.error ?? '', /无法确认|失效|窗口/);
+    assertPlanFailure(foreignWindow, {
+      commandId: 'cmd-discover-window', code: 'window', stage: 'guard',
+      requested: { windowId: 'target-b', composerId: 'composer-current' },
+    });
+    assert.equal(JSON.stringify(foreignWindow).includes('target-a'), false, 'must not leak the other window id');
+
+    const foreignComposer = await emitCommand(origin, sid, 'command:discover_plans', {
+      commandId: 'cmd-discover-session', type: 'discover_plans',
+      windowId: 'target-a', composerId: 'composer-other',
+    });
+    assertPlanFailure(foreignComposer, {
+      commandId: 'cmd-discover-session', code: 'session', stage: 'guard',
+      requested: { windowId: 'target-a', composerId: 'composer-other' },
+    });
+
+    manager.getCurrentState().lastExtractionAt = Date.now() - 60_000;
+    const stale = await emitCommand(origin, sid, 'command:discover_plans', {
+      ...discoverPayload('cmd-discover-expired'),
+    });
+    assertPlanFailure(stale, {
+      commandId: 'cmd-discover-expired', code: 'expired', stage: 'guard', requested,
+    });
+
+    manager.getCurrentState().lastExtractionAt = Date.now();
+    manager.onExtractionFailure('selector miss');
+    const extraction = await emitCommand(origin, sid, 'command:discover_plans', {
+      ...discoverPayload('cmd-discover-extraction'),
+    });
+    assertPlanFailure(extraction, {
+      commandId: 'cmd-discover-extraction', code: 'extraction', stage: 'guard', requested,
+    });
+
+    manager.onExtraction(stateWithoutPlanCards());
+    manager.onConnectionChanged(false);
+    const disconnected = await emitCommand(origin, sid, 'command:discover_plans', {
+      ...discoverPayload('cmd-discover-connection'),
+    });
+    assertPlanFailure(disconnected, {
+      commandId: 'cmd-discover-connection', code: 'connection', stage: 'guard', requested,
+    });
+
+    const busyCalls: ExecutorCall[] = [];
+    const busyManager = freshManager();
+    const gate = deferred();
+    const busy = await startRelay(busyCalls, { gate: gate.promise }, busyManager);
+    const busySock = await connectSocket(busy.origin);
+    await postCommand(busy.origin, busySock.sid, 'command:discover_plans', discoverPayload('cmd-discover-busy-owner'));
+    for (let i = 0; busyCalls.length === 0 && i < 100; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+    const reentrant = await emitCommand(busy.origin, busySock.sid, 'command:discover_plans', discoverPayload('cmd-discover-busy'));
+    assert.match(reentrant.error ?? '', /正在查找/);
+    assertPlanFailure(reentrant, {
+      commandId: 'cmd-discover-busy', code: 'busy', stage: 'guard', requested,
+    });
+    gate.resolve();
+    await collectResults(busy.origin, busySock.sid, 1);
+
+    assert.equal(calls.filter((call) => call.method === 'discoverPlans').length, 0);
   });
 
   it('never returns more than 32 refs in one batch', async () => {

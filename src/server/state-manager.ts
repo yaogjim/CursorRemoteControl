@@ -25,6 +25,7 @@ function stripAuthorizationSelectors<T>(value: T): T {
 
 export function toPublicState(state: CursorState): CursorState {
   const rest = { ...state };
+  delete rest._workspaceIdentity;
   delete rest._rawSignals;
   return stripAuthorizationSelectors(rest);
 }
@@ -32,6 +33,7 @@ export function toPublicState(state: CursorState): CursorState {
 /** Socket-facing patch: drop internal extractor diagnostics and selector paths. */
 export function toPublicPatch(patch: Partial<CursorState>): Partial<CursorState> {
   const rest = { ...patch };
+  delete rest._workspaceIdentity;
   delete rest._rawSignals;
   return stripAuthorizationSelectors(rest);
 }
@@ -328,6 +330,11 @@ export class StateManager extends EventEmitter {
 
     if (JSON.stringify(prev.chatTabs) !== JSON.stringify(next.chatTabs)) {
       patch.chatTabs = next.chatTabs;
+      hasChange = true;
+    }
+
+    if (prev.activeComposerId !== next.activeComposerId) {
+      patch.activeComposerId = next.activeComposerId;
       hasChange = true;
     }
 

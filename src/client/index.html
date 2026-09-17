@@ -86,6 +86,22 @@
       <div id="session-plans-items" class="session-plans-items"></div>
     </div>
 
+    <section id="supervision-panel" class="supervision-panel hidden" aria-labelledby="supervision-title">
+      <div class="supervision-header">
+        <strong id="supervision-title">Workspace supervision</strong>
+        <span id="supervision-status" role="status"></span>
+      </div>
+      <div id="supervision-summary" class="supervision-summary"></div>
+      <div class="supervision-issue-actions">
+        <button type="button" id="btn-supervision-check" class="hidden">Record active check</button>
+        <button type="button" id="btn-supervision-request" class="hidden">Request decision for current action</button>
+      </div>
+      <div id="supervision-owner-actions" class="supervision-issue-actions"></div>
+      <div id="supervision-issues" class="supervision-issues" aria-live="polite"></div>
+      <div id="supervision-checks" class="supervision-checks"></div>
+      <div id="supervision-operations" class="supervision-operations"></div>
+    </section>
+
     <div id="drawer-overlay" class="drawer-overlay hidden"></div>
     <div id="drawer" class="drawer hidden" role="dialog" aria-modal="true" aria-labelledby="drawer-title" aria-hidden="true">
       <div class="drawer-header">

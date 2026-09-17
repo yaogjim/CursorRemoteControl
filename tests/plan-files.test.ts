@@ -5,9 +5,11 @@ import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'fs';
 import { join, resolve } from 'path';
-import { tmpdir } from 'os';
+import { tmpdir, homedir } from 'os';
 import {
   MAX_PLAN_FILE_BYTES,
+  fileWorkspacePlansRoot,
+  planFileFromFileUri,
   readPlanFile,
   readPlanFileResult,
   resolvePlanFilePath,
@@ -171,5 +173,109 @@ describe('readPlanFile', () => {
     const large = readPlanFileResult('too-large.plan.md', plansRoot);
     assert.equal(large.ok, false);
     if (!large.ok) assert.equal(large.error, 'too_large');
+  });
+});
+
+const FILE_WORKSPACE = {
+  id: '265d56b2c491736926ee6e06eeffd5de',
+  uri: { scheme: 'file', authority: '', path: '/Users/yaogj/works/ccspace/cursorremote' },
+};
+
+describe('fileWorkspacePlansRoot', () => {
+  it('accepts the observed local file workspace and points at its .cursor/plans', () => {
+    assert.equal(
+      fileWorkspacePlansRoot(FILE_WORKSPACE),
+      '/Users/yaogj/works/ccspace/cursorremote/.cursor/plans',
+    );
+  });
+
+  it('rejects remote scheme, authority, missing identity, and multi-root workspaces', () => {
+    assert.equal(fileWorkspacePlansRoot(null), null);
+    assert.equal(fileWorkspacePlansRoot({ uri: FILE_WORKSPACE.uri }), null);
+    assert.equal(fileWorkspacePlansRoot({ id: '', uri: FILE_WORKSPACE.uri }), null);
+    assert.equal(fileWorkspacePlansRoot({
+      ...FILE_WORKSPACE,
+      uri: { ...FILE_WORKSPACE.uri, scheme: 'vscode-remote' },
+    }), null);
+    assert.equal(fileWorkspacePlansRoot({
+      ...FILE_WORKSPACE,
+      uri: { ...FILE_WORKSPACE.uri, authority: 'ssh-remote+host' },
+    }), null);
+    assert.equal(fileWorkspacePlansRoot({ ...FILE_WORKSPACE, folders: [{}, {}] }), null);
+    assert.equal(fileWorkspacePlansRoot({ ...FILE_WORKSPACE, folderCount: 2 }), null);
+  });
+
+  it('rejects relative, encoded, backslash, and traversal workspace paths', () => {
+    const badPaths = [
+      'Users/yaogj/works/ccspace/cursorremote',
+      '/Users/yaogj/works/ccspace/cursorremote/',
+      '/Users/yaogj/works/ccspace/cursorremote\\plans',
+      '/Users/yaogj/works/%2e%2e/ccspace/cursorremote',
+      '/Users/yaogj/works/ccspace/../secret',
+      '/Users/yaogj/works/ccspace/cursorremote/./proj',
+    ];
+    for (const path of badPaths) {
+      assert.equal(fileWorkspacePlansRoot({ ...FILE_WORKSPACE, uri: { ...FILE_WORKSPACE.uri, path } }), null, path);
+    }
+  });
+});
+
+describe('planFileFromFileUri', () => {
+  const homeName = 'safe_plan_abc123.plan.md';
+  const homeUri = `file://${resolve(homedir(), '.cursor', 'plans', homeName)}`;
+
+  it('accepts a home-plans file URI and returns only the basename', () => {
+    assert.deepEqual(planFileFromFileUri(homeUri), { fileName: homeName });
+  });
+
+  it('accepts a verified workspace plans file URI and returns that root', () => {
+    const name = 'safe_plan_abc123.plan.md';
+    const uri = `file://${FILE_WORKSPACE.uri.path}/.cursor/plans/${name}`;
+    assert.deepEqual(planFileFromFileUri(uri, FILE_WORKSPACE), {
+      fileName: name,
+      plansRoot: `${FILE_WORKSPACE.uri.path}/.cursor/plans`,
+    });
+  });
+
+  it('rejects traversal, non-file URIs, and paths outside the plans roots', () => {
+    const cases = [
+      'file:///etc/passwd.plan.md',
+      `file://${resolve(homedir(), '.cursor', 'plans', '..', 'secret.plan.md')}`,
+      `file://${resolve(homedir(), '.cursor', 'plans')}/../secret.plan.md`,
+      `file://${resolve(homedir(), '.cursor', 'plans')}/sub/${homeName}`,
+      'file://localhost/Users/yaogj/.cursor/plans/safe_plan_abc123.plan.md',
+      'https://example.com/safe_plan_abc123.plan.md',
+      '/Users/yaogj/.cursor/plans/safe_plan_abc123.plan.md',
+    ];
+    for (const uri of cases) {
+      assert.equal(planFileFromFileUri(uri), null, uri);
+    }
+  });
+});
+
+describe('readPlanFileResult with a file-workspace plans root', () => {
+  it('reads a plan inside that root and refuses a path outside it', () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'plan-workspace-'));
+    try {
+      const workspacePath = join(fixtureRoot, 'cursorremote');
+      const plansRoot = join(workspacePath, '.cursor', 'plans');
+      mkdirSync(plansRoot, { recursive: true });
+      writeFileSync(join(plansRoot, 'safe_plan_abc123.plan.md'), PLAN_MD);
+      const secretPath = join(fixtureRoot, 'secret.md');
+      writeFileSync(secretPath, SECRET);
+      const identity = {
+        id: '265d56b2c491736926ee6e06eeffd5de',
+        uri: { scheme: 'file', authority: '', path: workspacePath },
+      };
+      const resolvedRoot = fileWorkspacePlansRoot(identity);
+      assert.equal(resolvedRoot, plansRoot);
+      const result = readPlanFileResult('safe_plan_abc123.plan.md', resolvedRoot as string);
+      assert.ok(result.ok);
+      if (result.ok) assert.equal(result.data.body, '# Safe Plan Body');
+      assert.equal(readPlanFile('../secret.md', resolvedRoot as string), null);
+      assert.equal(readPlanFile(secretPath, resolvedRoot as string), null);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
   });
 });

@@ -5,7 +5,20 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { randomBytes, timingSafeEqual, createHash } from 'crypto';
 import { readFileSync } from 'fs';
-import type { ServerConfig, CursorState, CommandPayload, CommandResult, PlanBlock, PlanFullData, PlanDiscoveryData, SanitizedDiscoveryStatus } from './types.js';
+import type {
+  ServerConfig,
+  CursorState,
+  CommandPayload,
+  CommandResult,
+  PlanBlock,
+  PlanFullData,
+  PlanDiscoveryData,
+  SanitizedDiscoveryStatus,
+  PlanFailureCode,
+  PlanFailureStage,
+  SupervisionGrant,
+  WorkspaceIdentity,
+} from './types.js';
 import { AdapterStore } from './adapter-store.js';
 import { ActionRegistry } from './action-registry.js';
 import { capabilityAllows } from './capability-guard.js';
@@ -14,7 +27,7 @@ import { normalizeModel } from './capability-normalize.js';
 import { RuntimeValidator } from './runtime-validator.js';
 import type { RuntimeSelectorProvider, RuntimeAdapterContext } from './runtime-selector-provider.js';
 import { toPublicPatch, toPublicState, type StateManager } from './state-manager.js';
-import type { CommandExecutor } from './command-executor.js';
+import type { CommandExecutor, CommandDispatchOptions } from './command-executor.js';
 import type { CdpClient } from './cdp-client.js';
 import type { CDPBridge } from './cdp-bridge.js';
 import type { CapabilityStateManager } from './capability-state-manager.js';
@@ -22,12 +35,25 @@ import { TargetUiCoordinator } from './target-ui-coordinator.js';
 import { moveHomeWindow, type WindowMonitor } from './window-monitor.js';
 import { markdownToWebHtml, readPlanFileResult, type PlanFileReadError } from './plan-files.js';
 import {
+  attachPlanFailure,
+  diagnosePlanGuardFailure,
+  planFailResult,
+  planRequestedTarget,
+  sanitizePlanFailure,
+  type PlanGuardSnapshot,
+} from './plan-command-failure.js';
+import {
   WEBAPP_SESSION_COOKIE,
   SESSION_COOKIE_MAX_AGE_SEC,
   createWebappSessionStore,
   parseSessionCookie,
   type WebappSessionStore,
 } from './webapp-sessions.js';
+import { getRuntimeIdentity } from './runtime-identity.js';
+import { SupervisionError, SupervisionManager } from './supervision-manager.js';
+import { canReadUnderSupervision } from './supervision-policy.js';
+import { OperationJournal } from './operation-journal.js';
+import { ScopedCommandService, type ScopedCommandRequest } from './scoped-command-service.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -48,6 +74,7 @@ const MAX_RATE_LIMIT_KEYS = 2048;
 const MAX_OPERATION_CACHE = 1024;
 const OPERATION_CACHE_TTL_MS = 5 * 60_000;
 const PLAN_REFERENCE_TTL_MS = 5 * 60_000;
+const SUPERVISION_IDENTITY_FRESH_MS = 15_000;
 const API_JSON_LIMIT = '64kb';
 
 /** Dedicated socket events that mutate Cursor and require a bounded operationId. */
@@ -55,6 +82,7 @@ export const DANGEROUS_SOCKET_COMMANDS = new Set([
   'send_message',
   'approve',
   'approve_all',
+  'reject',
   'new_chat',
   'set_mode',
   'set_model',
@@ -71,6 +99,17 @@ export const DANGEROUS_ACTION_TYPES = new Set([
   'continue',
   'skip',
   'questionnaire_option',
+]);
+
+const SUPERVISED_WRITE_ROUTES = new Set([
+  'send_message',
+  'approve',
+  'approve_all',
+  'reject',
+  'set_mode',
+  'set_model',
+  'set_plan_model',
+  'click_action',
 ]);
 
 export function isValidActionType(value: unknown): value is string {
@@ -107,8 +146,60 @@ function parseCookieMap(header: string | undefined): Record<string, string> {
   }).filter(([key]) => key));
 }
 
-function csrfSetCookie(token: string): string {
-  return `${CSRF_COOKIE}=${token}; Path=/; SameSite=Lax; Max-Age=${SESSION_COOKIE_MAX_AGE_SEC}`;
+function csrfSetCookie(token: string, maxAgeSec = SESSION_COOKIE_MAX_AGE_SEC): string {
+  return `${CSRF_COOKIE}=${token}; Path=/; SameSite=Lax; Max-Age=${maxAgeSec}`;
+}
+
+function sessionSetCookie(token: string, maxAgeSec: number): string {
+  return [
+    `${WEBAPP_SESSION_COOKIE}=${token}`,
+    'HttpOnly',
+    'Path=/',
+    'SameSite=Lax',
+    `Max-Age=${maxAgeSec}`,
+  ].join('; ');
+}
+
+type OwnerPrincipal = { role: 'owner'; token?: string };
+type SupervisorPrincipal = { role: 'supervisor'; token: string; grant: SupervisionGrant; expiresAt: number };
+type RelayPrincipal = OwnerPrincipal | SupervisorPrincipal;
+
+function workspaceIdentitiesEqual(
+  a: WorkspaceIdentity | null | undefined,
+  b: WorkspaceIdentity | null | undefined,
+): boolean {
+  if (!a || !b) return false;
+  return a.id === b.id
+    && a.uri.scheme === b.uri.scheme
+    && a.uri.authority === b.uri.authority
+    && a.uri.path === b.uri.path;
+}
+
+function isSupervisorForbiddenApi(pathname: string): boolean {
+  const path = pathname.replace(/\/+$/, '') || '/';
+  if (path.startsWith('/api/capabilities')) return true;
+  if (path.startsWith('/api/discovery')) return true;
+  if (path.startsWith('/api/adapters')) return true;
+  if (path.startsWith('/api/supervision/grants')) return true;
+  return false;
+}
+
+function uniqueStringIds(values: unknown): string[] | null {
+  if (!Array.isArray(values)) return null;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of values) {
+    if (typeof item !== 'string' || item.length === 0) return null;
+    if (seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+  }
+  return out;
+}
+
+function isIdSubset(write: string[], read: string[]): boolean {
+  const allowed = new Set(read);
+  return write.every((id) => allowed.has(id));
 }
 
 function sendApiError(req: express.Request, res: express.Response, status: number, error: string): void {
@@ -383,11 +474,16 @@ export class Relay {
   private runtimeValidator = new RuntimeValidator();
 
   private sessionStore: WebappSessionStore;
+  private supervisionManager: SupervisionManager;
+  private operationJournal: OperationJournal;
+  private scopedCommandService: ScopedCommandService;
   private rateLimiter = new BoundedRateLimiter(MAX_RATE_LIMIT_KEYS);
   private operationCache = new Map<string, OperationCacheEntry>();
   private socketOperationCache = new Map<string, OperationCacheEntry>();
   // 仅跨越 await 到最终响应发送的校验；不缓存计划正文或结果。
   private readonly planResultGuards = new WeakMap<CommandResult, () => boolean>();
+  private readonly runtimeIdentity = getRuntimeIdentity();
+  private supervisionCheckTimer: ReturnType<typeof setInterval> | null = null;
 
   private get authEnabled(): boolean {
     return this.config.webappPassword.length > 0;
@@ -422,6 +518,34 @@ export class Relay {
     this.runtimeSelectors = runtimeSelectors;
     this.actionRegistry = actionRegistry ?? new ActionRegistry({ ttlMs: config.actionTtlMs });
     this.sessionStore = createWebappSessionStore(config.dataDir);
+    this.supervisionManager = new SupervisionManager({ dataDir: config.dataDir });
+    this.operationJournal = new OperationJournal({ dataDir: config.dataDir });
+    this.scopedCommandService = new ScopedCommandService({
+      journal: this.operationJournal,
+      supervisionManager: this.supervisionManager,
+      getContext: () => {
+        const state = this.stateManager.getCurrentState();
+        const targetId = this.cdpBridge.activeTargetId;
+        return {
+          workspace: this.getObservedWorkspaceIdentity(state),
+          state,
+          activeTargetId: targetId,
+          targetGeneration: targetId ? this.cdpBridge.getTargetGeneration(targetId) : 0,
+          getDraftPresent: () => this.commandExecutor.hasComposerDraftNow(),
+          hasAction: (actionId: string) => this.stateContainsAction(this.stateManager.getCurrentState(), actionId),
+        };
+      },
+    });
+    const setHumanTakeoverHandler = (this.commandExecutor as {
+      setHumanTakeoverHandler?: (handler: (() => void | Promise<void>) | null) => void;
+    }).setHumanTakeoverHandler;
+    if (typeof setHumanTakeoverHandler === 'function') {
+      setHumanTakeoverHandler.call(this.commandExecutor, () => this.ownerTakeover());
+    }
+    const bridgeEvents = this.cdpBridge as unknown as {
+      on?: (event: string, listener: (workspace: WorkspaceIdentity | null) => void) => void;
+    };
+    bridgeEvents.on?.('willSwitchWindow', (workspace) => this.ownerTakeover(workspace));
 
     this.app = express();
     this.httpServer = createServer(this.app);
@@ -516,7 +640,12 @@ export class Relay {
   }
 
   notifyAdapterPending(adapter: { id: string; status: string; capabilityKinds: string[]; createdAt: number }): void {
-    this.io.emit('adapter:pending', { id: adapter.id, status: adapter.status, capabilityKinds: adapter.capabilityKinds, createdAt: adapter.createdAt });
+    this.emitOwnerEvent('adapter:pending', {
+      id: adapter.id,
+      status: adapter.status,
+      capabilityKinds: adapter.capabilityKinds,
+      createdAt: adapter.createdAt,
+    });
   }
 
   start(): Promise<void> {
@@ -536,6 +665,17 @@ export class Relay {
         console.log(
           `[relay] Server listening on http://${this.config.serverHost}:${this.port}`
         );
+        if (!this.supervisionCheckTimer) {
+          this.supervisionCheckTimer = setInterval(() => {
+            try {
+              const overdue = this.supervisionManager.markOverdueChecks();
+              if (overdue.length > 0) this.emitOwnerSupervisionState();
+            } catch (err) {
+              console.warn(`[relay] Supervision check expiry failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }, 1_000);
+          this.supervisionCheckTimer.unref?.();
+        }
         resolve();
       });
     });
@@ -543,6 +683,10 @@ export class Relay {
 
   async stop(): Promise<void> {
     this.sessionStore.flush();
+    if (this.supervisionCheckTimer) {
+      clearInterval(this.supervisionCheckTimer);
+      this.supervisionCheckTimer = null;
+    }
     this.io.close();
     return new Promise((resolve) => {
       this.httpServer.close(() => resolve());
@@ -599,6 +743,432 @@ export class Relay {
     return undefined;
   }
 
+  private extractCredentialTokens(authHeader: unknown, cookieHeader: unknown): string[] {
+    const tokens: string[] = [];
+    if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+      const t = authHeader.slice(7).trim();
+      if (t) tokens.push(t);
+    }
+    const fromCookie = parseSessionCookie(
+      typeof cookieHeader === 'string' ? cookieHeader : undefined,
+      WEBAPP_SESSION_COOKIE,
+    );
+    if (fromCookie) tokens.push(fromCookie);
+    return tokens;
+  }
+
+  private classifyCredential(token: string): RelayPrincipal | null {
+    if (this.sessionStore.touch(token)) return { role: 'owner', token };
+    const ctx = this.supervisionManager.authenticate(token);
+    if (!ctx) return null;
+    return { role: 'supervisor', token, grant: ctx.grant, expiresAt: ctx.expiresAt };
+  }
+
+  private resolvePrincipalFromTokens(tokens: string[]): RelayPrincipal | null {
+    let supervisor: SupervisorPrincipal | null = null;
+    for (const token of tokens) {
+      const classified = this.classifyCredential(token);
+      if (classified?.role === 'owner') return classified;
+      if (classified?.role === 'supervisor' && !supervisor) supervisor = classified;
+    }
+    if (supervisor) return supervisor;
+    if (!this.authEnabled) return { role: 'owner' };
+    return null;
+  }
+
+  private resolveHttpPrincipal(req: express.Request): RelayPrincipal | null {
+    return this.resolvePrincipalFromTokens(this.extractCredentialTokens(req.headers.authorization, req.headers.cookie));
+  }
+
+  private resolveSocketPrincipal(socket: Socket): RelayPrincipal | null {
+    const raw = socket.handshake.auth?.token;
+    const stored = typeof socket.data?.supervisorToken === 'string' ? socket.data.supervisorToken : undefined;
+    const tokens = this.extractCredentialTokens(
+      typeof raw === 'string' && raw.trim() ? `Bearer ${raw.trim()}` : undefined,
+      socket.handshake.headers.cookie,
+    );
+    if (stored && !tokens.includes(stored)) tokens.push(stored);
+    return this.resolvePrincipalFromTokens(tokens);
+  }
+
+  private liveSocketPrincipal(socket: Socket): RelayPrincipal | null {
+    if (socket.data?.principalRole === 'supervisor') {
+      const token = typeof socket.data.supervisorToken === 'string' ? socket.data.supervisorToken : '';
+      if (!token) return this.resolveSocketPrincipal(socket);
+      const ctx = this.supervisionManager.authenticate(token);
+      if (!ctx) return null;
+      return { role: 'supervisor', token, grant: ctx.grant, expiresAt: ctx.expiresAt };
+    }
+    return this.resolveSocketPrincipal(socket);
+  }
+
+  private rememberSocketPrincipal(socket: Socket, principal: RelayPrincipal): void {
+    socket.data.principalRole = principal.role;
+    if (principal.role === 'supervisor') {
+      socket.data.supervisorToken = principal.token;
+      socket.data.supervisionGrantId = principal.grant.grantId;
+      return;
+    }
+    socket.data.supervisorToken = undefined;
+    socket.data.supervisionGrantId = undefined;
+  }
+
+  private cookieMaxAgeSec(principal: RelayPrincipal | null | undefined): number {
+    if (principal?.role === 'supervisor') {
+      return Math.max(0, Math.floor((Math.min(principal.expiresAt, principal.grant.expiresAt) - Date.now()) / 1000));
+    }
+    return SESSION_COOKIE_MAX_AGE_SEC;
+  }
+
+  /** Identity observed with the latest DOM state; never fall back to a stale target title or connect-time value. */
+  private getObservedWorkspaceIdentity(state = this.stateManager.getCurrentState()): WorkspaceIdentity | null {
+    const observedAt = state.lastExtractionAt;
+    if (typeof observedAt !== 'number' || Date.now() - observedAt > SUPERVISION_IDENTITY_FRESH_MS) return null;
+    const identity = state._workspaceIdentity;
+    if (!identity || typeof identity.id !== 'string' || !identity.uri) return null;
+    return identity;
+  }
+
+  private listedComposerIds(): Set<string> {
+    const state = this.stateManager.getCurrentState();
+    const ids = new Set<string>();
+    for (const tab of state.chatTabs ?? []) {
+      if (typeof tab.composerId === 'string' && tab.composerId.length > 0) ids.add(tab.composerId);
+    }
+    if (state.activeComposerId) ids.add(state.activeComposerId);
+    return ids;
+  }
+
+  private filterStateForSupervisor(state: CursorState, grant: SupervisionGrant): CursorState {
+    const publicState = toPublicState(state);
+    const emptyState: CursorState = {
+      connected: false,
+      extractorStatus: 'idle',
+      lastExtractionAt: null,
+      consecutiveExtractionFailures: 0,
+      lastExtractionError: null,
+      agentStatus: 'idle',
+      agentActivityText: null,
+      agentActivityLive: false,
+      agentActivitySource: 'none',
+      chatTabs: [],
+      windows: [],
+      messages: [],
+      pendingApprovals: [],
+      composerQueue: { items: [] },
+      questionnaire: null,
+      activeComposerId: '',
+      activeWindowId: '',
+      inputAvailable: false,
+      mode: { current: '', available: [] },
+      model: { current: '', currentId: '' },
+    };
+    const identity = this.getObservedWorkspaceIdentity(state);
+    if (!workspaceIdentitiesEqual(identity, grant.workspace)) return emptyState;
+
+    const scopedEmpty: CursorState = {
+      ...emptyState,
+      connected: publicState.connected,
+      extractorStatus: publicState.extractorStatus,
+      lastExtractionAt: publicState.lastExtractionAt,
+      consecutiveExtractionFailures: publicState.consecutiveExtractionFailures,
+    };
+    const chatTabs = publicState.chatTabs.filter((tab) => canReadUnderSupervision(grant, tab.composerId));
+    const current = publicState.windows.find((window) => window.id === publicState.activeWindowId);
+    const windows = current
+      ? [{ id: current.id, title: current.title } as CursorState['windows'][number]]
+      : [];
+    const activeReadable = canReadUnderSupervision(grant, publicState.activeComposerId);
+    if (!activeReadable) {
+      return { ...scopedEmpty, chatTabs, windows };
+    }
+    return { ...publicState, lastExtractionError: null, chatTabs, windows };
+  }
+
+  private emitSupervisorState(socket: Socket, grant: SupervisionGrant): void {
+    socket.emit('state:full', this.filterStateForSupervisor(this.stateManager.getCurrentState(), grant));
+  }
+
+  private emitOwnerEvent(event: string, payload: unknown): void {
+    for (const socket of this.io.sockets.sockets.values()) {
+      if (this.liveSocketPrincipal(socket)?.role === 'owner') socket.emit(event, payload);
+    }
+  }
+
+  private disconnectGrantSockets(grantId: string): void {
+    for (const socket of this.io.sockets.sockets.values()) {
+      if (socket.data?.supervisionGrantId === grantId) socket.disconnect(true);
+    }
+  }
+
+  private publicGrant(grant: SupervisionGrant): SupervisionGrant {
+    return {
+      ...grant,
+      workspace: {
+        id: grant.workspace.id,
+        uri: {
+          scheme: grant.workspace.uri.scheme,
+          authority: grant.workspace.uri.authority,
+          path: '',
+        },
+      },
+    };
+  }
+
+  private supervisionSnapshot(grantId: string): Record<string, unknown> {
+    const grant = this.supervisionManager.getGrant(grantId);
+    if (!grant) return { grant: null, issues: [], checks: [], operations: [], observedAt: Date.now() };
+    const issues = this.supervisionManager.listIssues(grantId).map((issue) => ({
+      ...issue,
+      workspace: this.publicGrant(grant).workspace,
+    }));
+    const checks = this.supervisionManager.listChecks(grantId);
+    const operations = this.operationJournal.list()
+      .filter((record) => record.target.grantId === grantId)
+      .map((record) => ({
+        operationId: record.operationId,
+        status: record.status,
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+        target: {
+          workspaceId: record.target.workspaceId,
+          composerId: record.target.composerId,
+          windowId: record.target.windowId,
+          actionType: record.target.actionType,
+          planVersion: record.target.planVersion,
+          authorizationVersion: record.target.authorizationVersion,
+          controlVersion: record.target.controlVersion,
+        },
+      }));
+    const latestCheckAt = checks.reduce((value, item) => Math.max(value, item.checkedAt), grant.createdAt);
+    return {
+      grant: this.publicGrant(grant),
+      issues,
+      checks,
+      operations,
+      observedAt: Date.now(),
+      workspaceMatches: workspaceIdentitiesEqual(this.getObservedWorkspaceIdentity(), grant.workspace),
+      checkDueAt: grant.checkTtlMs > 0 ? latestCheckAt + grant.checkTtlMs : null,
+    };
+  }
+
+  private emitSupervisionState(socket: Socket, grantId: string): void {
+    try {
+      socket.emit('supervision:state', this.supervisionSnapshot(grantId));
+    } catch (err) {
+      socket.emit('supervision:state', {
+        grant: null,
+        issues: [],
+        checks: [],
+        operations: [],
+        observedAt: Date.now(),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private emitOwnerSupervisionState(): void {
+    const grants = this.supervisionManager.listGrants().map((grant) => this.supervisionSnapshot(grant.grantId));
+    this.emitOwnerEvent('supervision:overview', { grants, observedAt: Date.now() });
+  }
+
+  private emitAllSupervisionStates(): void {
+    this.emitOwnerSupervisionState();
+    for (const socket of this.io.sockets.sockets.values()) {
+      const principal = this.liveSocketPrincipal(socket);
+      if (principal?.role === 'supervisor') this.emitSupervisionState(socket, principal.grant.grantId);
+    }
+  }
+
+  private requireOwnerPrincipal(req: express.Request, res: express.Response): boolean {
+    const principal = this.resolveHttpPrincipal(req);
+    if (principal?.role === 'supervisor') {
+      sendApiError(req, res, 403, 'Forbidden');
+      return false;
+    }
+    if (!this.authEnabled || principal?.role === 'owner') return true;
+    if (!principal) {
+      sendApiError(req, res, 401, 'Unauthorized');
+      return false;
+    }
+    sendApiError(req, res, 403, 'Forbidden');
+    return false;
+  }
+
+  private supervisionCommandDenied(socket: Socket, route: string, payload: CommandPayload): string | null {
+    const principal = this.liveSocketPrincipal(socket);
+    if (socket.data?.principalRole === 'supervisor' && !principal) {
+      socket.disconnect(true);
+      return 'Supervision scope denied';
+    }
+    if (!principal || principal.role === 'owner') return null;
+    if (SUPERVISED_WRITE_ROUTES.has(route)) return null;
+    if (route !== 'discover_plans' && route !== 'get_plan_full') return 'Supervision scope denied';
+    if (!workspaceIdentitiesEqual(this.getObservedWorkspaceIdentity(), principal.grant.workspace)) {
+      return 'Supervision scope denied';
+    }
+    const composerId = payload.composerId;
+    if (typeof composerId !== 'string' || !canReadUnderSupervision(principal.grant, composerId)) {
+      return 'Supervision scope denied';
+    }
+    if (payload.windowId !== this.stateManager.getCurrentState().activeWindowId) {
+      return 'Supervision scope denied';
+    }
+    return null;
+  }
+
+  private ownerTakeover(workspace: WorkspaceIdentity | null = this.getObservedWorkspaceIdentity()): void {
+    if (workspace) {
+      this.supervisionManager.pauseWorkspace(workspace, 'human_takeover', { role: 'owner' });
+    } else {
+      // When the latest observed identity is stale, fail closed across all active
+      // grants rather than letting supervision resume after the next extraction.
+      for (const grant of this.supervisionManager.listGrants()) {
+        if (grant.status === 'active') {
+          this.supervisionManager.addPause(grant.grantId, 'human_takeover', { role: 'owner' });
+        }
+      }
+    }
+    // A human action wins even when the latest workspace observation is stale:
+    // cancelling all definitely-unmutated records is safer than leaving an old
+    // supervised operation queued for a later retry.
+    this.scopedCommandService.cancelPendingForWorkspace(workspace);
+    this.emitAllSupervisionStates();
+  }
+
+  private scopedWriteRequest(
+    principal: SupervisorPrincipal,
+    route: string,
+    payload: CommandPayload,
+  ): ScopedCommandRequest | null {
+    const state = this.stateManager.getCurrentState();
+    const operationId = payload.operationId;
+    const composerId = payload.composerId;
+    const windowId = payload.windowId;
+    const planVersion = payload.planVersion;
+    const authorizationVersion = payload.authorizationVersion;
+    const controlVersion = payload.controlVersion;
+    const targetId = this.cdpBridge.activeTargetId;
+    const targetGeneration = targetId ? this.cdpBridge.getTargetGeneration(targetId) : 0;
+    if (
+      typeof operationId !== 'string' || !OPERATION_ID_RE.test(operationId)
+      || typeof composerId !== 'string' || composerId.length === 0
+      || typeof windowId !== 'string' || windowId.length === 0
+      || typeof planVersion !== 'string' || planVersion.length === 0
+      || typeof authorizationVersion !== 'string' || authorizationVersion.length === 0
+      || typeof controlVersion !== 'string' || controlVersion.length === 0
+      || !targetId || !targetGeneration
+    ) return null;
+    const actionType = route === 'click_action'
+      ? payload.actionType ?? ''
+      : route;
+    const mode = route === 'set_mode' ? payload.modeId ?? '' : state.mode.current;
+    const model = route === 'set_model'
+      ? payload.modelId ?? ''
+      : route === 'set_plan_model'
+        ? payload.planModelId ?? ''
+        : state.model.currentId || state.model.current;
+    return {
+      operationId,
+      payloadDigest: this.socketOperationFingerprint(route, payload),
+      grantId: principal.grant.grantId,
+      composerId,
+      windowId,
+      targetId,
+      targetGeneration,
+      actionType,
+      mode,
+      model,
+      planVersion,
+      authorizationVersion,
+      controlVersion,
+      ...(typeof payload.issueId === 'string' && payload.issueId ? { issueId: payload.issueId } : {}),
+      ...(typeof payload.actionId === 'string' && payload.actionId ? { actionId: payload.actionId } : {}),
+      ...(typeof payload.contentDigest === 'string' && payload.contentDigest ? { contentDigest: payload.contentDigest } : {}),
+    };
+  }
+
+  private async runScopedWrite(
+    socket: Socket,
+    route: string,
+    payload: CommandPayload,
+    commandId: string,
+    dispatch: (options: CommandDispatchOptions) => Promise<CommandResult>,
+    confirm: () => boolean | Promise<boolean>,
+  ): Promise<CommandResult> {
+    const principal = this.liveSocketPrincipal(socket);
+    if (socket.data?.principalRole === 'supervisor' && !principal) {
+      socket.disconnect(true);
+      return { commandId, ok: false, error: 'Supervision scope denied' };
+    }
+    if (!principal || principal.role === 'owner') {
+      this.ownerTakeover();
+      return dispatch({});
+    }
+    const request = this.scopedWriteRequest(principal, route, payload);
+    if (!request) return { commandId, ok: false, error: 'Supervision write scope is incomplete' };
+    const result = await this.scopedCommandService.execute(request, dispatch, confirm);
+    this.emitSupervisionState(socket, principal.grant.grantId);
+    this.emitOwnerSupervisionState();
+    return { ...result, commandId };
+  }
+
+  private async waitForState(
+    predicate: (state: CursorState) => boolean,
+    timeoutMs = 3_000,
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (predicate(this.stateManager.getCurrentState())) return true;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return predicate(this.stateManager.getCurrentState());
+  }
+
+  private stateContainsAction(state: CursorState, actionId: string): boolean {
+    if (!actionId) return false;
+    for (const approval of state.pendingApprovals) {
+      if (approval.actions.some((action) => action.actionId === actionId)) return true;
+    }
+    for (const message of state.messages) {
+      if ('actions' in message && message.actions?.some((action) => action.actionId === actionId)) return true;
+      if (message.type === 'plan' && message.modelActionId === actionId) return true;
+    }
+    const questionnaire = state.questionnaire;
+    if (questionnaire?.skipActionId === actionId || questionnaire?.continueActionId === actionId) return true;
+    return questionnaire?.questions.some((question) =>
+      question.options.some((option) => option.actionId === actionId)
+    ) ?? false;
+  }
+
+  /** Bind a human decision to the currently observed opaque action and target versions. */
+  private currentActionDigest(
+    composerId: string,
+    actionType: string,
+    actionId: string,
+    planVersion: string,
+    authorizationVersion: string,
+  ): string | null {
+    const state = this.stateManager.getCurrentState();
+    if (state.activeComposerId !== composerId || !this.stateContainsAction(state, actionId)) return null;
+    const action = this.actionRegistry.public(actionId);
+    if (!action || !action.executable || action.kind !== actionType) return null;
+    const targetId = this.cdpBridge.activeTargetId;
+    const targetGeneration = targetId ? this.cdpBridge.getTargetGeneration(targetId) : 0;
+    if (!targetId || !targetGeneration) return null;
+    return createHash('sha256').update(JSON.stringify([
+      state.activeWindowId,
+      composerId,
+      targetId,
+      targetGeneration,
+      actionId,
+      actionType,
+      action.label,
+      planVersion,
+      authorizationVersion,
+    ])).digest('hex');
+  }
+
   private setupRoutes(): void {
     const clientDir = join(__dirname, '..', 'client');
     const apiJson = express.json({ limit: API_JSON_LIMIT });
@@ -647,38 +1217,104 @@ export class Relay {
       const csrf = randomBytes(24).toString('hex');
       this.sessionStore.add(token);
       console.log(`[relay] Successful login from ${ip}`);
-      res.setHeader(
-        'Set-Cookie',
-        [
-          `${WEBAPP_SESSION_COOKIE}=${token}`,
-          'HttpOnly',
-          'Path=/',
-          'SameSite=Lax',
-          `Max-Age=${SESSION_COOKIE_MAX_AGE_SEC}`,
-        ].join('; ')
-      );
+      res.setHeader('Set-Cookie', sessionSetCookie(token, SESSION_COOKIE_MAX_AGE_SEC));
       res.append('Set-Cookie', csrfSetCookie(csrf));
       return res.json({ token });
     });
 
+    this.app.post('/api/supervision/redeem', (req, res, next) => {
+      const origin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
+      const host = typeof req.headers.host === 'string' ? req.headers.host : undefined;
+      if (!isAllowedHttpOrigin(origin, host)) {
+        sendApiError(req, res, 403, 'Forbidden origin');
+        return;
+      }
+      next();
+    }, apiJson, (req, res) => {
+      const ip = this.getClientIp(req);
+      const { allowed, retryAfter } = this.rateLimiter.check(
+        `login:${ip}`,
+        LOGIN_RATE_MAX,
+        LOGIN_RATE_WINDOW_MS,
+      );
+      if (!allowed) {
+        console.warn(`[relay] Rate limited login from ${ip}`);
+        res.set('Retry-After', String(retryAfter));
+        return res.status(429).json({ error: `Too many attempts. Retry in ${retryAfter}s.` });
+      }
+
+      const code = req.body?.code ?? req.body?.redeemCode;
+      if (typeof code !== 'string' || code.length === 0) {
+        return res.status(400).json({ error: 'Redeem code required' });
+      }
+
+      try {
+        const redeemed = this.supervisionManager.redeem(code);
+        const maxAgeSec = Math.max(0, Math.floor(
+          (Math.min(redeemed.expiresAt, redeemed.grant.expiresAt) - Date.now()) / 1000,
+        ));
+        const csrf = randomBytes(24).toString('hex');
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Set-Cookie', sessionSetCookie(redeemed.token, maxAgeSec));
+        res.append('Set-Cookie', csrfSetCookie(csrf, maxAgeSec));
+        return res.json({ ok: true });
+      } catch (err) {
+        if (err instanceof SupervisionError) {
+          console.warn(`[relay] Failed supervisor redeem from ${ip}`);
+          return res.status(401).json({ error: 'Invalid redeem code' });
+        }
+        throw err;
+      }
+    });
+
     this.app.get('/health', (req, res) => {
-      const sessionOk = !this.authEnabled || this.resolveHttpSession(req) !== undefined;
+      const tokens = this.extractCredentialTokens(req.headers.authorization, req.headers.cookie);
+      const principal = this.resolveHttpPrincipal(req);
+      const sessionOk = !this.authEnabled || principal !== null;
+      const failedCredentials = this.authEnabled && tokens.length > 0 && principal === null;
       const publicBody = {
         ok: true as const,
         authRequired: this.authEnabled,
         sessionValid: sessionOk,
       };
-      // Full details: no password (localhost), valid session, or loopback observer
-      // (extension health poll from 127.0.0.1). Unauthenticated LAN gets public min.
       const revealDetails =
-        !this.authEnabled ||
-        sessionOk ||
-        isLoopbackRemoteAddress(req.socket.remoteAddress);
+        !failedCredentials && (
+          !this.authEnabled ||
+          sessionOk ||
+          isLoopbackRemoteAddress(req.socket.remoteAddress)
+        );
       if (!revealDetails) {
         res.json(publicBody);
         return;
       }
       const state = this.stateManager.getCurrentState();
+      if (principal?.role === 'supervisor') {
+        const workspaceOk = workspaceIdentitiesEqual(this.getObservedWorkspaceIdentity(state), principal.grant.workspace);
+        const runtimeBody: Record<string, unknown> = {
+          ...publicBody,
+          version: this.runtimeIdentity.version,
+          instanceId: this.runtimeIdentity.instanceId,
+          startedAt: this.runtimeIdentity.startedAt,
+          build: this.runtimeIdentity.build,
+        };
+        if (!workspaceOk) {
+          res.json(runtimeBody);
+          return;
+        }
+        const body: Record<string, unknown> = {
+          ...runtimeBody,
+          connected: state.connected,
+          extractorStatus: state.extractorStatus,
+          lastExtractionAt: state.lastExtractionAt,
+          consecutiveExtractionFailures: state.consecutiveExtractionFailures,
+        };
+        if (canReadUnderSupervision(principal.grant, state.activeComposerId)) {
+          body.activeWindowId = state.activeWindowId;
+          body.activeComposerId = state.activeComposerId;
+        }
+        res.json(body);
+        return;
+      }
       res.json({
         ...publicBody,
         connected: state.connected,
@@ -696,11 +1332,21 @@ export class Relay {
         chatTabCount: state.chatTabs?.length ?? 0,
         pendingApprovalCount: state.pendingApprovals?.length ?? 0,
         generation: this.stateManager.generation,
+        version: this.runtimeIdentity.version,
+        instanceId: this.runtimeIdentity.instanceId,
+        startedAt: this.runtimeIdentity.startedAt,
+        build: this.runtimeIdentity.build,
+        activeComposerId: state.activeComposerId,
       });
     });
 
     this.app.get('/debug/state', (req, res) => {
-      if (this.authEnabled && this.resolveHttpSession(req) === undefined) {
+      const principal = this.resolveHttpPrincipal(req);
+      if (principal?.role === 'supervisor') {
+        res.status(403).json({ error: 'Forbidden' });
+        return;
+      }
+      if (this.authEnabled && !principal) {
         res.status(401).json({ error: 'unauthorized' });
         return;
       }
@@ -755,7 +1401,7 @@ export class Relay {
     const authMiddleware: express.RequestHandler = (req, res, next) => {
       if (!this.authEnabled) return next();
 
-      if (this.resolveHttpSession(req)) return next();
+      if (this.resolveHttpPrincipal(req)) return next();
 
       if (req.path.startsWith('/api/')) {
         if (!req.readableEnded) req.resume();
@@ -765,6 +1411,15 @@ export class Relay {
     };
 
     this.app.use(authMiddleware);
+
+    this.app.use('/api', (req, res, next) => {
+      const principal = this.resolveHttpPrincipal(req);
+      if (principal?.role === 'supervisor' && isSupervisorForbiddenApi(requestPathname(req))) {
+        sendApiError(req, res, 403, 'Forbidden');
+        return;
+      }
+      next();
+    });
 
     // Protected writes: auth (above) → Host/Origin/CSRF/Bearer → body/size →
     // rate limit → operation reservation → handler. Cookie sessions must be
@@ -893,9 +1548,10 @@ export class Relay {
     this.app.get('/api/csrf', (req, res) => {
       const cookies = parseCookieMap(req.headers.cookie);
       let token = cookies[CSRF_COOKIE];
+      const maxAgeSec = this.cookieMaxAgeSec(this.resolveHttpPrincipal(req));
       if (typeof token !== 'string' || !/^[A-Za-z0-9]+$/.test(token) || token.length < 24) {
         token = randomBytes(24).toString('hex');
-        res.append('Set-Cookie', csrfSetCookie(token));
+        res.append('Set-Cookie', csrfSetCookie(token, maxAgeSec));
       }
       res.json({ csrfToken: token });
     });
@@ -967,7 +1623,7 @@ export class Relay {
         const changed = await this.adapterStore.reject(req.params.id);
         if (!changed) { res.status(404).json({ ok:false, error:'adapter not found' }); return; }
         res.json({ ok:true, adapter:{ id:adapter.id, status:'rejected' } });
-        this.io.emit('adapter:changed', { adapterId: adapter.id, action:'reject' });
+        this.emitOwnerEvent('adapter:changed', { adapterId: adapter.id, action:'reject' });
       } catch (err) { res.status(422).json({ ok:false, error:err instanceof Error ? err.message : String(err) }); }
     });
 
@@ -997,9 +1653,277 @@ export class Relay {
           adapterBindings:this.runtimeSelectors!.getAdapterBindings(),
         });
         res.json({ok:true, runtime:this.runtimeSelectors!.status()});
-        this.io.emit('adapter:changed',{action:'rollback',capabilityKind:body.capabilityKind});
+        this.emitOwnerEvent('adapter:changed',{action:'rollback',capabilityKind:body.capabilityKind});
       }
       catch (err) { res.status(422).json({ok:false,error:err instanceof Error?err.message:String(err)}); }
+    });
+
+    this.app.get('/api/supervision/current', (req, res) => {
+      const principal = this.resolveHttpPrincipal(req);
+      res.setHeader('Cache-Control', 'no-store');
+      if (principal?.role === 'supervisor') {
+        res.json(this.supervisionSnapshot(principal.grant.grantId));
+        return;
+      }
+      if (!this.requireOwnerPrincipal(req, res)) return;
+      res.json({
+        grants: this.supervisionManager.listGrants().map((grant) => this.supervisionSnapshot(grant.grantId)),
+        observedAt: Date.now(),
+      });
+    });
+
+    this.app.post('/api/supervision/checks', (req, res) => {
+      const principal = this.resolveHttpPrincipal(req);
+      if (!principal || principal.role !== 'supervisor') {
+        sendApiError(req, res, 403, 'Supervisor credential required');
+        return;
+      }
+      if (!workspaceIdentitiesEqual(this.getObservedWorkspaceIdentity(), principal.grant.workspace)) {
+        sendApiError(req, res, 409, 'workspace mismatch');
+        return;
+      }
+      try {
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const check = this.supervisionManager.recordCheck(
+          principal.grant.grantId,
+          body.status as 'ok' | 'attention' | 'failed',
+          typeof body.summary === 'string' ? body.summary : '',
+        );
+        this.emitAllSupervisionStates();
+        res.json({ check });
+      } catch (err) {
+        sendApiError(req, res, 400, err instanceof Error ? err.message : String(err));
+      }
+    });
+
+    this.app.post('/api/supervision/issues', (req, res) => {
+      const principal = this.resolveHttpPrincipal(req);
+      if (!principal || principal.role !== 'supervisor') {
+        sendApiError(req, res, 403, 'Supervisor credential required');
+        return;
+      }
+      const workspace = this.getObservedWorkspaceIdentity();
+      if (!workspace || !workspaceIdentitiesEqual(workspace, principal.grant.workspace)) {
+        sendApiError(req, res, 409, 'workspace mismatch');
+        return;
+      }
+      try {
+        const body = (req.body ?? {}) as Record<string, unknown>;
+        const composerId = body.composerId as string;
+        const actionType = body.actionType as string;
+        const actionId = body.actionId as string;
+        const planVersion = body.planVersion as string;
+        const authorizationVersion = body.authorizationVersion as string;
+        const contentDigest = this.currentActionDigest(
+          composerId,
+          actionType,
+          actionId,
+          planVersion,
+          authorizationVersion,
+        );
+        if (!contentDigest) {
+          sendApiError(req, res, 409, 'issue action is not current');
+          return;
+        }
+        const issue = this.supervisionManager.createIssuePermit({
+          grantId: principal.grant.grantId,
+          workspace,
+          composerId,
+          actionType,
+          actionId,
+          planVersion,
+          authorizationVersion,
+          contentDigest,
+          expiresAt: body.expiresAt as number,
+          evidence: typeof body.evidence === 'string' ? body.evidence : undefined,
+          recommendation: typeof body.recommendation === 'string' ? body.recommendation : undefined,
+          attemptedActions: Array.isArray(body.attemptedActions) ? body.attemptedActions as string[] : undefined,
+        });
+        const ownerConnected = [...this.io.sockets.sockets.values()]
+          .some((socket) => this.liveSocketPrincipal(socket)?.role === 'owner');
+        const notifiedIssue = ownerConnected
+          ? this.supervisionManager.recordNotificationStatus(issue.issueId, 'delivery_unknown')
+          : issue;
+        this.emitAllSupervisionStates();
+        res.json({ issue: notifiedIssue });
+      } catch (err) {
+        sendApiError(req, res, 400, err instanceof Error ? err.message : String(err));
+      }
+    });
+
+    this.app.post('/api/supervision/issues/:id/decision', (req, res) => {
+      if (!this.requireOwnerPrincipal(req, res)) return;
+      try {
+        const decision = req.body?.decision;
+        if (decision !== 'approved' && decision !== 'rejected') {
+          sendApiError(req, res, 400, 'invalid issue decision');
+          return;
+        }
+        if (decision === 'approved') {
+          const pending = this.supervisionManager.getIssue(req.params.id);
+          const grant = pending ? this.supervisionManager.getGrant(pending.grantId) : undefined;
+          const workspace = this.getObservedWorkspaceIdentity();
+          const digest = pending && grant && workspaceIdentitiesEqual(workspace, grant.workspace)
+            ? this.currentActionDigest(
+                pending.composerId,
+                pending.actionType,
+                pending.actionId,
+                pending.planVersion,
+                pending.authorizationVersion,
+              )
+            : null;
+          if (!pending || !grant || !digest || digest !== pending.contentDigest) {
+            sendApiError(req, res, 409, 'issue target is no longer current');
+            return;
+          }
+        }
+        const issue = this.supervisionManager.decideIssue(req.params.id, decision, { role: 'owner' });
+        this.emitAllSupervisionStates();
+        res.json({ issue });
+      } catch (err) {
+        sendApiError(req, res, 400, err instanceof Error ? err.message : String(err));
+      }
+    });
+
+    this.app.post('/api/supervision/grants/:id/resume-supervision', (req, res) => {
+      if (!this.requireOwnerPrincipal(req, res)) return;
+      try {
+        const pending = this.supervisionManager.getGrant(req.params.id);
+        if (
+          !pending
+          || pending.status !== 'active'
+          || Date.now() >= pending.expiresAt
+          || !pending.pauseReasons.includes('human_takeover')
+          || !workspaceIdentitiesEqual(this.getObservedWorkspaceIdentity(), pending.workspace)
+        ) {
+          sendApiError(req, res, 409, 'supervision resume prerequisites are not satisfied');
+          return;
+        }
+        const grant = this.supervisionManager.clearPause(
+          req.params.id,
+          'human_takeover',
+          { role: 'owner' },
+        );
+        this.emitAllSupervisionStates();
+        res.json({ grant: this.publicGrant(grant) });
+      } catch (err) {
+        sendApiError(req, res, 400, err instanceof Error ? err.message : String(err));
+      }
+    });
+
+    this.app.post('/api/supervision/grants/:id/resume-recovery', (req, res) => {
+      if (!this.requireOwnerPrincipal(req, res)) return;
+      try {
+        const pending = this.supervisionManager.getGrant(req.params.id);
+        const state = this.stateManager.getCurrentState();
+        const targetId = this.cdpBridge.activeTargetId;
+        const targetGeneration = targetId ? this.cdpBridge.getTargetGeneration(targetId) : 0;
+        const unresolved = this.operationJournal.list().some((record) =>
+          record.target.grantId === req.params.id
+          && (record.status === 'pending'
+            || record.status === 'dispatching'
+            || record.status === 'dispatched'
+            || record.status === 'unknown')
+        );
+        if (
+          !pending
+          || pending.status !== 'pending_recovery'
+          || Date.now() >= pending.expiresAt
+          || !workspaceIdentitiesEqual(this.getObservedWorkspaceIdentity(state), pending.workspace)
+          || !targetId
+          || !targetGeneration
+          || !state.activeWindowId
+          || !canReadUnderSupervision({ ...pending, status: 'active' }, state.activeComposerId)
+          || unresolved
+        ) {
+          sendApiError(req, res, 409, 'recovery prerequisites are not satisfied');
+          return;
+        }
+        const grant = this.supervisionManager.resumeRecovery(req.params.id, { role: 'owner' });
+        this.emitAllSupervisionStates();
+        res.json({ grant: this.publicGrant(grant) });
+      } catch (err) {
+        sendApiError(req, res, 400, err instanceof Error ? err.message : String(err));
+      }
+    });
+
+    this.app.post('/api/supervision/grants', (req, res) => {
+      if (!this.requireOwnerPrincipal(req, res)) return;
+      const identity = this.getObservedWorkspaceIdentity();
+      if (!identity) {
+        sendApiError(req, res, 409, 'workspace identity unavailable');
+        return;
+      }
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const readComposerIds = uniqueStringIds(body.readComposerIds ?? []);
+      const writeComposerIds = uniqueStringIds(body.writeComposerIds ?? []);
+      if (!readComposerIds || !writeComposerIds) {
+        sendApiError(req, res, 400, 'invalid composer scope');
+        return;
+      }
+      if (!isIdSubset(writeComposerIds, readComposerIds)) {
+        sendApiError(req, res, 400, 'write scope must be a subset of read scope');
+        return;
+      }
+      const listed = this.listedComposerIds();
+      if ([...readComposerIds, ...writeComposerIds].some((id) => !listed.has(id))) {
+        sendApiError(req, res, 400, 'composer is not in current state');
+        return;
+      }
+      try {
+        const created = this.supervisionManager.createGrant({
+          workspace: identity,
+          readComposerIds,
+          writeComposerIds,
+          goal: body.goal as string,
+          constraints: typeof body.constraints === 'string' ? body.constraints : undefined,
+          acceptanceCriteria: typeof body.acceptanceCriteria === 'string' ? body.acceptanceCriteria : undefined,
+          planVersion: body.planVersion as string,
+          authorizationVersion: body.authorizationVersion as string,
+          controlVersion: typeof body.controlVersion === 'string' ? body.controlVersion : undefined,
+          expiresAt: body.expiresAt as number,
+          operationLimit: typeof body.operationLimit === 'number' ? body.operationLimit : undefined,
+          checkTtlMs: typeof body.checkTtlMs === 'number' ? body.checkTtlMs : undefined,
+          allowedActionTypes: Array.isArray(body.allowedActionTypes) ? body.allowedActionTypes as string[] : undefined,
+          allowedModes: Array.isArray(body.allowedModes) ? body.allowedModes as string[] : undefined,
+          allowedModels: Array.isArray(body.allowedModels) ? body.allowedModels as string[] : undefined,
+        });
+        res.setHeader('Cache-Control', 'no-store');
+        res.json({ grant: this.publicGrant(created.grant), redeemCode: created.redeemCode });
+      } catch (err) {
+        if (err instanceof SupervisionError) {
+          sendApiError(req, res, 400, err.message);
+          return;
+        }
+        throw err;
+      }
+    });
+
+    this.app.post('/api/supervision/grants/:id/revoke', (req, res) => {
+      if (!this.requireOwnerPrincipal(req, res)) return;
+      try {
+        const grant = this.supervisionManager.revoke(req.params.id);
+        this.disconnectGrantSockets(grant.grantId);
+        res.setHeader('Cache-Control', 'no-store');
+        res.json({ grant: this.publicGrant(grant) });
+      } catch (err) {
+        if (err instanceof SupervisionError) {
+          sendApiError(req, res, err.message === 'grant not found' ? 404 : 400, err.message);
+          return;
+        }
+        throw err;
+      }
+    });
+
+    this.app.get('/api/supervision/grants/:id', (req, res) => {
+      if (!this.requireOwnerPrincipal(req, res)) return;
+      const grant = this.supervisionManager.getGrant(req.params.id);
+      if (!grant) {
+        sendApiError(req, res, 404, 'grant not found');
+        return;
+      }
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({ grant: this.publicGrant(grant) });
     });
 
     this.app.use(jsonBodyErrorHandler);
@@ -1085,6 +2009,42 @@ export class Relay {
     return raw as CommandPayload;
   }
 
+  private planGuardSnapshot(socket: Socket, payload: CommandPayload, extra: Partial<PlanGuardSnapshot> = {}): PlanGuardSnapshot {
+    const state = this.stateManager.getCurrentState();
+    return {
+      socketConnected: socket.connected,
+      authEnabled: this.authEnabled,
+      hasAuthSession: !this.authEnabled || this.liveSocketPrincipal(socket) !== null,
+      connected: state.connected,
+      extractorStatus: state.extractorStatus,
+      lastExtractionAt: state.lastExtractionAt,
+      activeWindowId: state.activeWindowId,
+      activeComposerId: state.activeComposerId,
+      activeTargetId: this.cdpBridge.activeTargetId,
+      requestedWindowId: payload.windowId,
+      requestedComposerId: payload.composerId,
+      ...extra,
+    };
+  }
+
+  private planRouteFailure(
+    socket: Socket,
+    payload: CommandPayload,
+    commandId: string,
+    error: string,
+    code?: PlanFailureCode,
+    stage: PlanFailureStage = 'guard',
+  ): CommandResult {
+    const diagnosed = code ?? diagnosePlanGuardFailure(this.planGuardSnapshot(socket, payload)) ?? 'unknown';
+    return planFailResult({
+      commandId,
+      error,
+      code: diagnosed,
+      stage,
+      requested: planRequestedTarget(payload),
+    });
+  }
+
   private socketSessionKey(socket: Socket): string {
     return this.resolveSocketSession(socket) ?? `anon:${socket.id}`;
   }
@@ -1092,11 +2052,13 @@ export class Relay {
   private emitCommandResult(
     socket: Socket,
     commandId: string,
-    result: { ok: boolean; error?: string; data?: unknown },
+    result: { ok: boolean; error?: string; data?: unknown; failure?: CommandResult['failure'] },
   ): void {
     const body: CommandResult = { commandId, ok: result.ok };
     if (result.error !== undefined) body.error = result.error;
     if (result.data !== undefined) body.data = result.data;
+    const failure = sanitizePlanFailure(result.failure);
+    if (failure) body.failure = failure;
     socket.emit('command:result', body);
   }
 
@@ -1146,11 +2108,13 @@ export class Relay {
     return { type: 'run', finish };
   }
 
-  private cachedCommandResult(result: CommandResult): { ok: boolean; error?: string; data?: unknown } {
+  private cachedCommandResult(result: CommandResult): { ok: boolean; error?: string; data?: unknown; failure?: CommandResult['failure'] } {
+    const failure = sanitizePlanFailure(result.failure);
     return {
       ok: result.ok,
       ...(result.error !== undefined ? { error: result.error } : {}),
       ...(result.data !== undefined ? { data: result.data } : {}),
+      ...(failure ? { failure } : {}),
     };
   }
 
@@ -1167,8 +2131,19 @@ export class Relay {
       this.emitCommandResult(socket, commandId, { ok: false, error: 'Missing commandId' });
       return;
     }
+    const denied = this.supervisionCommandDenied(socket, route, payload);
+    if (denied) {
+      this.emitCommandResult(socket, commandId, { ok: false, error: denied });
+      return;
+    }
     const validationError = validate?.(payload, commandId);
     if (validationError) {
+      if (route === 'discover_plans' || route === 'get_plan_full') {
+        this.emitCommandResult(socket, commandId, this.planRouteFailure(
+          socket, payload, commandId, validationError, 'invalid', 'validate',
+        ));
+        return;
+      }
       this.emitCommandResult(socket, commandId, { ok: false, error: validationError });
       return;
     }
@@ -1180,7 +2155,9 @@ export class Relay {
           const valid = this.planResultGuards.get(result);
           this.planResultGuards.delete(result);
           if (!valid?.()) {
-            this.emitCommandResult(socket, commandId, { ok: false, error: '计划读取目标或权限已失效' });
+            this.emitCommandResult(socket, commandId, this.planRouteFailure(
+              socket, payload, commandId, '计划读取目标或权限已失效', undefined, 'emit',
+            ));
             return;
           }
         }
@@ -1267,14 +2244,13 @@ export class Relay {
   }
 
   private setupSocketHandlers(): void {
-    if (this.authEnabled) {
-      this.io.use((socket, next) => {
-        const resolved = this.resolveSocketSession(socket);
-        if (resolved) return next();
+    this.io.use((socket, next) => {
+      const principal = this.resolveSocketPrincipal(socket);
+      if (this.authEnabled && !principal) {
         const raw = socket.handshake.auth?.token;
         const hint =
           typeof raw === 'string' && raw.length > 0
-            ? raw.slice(0, 8) + '...'
+            ? 'token-present'
             : parseSessionCookie(
                 typeof socket.handshake.headers.cookie === 'string'
                   ? socket.handshake.headers.cookie
@@ -1285,19 +2261,46 @@ export class Relay {
               : 'empty';
         console.warn(`[relay] Socket.io auth rejected (${socket.id}) — ${hint}`);
         next(new Error('Unauthorized'));
-      });
-    }
+        return;
+      }
+      this.rememberSocketPrincipal(socket, principal ?? { role: 'owner' });
+      next();
+    });
 
     this.io.on('connection', (socket) => {
       console.log(`[relay] Client connected: ${socket.id}`);
 
-      socket.emit('state:full', toPublicState(this.stateManager.getCurrentState()));
-      if (this.capabilityStateManager) {
-        socket.emit('capabilities:full', this.capabilityStateManager.getPublicState());
+      const principal = this.liveSocketPrincipal(socket);
+      if (principal?.role === 'supervisor') {
+        this.emitSupervisorState(socket, principal.grant);
+        this.emitSupervisionState(socket, principal.grant.grantId);
+      } else {
+        socket.emit('state:full', toPublicState(this.stateManager.getCurrentState()));
+        socket.emit('supervision:overview', {
+          grants: this.supervisionManager.listGrants().map((grant) => this.supervisionSnapshot(grant.grantId)),
+          observedAt: Date.now(),
+        });
+        if (this.capabilityStateManager) {
+          socket.emit('capabilities:full', this.capabilityStateManager.getPublicState());
+        }
       }
 
       socket.on('state:request', () => {
+        const current = this.liveSocketPrincipal(socket);
+        if (socket.data?.principalRole === 'supervisor' && !current) {
+          socket.disconnect(true);
+          return;
+        }
+        if (current?.role === 'supervisor') {
+          this.emitSupervisorState(socket, current.grant);
+          this.emitSupervisionState(socket, current.grant.grantId);
+          return;
+        }
         socket.emit('state:full', toPublicState(this.stateManager.getCurrentState()));
+        socket.emit('supervision:overview', {
+          grants: this.supervisionManager.listGrants().map((grant) => this.supervisionSnapshot(grant.grantId)),
+          observedAt: Date.now(),
+        });
       });
 
       const onCommand = (
@@ -1312,22 +2315,73 @@ export class Relay {
 
       onCommand('send_message', (payload, commandId) => {
         console.log(`[relay] Command: send_message from ${socket.id}`);
-        return this.commandExecutor.sendMessage(commandId, payload.text!);
+        const before = this.stateManager.getCurrentState().messages.filter(
+          (message) => message.type === 'human' && message.text.trim() === payload.text!.trim(),
+        ).length;
+        return this.runScopedWrite(
+          socket,
+          'send_message',
+          payload,
+          commandId,
+          (options) => this.commandExecutor.sendMessage(commandId, payload.text!, options),
+          () => this.waitForState((state) =>
+            state.activeComposerId === payload.composerId
+            && state.messages.filter(
+              (message) => message.type === 'human' && message.text.trim() === payload.text!.trim(),
+            ).length > before
+          ),
+        );
       }, (payload) => (!payload.text ? 'Missing commandId or text' : null));
 
       onCommand('approve', (payload, commandId) => {
         console.log(`[relay] Command: approve from ${socket.id}`);
-        return this.commandExecutor.clickRegisteredAction(commandId, payload.actionId!, this.actionTarget('approve'));
+        return this.runScopedWrite(
+          socket,
+          'approve',
+          payload,
+          commandId,
+          (options) => this.commandExecutor.clickRegisteredAction(
+            commandId,
+            payload.actionId!,
+            this.actionTarget('approve'),
+            options,
+          ),
+          () => this.waitForState((state) => !this.stateContainsAction(state, payload.actionId!)),
+        );
       }, (payload) => (!payload.actionId ? 'Missing commandId or authorized actionId' : null));
 
       onCommand('approve_all', (payload, commandId) => {
         console.log(`[relay] Command: approve_all from ${socket.id}`);
-        return this.commandExecutor.clickRegisteredAction(commandId, payload.actionId!, this.actionTarget('approve_all'));
+        return this.runScopedWrite(
+          socket,
+          'approve_all',
+          payload,
+          commandId,
+          (options) => this.commandExecutor.clickRegisteredAction(
+            commandId,
+            payload.actionId!,
+            this.actionTarget('approve_all'),
+            options,
+          ),
+          () => this.waitForState((state) => !this.stateContainsAction(state, payload.actionId!)),
+        );
       }, (payload) => (!payload.actionId ? 'Missing commandId or authorized actionId' : null));
 
       onCommand('reject', (payload, commandId) => {
         console.log(`[relay] Command: reject from ${socket.id}`);
-        return this.commandExecutor.clickRegisteredAction(commandId, payload.actionId!, this.actionTarget('reject'));
+        return this.runScopedWrite(
+          socket,
+          'reject',
+          payload,
+          commandId,
+          (options) => this.commandExecutor.clickRegisteredAction(
+            commandId,
+            payload.actionId!,
+            this.actionTarget('reject'),
+            options,
+          ),
+          () => this.waitForState((state) => !this.stateContainsAction(state, payload.actionId!)),
+        );
       }, (payload) => (!payload.actionId ? 'Missing commandId or authorized actionId' : null));
 
       onCommand('switch_tab', (payload, commandId) => {
@@ -1342,7 +2396,14 @@ export class Relay {
 
       onCommand('set_mode', (payload, commandId) => {
         console.log(`[relay] Command: set_mode to ${payload.modeId} from ${socket.id}`);
-        return this.commandExecutor.setMode(commandId, payload.modeId!);
+        return this.runScopedWrite(
+          socket,
+          'set_mode',
+          payload,
+          commandId,
+          (options) => this.commandExecutor.setMode(commandId, payload.modeId!, options),
+          () => this.waitForState((state) => state.activeComposerId === payload.composerId && state.mode.current === payload.modeId),
+        );
       }, (payload) => {
         if (!payload.modeId) return 'Missing commandId or modeId';
         return this.capabilityAllows('mode', payload.modeId);
@@ -1350,7 +2411,17 @@ export class Relay {
 
       onCommand('set_model', (payload, commandId) => {
         console.log(`[relay] Command: set_model to ${payload.modelId} from ${socket.id}`);
-        return this.commandExecutor.setModel(commandId, payload.modelId!);
+        return this.runScopedWrite(
+          socket,
+          'set_model',
+          payload,
+          commandId,
+          (options) => this.commandExecutor.setModel(commandId, payload.modelId!, options),
+          () => this.waitForState((state) =>
+            state.activeComposerId === payload.composerId
+            && (state.model.currentId === payload.modelId || state.model.current === payload.modelId)
+          ),
+        );
       }, (payload) => {
         if (!payload.modelId) return 'Missing commandId or modelId';
         return this.capabilityAllows('model', payload.modelId);
@@ -1396,27 +2467,35 @@ export class Relay {
         updatePlanScope();
         const epoch = planEpoch;
         let invalidated = false;
-        return () => {
+        let observedFailure: PlanFailureCode | undefined;
+        const isCurrent = () => {
           updatePlanScope();
-          const state = this.stateManager.getCurrentState();
-          const now = Date.now();
-          const valid = !invalidated && epoch === planEpoch && socket.connected
-            && (!this.authEnabled || !!this.resolveSocketSession(socket))
-            && state.connected && state.extractorStatus === 'ok'
-            && typeof state.lastExtractionAt === 'number'
-            && state.lastExtractionAt <= now && now - state.lastExtractionAt <= 15_000
-            && state.activeWindowId === payload.windowId && state.activeComposerId === payload.composerId
-            && this.cdpBridge.activeTargetId === payload.windowId;
-          if (!valid) invalidated = true;
-          return valid;
+          const code = diagnosePlanGuardFailure(this.planGuardSnapshot(socket, payload, {
+            now: Date.now(),
+            invalidated,
+            epochMatch: epoch === planEpoch,
+          }));
+          if (code) {
+            invalidated = true;
+            observedFailure ??= code;
+          }
+          return code === null;
         };
+        return Object.assign(isCurrent, { observedFailure: () => observedFailure });
       };
 
       onCommand('discover_plans', async (payload, commandId) => {
-        const fail = (error = '当前会话的目标或读取权限无法确认，请刷新后重试'): CommandResult =>
-          ({ commandId, ok: false, error });
-        if (planDiscoveryBusy) return fail('当前连接正在查找历史计划，请等待完成');
         const scopeCurrent = capturePlanGuard(payload);
+        const fail = (error?: string, code?: PlanFailureCode, stage: PlanFailureStage = 'guard'): CommandResult =>
+          this.planRouteFailure(
+            socket,
+            payload,
+            commandId,
+            error ?? '当前会话的目标或读取权限无法确认，请刷新后重试',
+            code ?? scopeCurrent.observedFailure(),
+            stage,
+          );
+        if (planDiscoveryBusy) return fail('当前连接正在查找历史计划，请等待完成', 'busy');
         if (!scopeCurrent()) return fail();
         clearPlanReferences();
         planDiscoveryBusy = true;
@@ -1425,7 +2504,14 @@ export class Relay {
             windowId: payload.windowId!, composerId: payload.composerId!,
           }, scopeCurrent);
           if (!scopeCurrent()) return fail();
-          if (!result.ok) return result;
+          if (!result.ok) {
+            return attachPlanFailure(result, {
+              code: 'unknown',
+              stage: 'discover',
+              commandId,
+              requested: planRequestedTarget(payload),
+            });
+          }
           const data = result.data as {
             plans?: Array<{ toolCallId?: unknown; title?: unknown; description?: unknown }>;
             observedAt?: unknown; reachedStart?: unknown; completeness?: unknown;
@@ -1481,47 +2567,88 @@ export class Relay {
         const reference = planReferences.get(payload.planId!);
         const plan = reference ?? initial.messages.find((message): message is PlanBlock =>
           message.type === 'plan' && message.id === payload.planId);
-        const fail = (): CommandResult => ({ commandId, ok: false, error: '当前会话的计划、目标或读取权限无法确认，请刷新后重试' });
-        if (!plan) return fail();
+        const fail = (code?: PlanFailureCode): CommandResult => this.planRouteFailure(
+          socket,
+          payload,
+          commandId,
+          '当前会话的计划、目标或读取权限无法确认，请刷新后重试',
+          code ?? scopeCurrent.observedFailure(),
+        );
+        if (!plan) return fail('plan');
         const fingerprint = (value: PlanBlock) => JSON.stringify([
           value.id, value.toolCallId, value.fileName, value.label, value.title, value.description,
           value.todos, value.todosCompleted, value.todosTotal,
         ]);
         const initialFingerprint = fingerprint(plan);
         let invalidated = false;
+        const referenceLive = () => planReferences.get(plan.id) === reference && Date.now() < planReferencesExpireAt;
         const isCurrent = () => {
           const state = this.stateManager.getCurrentState();
           const current = state.messages.find((message): message is PlanBlock =>
             message.type === 'plan' && message.id === plan.id);
           return !invalidated && scopeCurrent()
             && (reference
-              ? planReferences.get(plan.id) === reference && Date.now() < planReferencesExpireAt
+              ? referenceLive()
               : !!current && fingerprint(current) === initialFingerprint);
         };
-        if (!isCurrent()) return fail();
+        const failStale = (): CommandResult => fail(scopeCurrent.observedFailure() ?? 'expired');
+        if (!isCurrent()) return failStale();
         // 已观察到的目标变化不可被切回同名会话消除。
         const onStateChange = () => { if (!isCurrent()) invalidated = true; };
         this.stateManager.on('state:patch', onStateChange);
         this.stateManager.on('connection:changed', onStateChange);
         try {
           let fileName = plan.fileName;
+          let plansRoot: string | undefined;
           if (!fileName) {
-            if (!plan.toolCallId) return fail();
+            if (typeof plan.toolCallId !== 'string' || !plan.toolCallId.trim()) {
+              return planFailResult({
+                commandId,
+                error: '当前计划卡片缺少可核对的文件关联，无法读取全文；请从创建计划记录打开（不保证一定存在创建记录）。当前会话的计划、目标或读取权限无法确认，请刷新后重试',
+                code: 'plan',
+                stage: 'resolve',
+                requested: planRequestedTarget(payload),
+              });
+            }
             const resolved = await this.commandExecutor.resolvePlanFile(commandId, {
               windowId: payload.windowId!, composerId: payload.composerId!,
               planId: plan.id, toolCallId: plan.toolCallId,
             }, isCurrent);
-            if (!isCurrent()) return fail();
-            if (!resolved.ok) return resolved;
-            const data = resolved.data as { fileName?: unknown } | undefined;
+            if (!isCurrent()) return failStale();
+            if (!resolved.ok) {
+              return attachPlanFailure(resolved, {
+                code: 'unknown',
+                stage: 'resolve',
+                commandId,
+                requested: planRequestedTarget(payload),
+              });
+            }
+            const data = resolved.data as { fileName?: unknown; plansRoot?: unknown } | undefined;
             if (typeof data?.fileName !== 'string') return fail();
             fileName = data.fileName;
+            if (typeof data.plansRoot === 'string') plansRoot = data.plansRoot;
           }
-          if (!isCurrent()) return fail();
-          const result = readPlanFileResult(fileName);
-          if (!result.ok) return { commandId, ok: false, error: planFileErrorMessage(result.error) };
-          if (!result.data.body) return { commandId, ok: false, error: '计划文件缺少正文，无法确认全文完整性' };
-          if (!isCurrent()) return fail();
+          if (!isCurrent()) return failStale();
+          const result = readPlanFileResult(fileName, plansRoot);
+          if (!result.ok) {
+            return planFailResult({
+              commandId,
+              error: planFileErrorMessage(result.error),
+              code: 'file',
+              stage: 'read',
+              requested: planRequestedTarget(payload),
+            });
+          }
+          if (!result.data.body) {
+            return planFailResult({
+              commandId,
+              error: '计划文件缺少正文，无法确认全文完整性',
+              code: 'file',
+              stage: 'read',
+              requested: planRequestedTarget(payload),
+            });
+          }
+          if (!isCurrent()) return failStale();
           const response: CommandResult = {
             commandId, ok: true,
             data: {
@@ -1553,7 +2680,19 @@ export class Relay {
 
       onCommand('set_plan_model', (payload, commandId) => {
         console.log(`[relay] Command: set_plan_model to ${payload.planModelId} from ${socket.id}`);
-        return this.commandExecutor.setRegisteredPlanModel(commandId, payload.actionId!, payload.planModelId!);
+        return this.runScopedWrite(
+          socket,
+          'set_plan_model',
+          payload,
+          commandId,
+          (options) => this.commandExecutor.setRegisteredPlanModel(
+            commandId,
+            payload.actionId!,
+            payload.planModelId!,
+            options,
+          ),
+          () => this.waitForState((state) => !this.stateContainsAction(state, payload.actionId!)),
+        );
       }, (payload) => (
         !payload.actionId || !payload.planModelId
           ? 'Missing commandId, authorized plan model actionId, or planModelId'
@@ -1562,10 +2701,18 @@ export class Relay {
 
       onCommand('click_action', (payload, commandId) => {
         console.log(`[relay] Command: click_action from ${socket.id}`);
-        return this.commandExecutor.clickRegisteredAction(
+        return this.runScopedWrite(
+          socket,
+          'click_action',
+          payload,
           commandId,
-          payload.actionId!,
-          this.actionTarget(payload.actionType!),
+          (options) => this.commandExecutor.clickRegisteredAction(
+            commandId,
+            payload.actionId!,
+            this.actionTarget(payload.actionType!),
+            options,
+          ),
+          () => this.waitForState((state) => !this.stateContainsAction(state, payload.actionId!)),
         );
       }, (payload) => {
         if (typeof payload.actionId !== 'string' || payload.actionId.length === 0 || !isValidActionType(payload.actionType)) {
@@ -1594,7 +2741,19 @@ export class Relay {
     this.stateManager.on('state:patch', (patch: Partial<CursorState>) => {
       const publicPatch = toPublicPatch(patch);
       if (Object.keys(publicPatch).length === 0) return;
-      this.io.emit('state:patch', publicPatch);
+      for (const socket of this.io.sockets.sockets.values()) {
+        const principal = this.liveSocketPrincipal(socket);
+        if (socket.data?.principalRole === 'supervisor' && !principal) {
+          socket.disconnect(true);
+          continue;
+        }
+        if (principal?.role === 'supervisor') {
+          this.emitSupervisorState(socket, principal.grant);
+          this.emitSupervisionState(socket, principal.grant.grantId);
+          continue;
+        }
+        socket.emit('state:patch', publicPatch);
+      }
     });
 
     this.stateManager.on('connection:changed', (connected: boolean) => {
@@ -1603,16 +2762,16 @@ export class Relay {
 
     if (this.capabilityStateManager) {
       this.capabilityStateManager.on('capabilities:full', (snapshot: unknown) => {
-        this.io.emit(
+        this.emitOwnerEvent(
           'capabilities:full',
           toPublicCapabilityFull(snapshot, this.capabilityStateManager?.activeTargetId ?? ''),
         );
       });
       this.capabilityStateManager.on('capabilities:patch', (patch: unknown) => {
-        this.io.emit('capabilities:patch', patch);
+        this.emitOwnerEvent('capabilities:patch', patch);
       });
       this.capabilityStateManager.on('capabilities:stale', (patch: unknown) => {
-        this.io.emit('capabilities:stale', patch);
+        this.emitOwnerEvent('capabilities:stale', patch);
       });
     }
   }

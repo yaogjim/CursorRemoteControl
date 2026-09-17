@@ -38,6 +38,32 @@ function firstLanIPv4(): string | undefined {
   return undefined;
 }
 
+function assertRuntimeIdentityFields(body: Record<string, unknown>): void {
+  assert.equal(typeof body.version, 'string');
+  assert.ok((body.version as string).length > 0);
+  assert.match(String(body.instanceId), /^[0-9a-f]{32}$/);
+  assert.equal(Number.isNaN(Date.parse(String(body.startedAt))), false);
+  const build = body.build as { digest?: unknown; scope?: unknown };
+  assert.equal(typeof build, 'object');
+  assert.ok(build !== null);
+  assert.equal(typeof build.scope, 'string');
+  if (build.digest === null) {
+    assert.notEqual(build.scope, 'bundle');
+  } else {
+    assert.match(String(build.digest), /^[0-9a-f]{64}$/);
+    assert.equal(build.scope, 'bundle');
+  }
+  assert.ok('activeComposerId' in body);
+}
+
+function assertHealthHasNoSensitiveLeak(raw: string): void {
+  assert.doesNotMatch(raw, /file:/);
+  assert.doesNotMatch(raw, /\/Users\//);
+  assert.doesNotMatch(raw, /\/home\//);
+  assert.doesNotMatch(raw, /WEBAPP_PASSWORD|TELEGRAM_BOT_TOKEN|process\.env/);
+  assert.doesNotMatch(raw, /package\.json/);
+}
+
 describe('loopback / CORS helpers', () => {
   it('treats localhost variants as loopback bind hosts', () => {
     assert.equal(isLoopbackBindHost('127.0.0.1'), true);
@@ -211,6 +237,33 @@ describe('Relay auth / health', () => {
     assert.equal('windows' in body, false);
     assert.equal('lastExtractionError' in body, false);
     assert.equal('agentStatus' in body, false);
+    assert.equal('version' in body, false);
+    assert.equal('instanceId' in body, false);
+    assert.equal('startedAt' in body, false);
+    assert.equal('build' in body, false);
+    assert.equal('activeComposerId' in body, false);
+    assert.deepEqual(Object.keys(body).sort(), ['authRequired', 'ok', 'sessionValid']);
+  });
+
+  it('includes a stable runtime identity on detailed loopback health', async () => {
+    const relay = makeRelay({ webappPassword: 'super-secret-health-pw' });
+    await relay.start();
+    const url = `http://127.0.0.1:${relay.port}/health`;
+    const firstRes = await fetch(url);
+    const firstRaw = await firstRes.text();
+    const first = JSON.parse(firstRaw) as Record<string, unknown>;
+    assert.equal(first.ok, true);
+    assert.equal(typeof first.connected, 'boolean');
+    assertRuntimeIdentityFields(first);
+    assertHealthHasNoSensitiveLeak(firstRaw);
+    assert.doesNotMatch(firstRaw, /super-secret-health-pw/);
+
+    const secondRes = await fetch(url);
+    const second = (await secondRes.json()) as Record<string, unknown>;
+    assert.equal(second.instanceId, first.instanceId);
+    assert.equal(second.startedAt, first.startedAt);
+    assert.equal(second.version, first.version);
+    assert.deepEqual(second.build, first.build);
   });
 
   it('returns full health after login', async () => {
@@ -233,6 +286,7 @@ describe('Relay auth / health', () => {
     assert.equal(body.sessionValid, true);
     assert.equal(typeof body.connected, 'boolean');
     assert.equal(typeof body.generation, 'number');
+    assertRuntimeIdentityFields(body);
   });
 
   it('sets an HttpOnly session cookie on login', async () => {
